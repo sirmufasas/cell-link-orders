@@ -24,7 +24,7 @@ export const Route = createFileRoute("/order/$slug")({
 });
 
 function OrderPage() {
-  const { customer } = Route.useLoaderData();
+  const { customer } = Route.useLoaderData() as { customer: MockCustomer };
   const [qty, setQty] = useState<Record<string, number>>(
     Object.fromEntries(customer.products.map((p) => [p.id, 0]))
   );
