@@ -1,6 +1,6 @@
 import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useState } from "react";
-import { getCustomer } from "@/lib/mock-data";
+import { getCustomer, type MockCustomer } from "@/lib/mock-data";
 
 export const Route = createFileRoute("/order/$slug")({
   head: ({ params }) => ({
