@@ -61,10 +61,7 @@ function OrderPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const { data: allProducts } = useSuspenseQuery({
-    ...allProductsQuery,
-    enabled: showMore,
-  });
+  const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
   const regularProductIds = useMemo(
     () => new Set(regulars.map((r) => r.product?.id).filter(Boolean) as string[]),

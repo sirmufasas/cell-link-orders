@@ -8,9 +8,8 @@ import {
 import {
   listCustomers, listSubmissions, syncFromSheet, analyticsOverview,
 } from "@/lib/bakery.functions";
-import { PORTUGAL_BAKERY_SHEET_ID } from "@/lib/sheets.server";
 
-const SHEET_URL = `https://docs.google.com/spreadsheets/d/${PORTUGAL_BAKERY_SHEET_ID}/edit`;
+const SHEET_URL = "https://docs.google.com/spreadsheets/d/18n8m7xpZleB6d9l2ccwOqRWbc8QxLVBXftdBVlxL2tQ/edit";
 
 const customersQuery = queryOptions({ queryKey: ["customers"], queryFn: () => listCustomers() });
 const submissionsQuery = queryOptions({ queryKey: ["submissions"], queryFn: () => listSubmissions({ data: {} }) });
