@@ -14,7 +14,179 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      customer_products: {
+        Row: {
+          created_at: string
+          customer_id: string
+          id: string
+          product_id: string
+          sheet_row: number
+          sort_order: number
+        }
+        Insert: {
+          created_at?: string
+          customer_id: string
+          id?: string
+          product_id: string
+          sheet_row: number
+          sort_order?: number
+        }
+        Update: {
+          created_at?: string
+          customer_id?: string
+          id?: string
+          product_id?: string
+          sheet_row?: number
+          sort_order?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "customer_products_customer_id_fkey"
+            columns: ["customer_id"]
+            isOneToOne: false
+            referencedRelation: "customers"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "customer_products_product_id_fkey"
+            columns: ["product_id"]
+            isOneToOne: false
+            referencedRelation: "products"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      customers: {
+        Row: {
+          created_at: string
+          driver: string | null
+          id: string
+          name: string
+          slug: string
+          sort_order: number
+        }
+        Insert: {
+          created_at?: string
+          driver?: string | null
+          id?: string
+          name: string
+          slug: string
+          sort_order?: number
+        }
+        Update: {
+          created_at?: string
+          driver?: string | null
+          id?: string
+          name?: string
+          slug?: string
+          sort_order?: number
+        }
+        Relationships: []
+      }
+      order_submission_items: {
+        Row: {
+          created_at: string
+          id: string
+          product_id: string | null
+          product_name: string
+          quantity: number
+          sheet_row: number | null
+          submission_id: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          product_id?: string | null
+          product_name: string
+          quantity: number
+          sheet_row?: number | null
+          submission_id: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          product_id?: string | null
+          product_name?: string
+          quantity?: number
+          sheet_row?: number | null
+          submission_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "order_submission_items_product_id_fkey"
+            columns: ["product_id"]
+            isOneToOne: false
+            referencedRelation: "products"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "order_submission_items_submission_id_fkey"
+            columns: ["submission_id"]
+            isOneToOne: false
+            referencedRelation: "order_submissions"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      order_submissions: {
+        Row: {
+          created_at: string
+          customer_id: string
+          for_date: string
+          id: string
+          synced_to_sheet: boolean
+          total_items: number
+        }
+        Insert: {
+          created_at?: string
+          customer_id: string
+          for_date: string
+          id?: string
+          synced_to_sheet?: boolean
+          total_items?: number
+        }
+        Update: {
+          created_at?: string
+          customer_id?: string
+          for_date?: string
+          id?: string
+          synced_to_sheet?: boolean
+          total_items?: number
+        }
+        Relationships: [
+          {
+            foreignKeyName: "order_submissions_customer_id_fkey"
+            columns: ["customer_id"]
+            isOneToOne: false
+            referencedRelation: "customers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      products: {
+        Row: {
+          category: string | null
+          created_at: string
+          id: string
+          image_url: string | null
+          name: string
+        }
+        Insert: {
+          category?: string | null
+          created_at?: string
+          id?: string
+          image_url?: string | null
+          name: string
+        }
+        Update: {
+          category?: string | null
+          created_at?: string
+          id?: string
+          image_url?: string | null
+          name?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
