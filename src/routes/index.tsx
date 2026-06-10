@@ -1,5 +1,12 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { MOCK_CUSTOMERS } from "@/lib/mock-data";
+import { useState, useMemo } from "react";
+import { useSuspenseQuery, queryOptions } from "@tanstack/react-query";
+import { listCustomers } from "@/lib/bakery.functions";
+
+const customersQuery = queryOptions({
+  queryKey: ["customers"],
+  queryFn: () => listCustomers(),
+});
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -8,75 +15,76 @@ export const Route = createFileRoute("/")({
       { name: "description", content: "Wholesale order portal for Portugal Bakery customers." },
     ],
   }),
+  loader: ({ context }) => context.queryClient.ensureQueryData(customersQuery),
   component: Home,
+  errorComponent: ({ error }) => (
+    <div className="p-6 text-center text-red-700">Failed to load: {error.message}</div>
+  ),
+  notFoundComponent: () => <div className="p-6">Not found</div>,
 });
 
 function Home() {
+  const { data: customers } = useSuspenseQuery(customersQuery);
+  const [q, setQ] = useState("");
+  const filtered = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    if (!s) return customers;
+    return customers.filter((c) => c.name.toLowerCase().includes(s));
+  }, [q, customers]);
+
   return (
     <div className="min-h-screen bg-[#fdf8f1] text-[#2a1810]">
-      {/* Header */}
       <header className="border-b border-[#e8dcc8] bg-white">
         <div className="max-w-5xl mx-auto px-6 py-5 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-[#c8362b] to-[#8b1e1e] flex items-center justify-center text-white font-bold text-lg shadow-sm">
-              P
-            </div>
+            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-[#c8362b] to-[#8b1e1e] flex items-center justify-center text-white font-bold text-lg shadow-sm">P</div>
             <div>
               <h1 className="font-bold text-lg leading-none">Portugal Bakery</h1>
-              <p className="text-xs text-[#8b6f4e]">Fresh daily since 1985</p>
+              <p className="text-xs text-[#8b6f4e]">Wholesale orders</p>
             </div>
           </div>
-          <Link
-            to="/admin"
-            className="text-sm px-4 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition-colors"
-          >
-            Admin
-          </Link>
+          <Link to="/admin" className="text-sm px-4 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition-colors">Admin</Link>
         </div>
       </header>
 
-      {/* Hero */}
-      <section className="max-w-5xl mx-auto px-6 py-16 text-center">
-        <p className="text-[#c8362b] uppercase tracking-widest text-xs font-semibold mb-3">
-          Wholesale Orders
-        </p>
-        <h2 className="text-4xl md:text-5xl font-bold mb-4 leading-tight">
-          Place your daily order
-          <br />
-          <span className="text-[#c8362b]">in seconds.</span>
-        </h2>
-        <p className="text-[#6b5544] max-w-xl mx-auto mb-10">
-          Each customer gets a permanent ordering link. Open it, type your quantities,
-          tap submit. Your order goes straight to the bakery's master sheet.
-        </p>
+      <section className="max-w-3xl mx-auto px-6 py-10">
+        <h2 className="text-3xl md:text-4xl font-bold mb-3 text-center">Find your order page</h2>
+        <p className="text-[#6b5544] text-center mb-6">Each customer has a permanent ordering link.</p>
 
-        {/* Customer demo links */}
-        <div className="bg-white rounded-2xl shadow-sm border border-[#e8dcc8] p-6 max-w-md mx-auto">
-          <p className="text-xs uppercase tracking-wider text-[#8b6f4e] mb-4 font-semibold">
-            Demo customer pages
-          </p>
-          <div className="space-y-2">
-            {MOCK_CUSTOMERS.map((c) => (
+        <input
+          autoFocus
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search customers…"
+          className="w-full bg-white border border-[#e8dcc8] rounded-xl px-4 py-3 text-base focus:outline-none focus:border-[#c8362b] shadow-sm"
+        />
+
+        <div className="mt-4 bg-white rounded-2xl border border-[#e8dcc8] shadow-sm divide-y divide-[#e8dcc8] max-h-[60vh] overflow-auto">
+          {filtered.length === 0 ? (
+            <div className="p-6 text-center text-sm text-[#8b6f4e]">
+              No customers yet. Open Admin → Sync from Sheet to import them.
+            </div>
+          ) : (
+            filtered.map((c) => (
               <Link
-                key={c.slug}
+                key={c.id}
                 to="/order/$slug"
                 params={{ slug: c.slug }}
-                className="flex items-center justify-between p-3 rounded-lg hover:bg-[#fdf8f1] border border-transparent hover:border-[#e8dcc8] transition-all"
+                className="flex items-center justify-between p-4 hover:bg-[#fdf8f1]"
               >
-                <div className="text-left">
+                <div>
                   <div className="font-semibold">{c.name}</div>
-                  <div className="text-xs text-[#8b6f4e]">/order/{c.slug}</div>
+                  <div className="text-xs text-[#8b6f4e]">/order/{c.slug}{c.driver ? ` · ${c.driver}` : ""}</div>
                 </div>
                 <span className="text-[#c8362b]">→</span>
               </Link>
-            ))}
-          </div>
+            ))
+          )}
         </div>
       </section>
 
-      {/* Footer */}
       <footer className="border-t border-[#e8dcc8] py-6 text-center text-xs text-[#8b6f4e]">
-        © {new Date().getFullYear()} Portugal Bakery · Bakery & Beverage Distribution
+        © {new Date().getFullYear()} Portugal Bakery
       </footer>
     </div>
   );
