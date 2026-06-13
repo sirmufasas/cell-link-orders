@@ -130,8 +130,8 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
   const productRows = await readProductRows();
   const customerRows = await readCustomerRows();
 
-  // ---- Products ----
-  const productMap = new Map<string, string | null>(); // name -> category
+  // ---- Build product set (from products tab + customer rows) ----
+  const productMap = new Map<string, string | null>();
   for (const r of productRows.slice(1)) {
     const name = (r?.[0] ?? "").trim();
     if (!name) continue;
@@ -141,15 +141,27 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
     const p = (r?.[1] ?? "").trim();
     if (p && !productMap.has(p)) productMap.set(p, null);
   }
-  const productPayload = Array.from(productMap.entries()).map(([name, category]) => ({
-    name,
-    category,
-  }));
-  if (productPayload.length) {
-    const { error } = await supabaseAdmin
-      .from("products")
-      .upsert(productPayload, { onConflict: "name", ignoreDuplicates: false });
-    if (error) throw error;
+
+  // Merge with existing products (preserve ids + image_url)
+  const { data: existingProducts } = await supabaseAdmin
+    .from("products")
+    .select("id, name, category, image_url");
+  const existingByName = new Map((existingProducts ?? []).map((p) => [p.name, p]));
+
+  for (const [name, category] of productMap) {
+    const ex = existingByName.get(name);
+    if (ex) {
+      if ((ex.category ?? null) !== category) {
+        await supabaseAdmin.from("products").update({ category }).eq("id", ex.id);
+      }
+    } else {
+      const { data: ins } = await supabaseAdmin
+        .from("products")
+        .insert({ name, category })
+        .select("id, name, category, image_url")
+        .single();
+      if (ins) existingByName.set(name, ins);
+    }
   }
 
   // ---- Customers ----
@@ -161,41 +173,41 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
     order += 1;
     seen.set(name, { driver: (r?.[3] ?? "").trim() || null, order });
   }
-  const slugUsed = new Set<string>();
-  const customerPayload = Array.from(seen.entries()).map(([name, info]) => {
-    let s = slugify(name);
-    const base = s;
-    let i = 2;
-    while (slugUsed.has(s)) {
-      s = `${base}-${i++}`;
-    }
-    slugUsed.add(s);
-    return { name, slug: s, driver: info.driver, sort_order: info.order };
-  });
-  if (customerPayload.length) {
-    const { error } = await supabaseAdmin
-      .from("customers")
-      .upsert(customerPayload, { onConflict: "name", ignoreDuplicates: false });
-    // name has no unique constraint; fall back if needed
-    if (error && !String(error.message).includes("on conflict")) throw error;
-    if (error) {
-      // try upsert by slug instead
-      const { error: e2 } = await supabaseAdmin
+
+  const { data: existingCustomers } = await supabaseAdmin
+    .from("customers")
+    .select("id, name, slug, driver");
+  const existingByCName = new Map((existingCustomers ?? []).map((c) => [c.name, c]));
+  const slugUsed = new Set<string>((existingCustomers ?? []).map((c) => c.slug));
+
+  let customersTouched = 0;
+  for (const [name, info] of seen) {
+    const ex = existingByCName.get(name);
+    if (ex) {
+      await supabaseAdmin
         .from("customers")
-        .upsert(customerPayload, { onConflict: "slug", ignoreDuplicates: true });
-      if (e2) throw e2;
+        .update({ driver: info.driver, sort_order: info.order })
+        .eq("id", ex.id);
+    } else {
+      let s = slugify(name);
+      const base = s;
+      let i = 2;
+      while (slugUsed.has(s)) s = `${base}-${i++}`;
+      slugUsed.add(s);
+      const { data: ins } = await supabaseAdmin
+        .from("customers")
+        .insert({ name, slug: s, driver: info.driver, sort_order: info.order })
+        .select("id, name, slug, driver")
+        .single();
+      if (ins) existingByCName.set(name, ins);
     }
+    customersTouched += 1;
   }
 
-  // Re-read to get IDs
-  const [{ data: dbCustomers }, { data: dbProducts }] = await Promise.all([
-    supabaseAdmin.from("customers").select("id, name"),
-    supabaseAdmin.from("products").select("id, name"),
-  ]);
-  const cId = new Map((dbCustomers ?? []).map((c) => [c.name, c.id]));
-  const pId = new Map((dbProducts ?? []).map((p) => [p.name, p.id]));
+  // ---- Customer_products ----
+  const cId = new Map(Array.from(existingByCName.entries()).map(([n, c]) => [n, c.id]));
+  const pId = new Map(Array.from(existingByName.entries()).map(([n, p]) => [n, p.id]));
 
-  // ---- Customer_products (the row-to-product map) ----
   const cpPayload: Array<{
     customer_id: string;
     product_id: string;
@@ -216,15 +228,14 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
     cpPayload.push({
       customer_id,
       product_id,
-      sheet_row: i + 1, // sheet rows are 1-indexed and we skipped header
+      sheet_row: i + 1,
       sort_order: next,
     });
   }
-  // Wipe and reinsert mappings to stay perfectly in sync with the sheet
+
   if (cpPayload.length) {
     const customerIds = Array.from(new Set(cpPayload.map((x) => x.customer_id)));
     await supabaseAdmin.from("customer_products").delete().in("customer_id", customerIds);
-    // Insert in batches to avoid payload limits
     const batchSize = 500;
     for (let i = 0; i < cpPayload.length; i += batchSize) {
       const { error } = await supabaseAdmin
@@ -235,10 +246,25 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
   }
 
   return {
-    customers: customerPayload.length,
-    products: productPayload.length,
+    customers: customersTouched,
+    products: productMap.size,
     mappings: cpPayload.length,
   };
+});
+
+// Auto-seed when DB is empty. Safe to call on every page load.
+export const ensureSeeded = createServerFn({ method: "GET" }).handler(async () => {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { count } = await supabaseAdmin
+    .from("customers")
+    .select("id", { count: "exact", head: true });
+  if ((count ?? 0) > 0) return { seeded: false };
+  // Call sync handler directly
+  const { readCustomerRows, readProductRows } = await import("./sheets.server");
+  await Promise.all([readCustomerRows(), readProductRows()]);
+  // Trigger full sync
+  await syncFromSheet();
+  return { seeded: true };
 });
 
 // ============================== ADMIN: ORDER HISTORY ==============================
