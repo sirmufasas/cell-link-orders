@@ -1,12 +1,12 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useSuspenseQuery, queryOptions, useQueryClient } from "@tanstack/react-query";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
   LineChart, Line,
 } from "recharts";
 import {
-  listCustomers, listSubmissions, syncFromSheet, analyticsOverview,
+  listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
 } from "@/lib/bakery.functions";
 
 const SHEET_URL = "https://docs.google.com/spreadsheets/d/18n8m7xpZleB6d9l2ccwOqRWbc8QxLVBXftdBVlxL2tQ/edit";
@@ -17,14 +17,30 @@ const analyticsQuery = queryOptions({ queryKey: ["analytics"], queryFn: () => an
 
 export const Route = createFileRoute("/admin")({
   head: () => ({ meta: [{ title: "Admin · Portugal Bakery" }] }),
-  loader: ({ context }) => {
+  loader: async ({ context }) => {
+    // Auto-seed if empty — runs once, no-op afterwards
+    try { await ensureSeeded(); } catch (_) {}
     context.queryClient.ensureQueryData(customersQuery);
     context.queryClient.ensureQueryData(submissionsQuery);
+    context.queryClient.ensureQueryData(analyticsQuery);
   },
   errorComponent: ({ error }) => <div className="p-6 text-red-700">Failed: {error.message}</div>,
   notFoundComponent: () => <div className="p-6">Not found</div>,
   component: AdminPage,
 });
+
+type Bucket = "day" | "week" | "month";
+type Dim = "items" | "products" | "customers";
+
+function bucketKey(dateStr: string, bucket: Bucket) {
+  const d = new Date(dateStr + "T00:00:00");
+  if (bucket === "day") return dateStr;
+  if (bucket === "month") return dateStr.slice(0, 7);
+  // week: ISO-ish, Monday start
+  const day = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - day);
+  return d.toISOString().slice(0, 10);
+}
 
 function AdminPage() {
   const qc = useQueryClient();
@@ -36,6 +52,17 @@ function AdminPage() {
   const [search, setSearch] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
+  const [bucket, setBucket] = useState<Bucket>("day");
+  const [dim, setDim] = useState<Dim>("items");
+
+  // Auto-refresh data every 30s so the dashboard stays live
+  useEffect(() => {
+    const t = setInterval(() => {
+      qc.invalidateQueries({ queryKey: ["submissions"] });
+      qc.invalidateQueries({ queryKey: ["analytics"] });
+    }, 30000);
+    return () => clearInterval(t);
+  }, [qc]);
 
   const filteredCustomers = useMemo(() => {
     const s = search.trim().toLowerCase();
@@ -57,17 +84,23 @@ function AdminPage() {
     }
   }
 
-  // Build chart data: orders per day (last 30)
-  const perDay = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const s of analytics) {
-      m.set(s.for_date, (m.get(s.for_date) ?? 0) + (s.total_items ?? 0));
+  // Build time-series chart data based on bucket + dimension
+  const timeSeries = useMemo(() => {
+    if (dim === "items") {
+      const m = new Map<string, number>();
+      for (const s of analytics) {
+        const k = bucketKey(s.for_date, bucket);
+        m.set(k, (m.get(k) ?? 0) + (s.total_items ?? 0));
+      }
+      const arr = Array.from(m.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, value]) => ({ key, value }));
+      // Pad empty state so chart still renders
+      if (arr.length === 0) return [{ key: "—", value: 0 }, { key: " ", value: 0 }];
+      return arr;
     }
-    return Array.from(m.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .slice(-30)
-      .map(([date, items]) => ({ date: date.slice(5), items }));
-  }, [analytics]);
+    return [];
+  }, [analytics, bucket, dim]);
 
   const topProducts = useMemo(() => {
     const m = new Map<string, number>();
@@ -76,10 +109,12 @@ function AdminPage() {
         m.set(it.product_name, (m.get(it.product_name) ?? 0) + it.quantity);
       }
     }
-    return Array.from(m.entries())
+    const arr = Array.from(m.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 10)
       .map(([name, qty]) => ({ name: name.length > 18 ? name.slice(0, 18) + "…" : name, qty }));
+    if (arr.length === 0) return [{ name: "No data yet", qty: 0 }];
+    return arr;
   }, [analytics]);
 
   const topCustomers = useMemo(() => {
@@ -88,21 +123,28 @@ function AdminPage() {
       const n = s.customer?.name ?? "—";
       m.set(n, (m.get(n) ?? 0) + (s.total_items ?? 0));
     }
-    return Array.from(m.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10)
+    const arr = Array.from(m.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10)
       .map(([name, qty]) => ({ name: name.length > 16 ? name.slice(0, 16) + "…" : name, qty }));
+    if (arr.length === 0) return [{ name: "No data yet", qty: 0 }];
+    return arr;
   }, [analytics]);
 
   return (
     <div className="min-h-screen bg-[#fdf8f1] text-[#2a1810]">
       <header className="bg-white border-b border-[#e8dcc8]">
         <div className="max-w-6xl mx-auto px-6 py-5 flex flex-wrap items-center justify-between gap-3">
-          <Link to="/" className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-[#c8362b] to-[#8b1e1e] flex items-center justify-center text-white font-bold text-lg shadow-sm">P</div>
-            <div>
-              <h1 className="font-bold text-lg leading-none">Portugal Bakery</h1>
-              <p className="text-xs text-[#8b6f4e]">Admin Dashboard</p>
-            </div>
-          </Link>
+          <div className="flex items-center gap-3">
+            <Link to="/" className="text-sm px-3 py-2 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]" aria-label="Back to home">
+              ← Back
+            </Link>
+            <Link to="/" className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-gradient-to-br from-[#c8362b] to-[#8b1e1e] flex items-center justify-center text-white font-bold text-lg shadow-sm">P</div>
+              <div>
+                <h1 className="font-bold text-lg leading-none">Portugal Bakery</h1>
+                <p className="text-xs text-[#8b6f4e]">Admin Dashboard</p>
+              </div>
+            </Link>
+          </div>
           <div className="flex gap-2">
             <a href={SHEET_URL} target="_blank" rel="noreferrer"
               className="text-sm px-3 py-2 rounded-lg bg-green-700 text-white font-semibold hover:bg-green-800">
@@ -110,7 +152,7 @@ function AdminPage() {
             </a>
             <button onClick={handleSync} disabled={syncing}
               className="text-sm px-3 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white disabled:opacity-50">
-              {syncing ? "Syncing…" : "↻ Sync from Sheet"}
+              {syncing ? "Syncing…" : "↻ Re-sync"}
             </button>
           </div>
         </div>
@@ -120,7 +162,6 @@ function AdminPage() {
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-6 space-y-6">
-        {/* Stats */}
         <section className="grid grid-cols-3 gap-3">
           {[
             { label: "Customers", value: customers.length },
@@ -134,7 +175,6 @@ function AdminPage() {
           ))}
         </section>
 
-        {/* Tabs */}
         <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 w-fit">
           {(["customers", "history", "analytics"] as const).map((t) => (
             <button key={t} onClick={() => setTab(t)}
@@ -151,7 +191,7 @@ function AdminPage() {
               className="w-full bg-white border border-[#e8dcc8] rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-[#c8362b]" />
             <div className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
               {filteredCustomers.length === 0 && (
-                <div className="p-6 text-center text-sm text-[#8b6f4e]">No customers — click “Sync from Sheet” above.</div>
+                <div className="p-6 text-center text-sm text-[#8b6f4e]">No customers yet — data will load automatically from your sheet.</div>
               )}
               {filteredCustomers.map((c) => (
                 <div key={c.id} className="p-3 flex items-center justify-between hover:bg-[#fdf8f1]">
@@ -187,40 +227,55 @@ function AdminPage() {
         )}
 
         {tab === "analytics" && (
-          <section className="grid gap-4 md:grid-cols-2">
-            <ChartCard title="Items per day (last 30)">
-              <ResponsiveContainer width="100%" height={240}>
-                <LineChart data={perDay}>
-                  <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
-                  <XAxis dataKey="date" tick={{ fontSize: 11 }} />
-                  <YAxis tick={{ fontSize: 11 }} />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="items" stroke="#c8362b" strokeWidth={2} dot={false} />
-                </LineChart>
+          <section className="space-y-4">
+            <div className="flex flex-wrap gap-2 items-center">
+              <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1">
+                {(["day", "week", "month"] as const).map((b) => (
+                  <button key={b} onClick={() => setBucket(b)}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold ${bucket === b ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}>
+                    {b === "day" ? "Days" : b === "week" ? "Weeks" : "Months"}
+                  </button>
+                ))}
+              </div>
+              <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1">
+                {(["items", "products", "customers"] as const).map((d) => (
+                  <button key={d} onClick={() => setDim(d)}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold ${dim === d ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}>
+                    {d === "items" ? "Items over time" : d === "products" ? "Top products" : "Top customers"}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <ChartCard title={
+              dim === "items" ? `Items per ${bucket}` : dim === "products" ? "Top 10 products (all time)" : "Top 10 customers (all time)"
+            }>
+              <ResponsiveContainer width="100%" height={300}>
+                {dim === "items" ? (
+                  <LineChart data={timeSeries}>
+                    <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
+                    <XAxis dataKey="key" tick={{ fontSize: 11 }} />
+                    <YAxis tick={{ fontSize: 11 }} allowDecimals={false} domain={[0, "auto"]} />
+                    <Tooltip />
+                    <Line type="monotone" dataKey="value" stroke="#c8362b" strokeWidth={2} dot />
+                  </LineChart>
+                ) : (
+                  <BarChart data={dim === "products" ? topProducts : topCustomers}>
+                    <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
+                    <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-25} textAnchor="end" height={70} />
+                    <YAxis tick={{ fontSize: 11 }} allowDecimals={false} domain={[0, "auto"]} />
+                    <Tooltip />
+                    <Bar dataKey="qty" fill="#c8362b" />
+                  </BarChart>
+                )}
               </ResponsiveContainer>
             </ChartCard>
-            <ChartCard title="Top 10 products">
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={topProducts}>
-                  <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
-                  <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-25} textAnchor="end" height={60} />
-                  <YAxis tick={{ fontSize: 11 }} />
-                  <Tooltip />
-                  <Bar dataKey="qty" fill="#c8362b" />
-                </BarChart>
-              </ResponsiveContainer>
-            </ChartCard>
-            <ChartCard title="Top 10 customers">
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={topCustomers}>
-                  <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
-                  <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-25} textAnchor="end" height={60} />
-                  <YAxis tick={{ fontSize: 11 }} />
-                  <Tooltip />
-                  <Bar dataKey="qty" fill="#8b1e1e" />
-                </BarChart>
-              </ResponsiveContainer>
-            </ChartCard>
+
+            {analytics.length === 0 && (
+              <p className="text-center text-xs text-[#8b6f4e]">
+                No orders yet — charts will update automatically as orders come in.
+              </p>
+            )}
           </section>
         )}
       </main>
@@ -228,7 +283,7 @@ function AdminPage() {
   );
 }
 
-function ChartCard({ title, children }: { title: string; children: React.ReactNode }) {
+function ChartCard({ title, children }: { title: string; children: React.ReactElement }) {
   return (
     <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm">
       <h3 className="font-semibold text-sm mb-2">{title}</h3>
