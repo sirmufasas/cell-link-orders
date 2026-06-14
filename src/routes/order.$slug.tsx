@@ -217,10 +217,10 @@ function OrderPage() {
               className="w-full bg-white border border-[#e8dcc8] rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-[#c8362b]"
             />
             <p className="text-[11px] text-[#8b6f4e]">
-              Extras are saved to order history; ask the bakery to add them to your regular list to write directly to the sheet.
+              Showing {extraProducts.length} extra products. Extras are saved to order history; ask the bakery to add them to your regular list to write directly to the sheet.
             </p>
             <div className="space-y-2">
-              {extraProducts.slice(0, 80).map((p) => {
+              {extraProducts.map((p) => {
                 const k: LineKey = `x:${p.id}`;
                 return (
                   <div key={p.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
