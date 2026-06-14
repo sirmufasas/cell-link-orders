@@ -268,6 +268,49 @@ function OrderPage() {
         </div>
         {error && <div className="max-w-xl mx-auto mt-2 text-xs text-red-700">{error}</div>}
       </div>
+
+      {preview && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-4"
+          onClick={() => setPreview(null)}
+        >
+          <div
+            className="bg-white rounded-3xl max-w-md w-full overflow-hidden shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="aspect-square bg-[#fdf8f1] relative">
+              {preview.image_url ? (
+                <img src={preview.image_url} alt={preview.name} className="w-full h-full object-cover" />
+              ) : (
+                <div className="w-full h-full flex items-center justify-center text-6xl">🥐</div>
+              )}
+              <button
+                onClick={() => setPreview(null)}
+                className="absolute top-3 right-3 w-9 h-9 rounded-full bg-white/90 text-[#2a1810] font-bold shadow flex items-center justify-center"
+                aria-label="Close"
+              >×</button>
+            </div>
+            <div className="p-5">
+              <h3 className="text-xl font-bold leading-tight">{preview.name}</h3>
+              {preview.category && (
+                <div className="text-xs text-[#8b6f4e] mt-0.5">{preview.category}</div>
+              )}
+              <div className="mt-4">
+                <div className="text-[10px] uppercase tracking-widest text-[#8b6f4e] font-semibold mb-1">Ingredients</div>
+                <p className="text-sm text-[#2a1810] leading-relaxed">
+                  {preview.ingredients || "No ingredients listed yet."}
+                </p>
+              </div>
+              <button
+                onClick={() => setPreview(null)}
+                className="mt-5 w-full bg-[#c8362b] hover:bg-[#a82a22] text-white font-semibold py-3 rounded-xl"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
