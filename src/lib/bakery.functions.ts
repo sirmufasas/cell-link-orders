@@ -131,15 +131,16 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
   const customerRows = await readCustomerRows();
 
   // ---- Build product set (from products tab + customer rows) ----
+  const isSentinel = (s: string) => /insert products above/i.test(s);
   const productMap = new Map<string, string | null>();
   for (const r of productRows.slice(1)) {
     const name = (r?.[0] ?? "").trim();
-    if (!name) continue;
+    if (!name || isSentinel(name)) continue;
     productMap.set(name, (r?.[1] ?? "").trim() || null);
   }
   for (const r of customerRows.slice(1)) {
     const p = (r?.[1] ?? "").trim();
-    if (p && !productMap.has(p)) productMap.set(p, null);
+    if (p && !isSentinel(p) && !productMap.has(p)) productMap.set(p, null);
   }
 
   // Merge with existing products (preserve ids + image_url)
