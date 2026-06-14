@@ -25,7 +25,7 @@ export const listProducts = createServerFn({ method: "GET" }).handler(async () =
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { data, error } = await supabaseAdmin
     .from("products")
-    .select("id, name, category, image_url")
+    .select("id, name, category, image_url, ingredients")
     .not("name", "ilike", "%insert products above%")
     .order("name", { ascending: true });
   if (error) throw error;
@@ -46,7 +46,7 @@ export const getCustomerPage = createServerFn({ method: "GET" })
 
     const { data: cps, error: cpErr } = await supabaseAdmin
       .from("customer_products")
-      .select("id, sheet_row, sort_order, product:products(id, name, category, image_url)")
+      .select("id, sheet_row, sort_order, product:products(id, name, category, image_url, ingredients)")
       .eq("customer_id", customer.id)
       .order("sort_order", { ascending: true });
     if (cpErr) throw cpErr;
