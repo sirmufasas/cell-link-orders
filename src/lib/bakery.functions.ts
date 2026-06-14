@@ -26,6 +26,7 @@ export const listProducts = createServerFn({ method: "GET" }).handler(async () =
   const { data, error } = await supabaseAdmin
     .from("products")
     .select("id, name, category, image_url")
+    .not("name", "ilike", "%insert products above%")
     .order("name", { ascending: true });
   if (error) throw error;
   return data ?? [];
