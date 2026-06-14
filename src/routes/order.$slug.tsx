@@ -60,6 +60,7 @@ function OrderPage() {
   const [submitted, setSubmitted] = useState<{ totalItems: number } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<null | { name: string; image_url: string | null; category: string | null; ingredients: string | null }>(null);
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
@@ -178,13 +179,18 @@ function OrderPage() {
           const product = r.product;
           return (
             <div key={r.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
-              <div className="w-14 h-14 rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center overflow-hidden shrink-0">
+              <button
+                type="button"
+                onClick={() => product && setPreview({ name: product.name, image_url: product.image_url, category: product.category, ingredients: (product as any).ingredients ?? null })}
+                className="w-14 h-14 rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center overflow-hidden shrink-0 active:scale-95 transition"
+                aria-label={`View ${product?.name ?? "product"} details`}
+              >
                 {product?.image_url ? (
                   <img src={product.image_url} alt="" className="w-full h-full object-cover" />
                 ) : (
                   <span className="text-xl">🥐</span>
                 )}
-              </div>
+              </button>
               <div className="flex-1 min-w-0">
                 <div className="font-semibold leading-tight text-sm">{product?.name ?? "—"}</div>
                 <div className="text-[10px] text-[#8b6f4e] mt-0.5">Row C{r.sheet_row}{product?.category ? ` · ${product.category}` : ""}</div>
@@ -224,9 +230,14 @@ function OrderPage() {
                 const k: LineKey = `x:${p.id}`;
                 return (
                   <div key={p.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
-                    <div className="w-12 h-12 rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center overflow-hidden shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setPreview({ name: p.name, image_url: p.image_url, category: p.category, ingredients: (p as any).ingredients ?? null })}
+                      className="w-12 h-12 rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center overflow-hidden shrink-0 active:scale-95 transition"
+                      aria-label={`View ${p.name} details`}
+                    >
                       {p.image_url ? <img src={p.image_url} alt="" className="w-full h-full object-cover" /> : <span>🥖</span>}
-                    </div>
+                    </button>
                     <div className="flex-1 min-w-0">
                       <div className="font-medium text-sm truncate">{p.name}</div>
                       {p.category && <div className="text-[10px] text-[#8b6f4e]">{p.category}</div>}
