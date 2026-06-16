@@ -60,7 +60,7 @@ function OrderPage() {
   const [submitted, setSubmitted] = useState<{ totalItems: number } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [preview, setPreview] = useState<null | { name: string; image_url: string | null; category: string | null; ingredients: string | null }>(null);
+  
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
