@@ -60,7 +60,7 @@ function OrderPage() {
   const [submitted, setSubmitted] = useState<{ totalItems: number } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [preview, setPreview] = useState<null | { name: string; image_url: string | null; category: string | null; ingredients: string | null }>(null);
+  
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
@@ -179,18 +179,6 @@ function OrderPage() {
           const product = r.product;
           return (
             <div key={r.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
-              <button
-                type="button"
-                onClick={() => product && setPreview({ name: product.name, image_url: product.image_url, category: product.category, ingredients: (product as any).ingredients ?? null })}
-                className="w-14 h-14 rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center overflow-hidden shrink-0 active:scale-95 transition"
-                aria-label={`View ${product?.name ?? "product"} details`}
-              >
-                {product?.image_url ? (
-                  <img src={product.image_url} alt="" className="w-full h-full object-cover" />
-                ) : (
-                  <span className="text-xl">🥐</span>
-                )}
-              </button>
               <div className="flex-1 min-w-0">
                 <div className="font-semibold leading-tight text-sm">{product?.name ?? "—"}</div>
                 <div className="text-[10px] text-[#8b6f4e] mt-0.5">Row C{r.sheet_row}{product?.category ? ` · ${product.category}` : ""}</div>
@@ -230,14 +218,6 @@ function OrderPage() {
                 const k: LineKey = `x:${p.id}`;
                 return (
                   <div key={p.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
-                    <button
-                      type="button"
-                      onClick={() => setPreview({ name: p.name, image_url: p.image_url, category: p.category, ingredients: (p as any).ingredients ?? null })}
-                      className="w-12 h-12 rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center overflow-hidden shrink-0 active:scale-95 transition"
-                      aria-label={`View ${p.name} details`}
-                    >
-                      {p.image_url ? <img src={p.image_url} alt="" className="w-full h-full object-cover" /> : <span>🥖</span>}
-                    </button>
                     <div className="flex-1 min-w-0">
                       <div className="font-medium text-sm truncate">{p.name}</div>
                       {p.category && <div className="text-[10px] text-[#8b6f4e]">{p.category}</div>}
@@ -250,6 +230,7 @@ function OrderPage() {
           </div>
         )}
       </div>
+
 
       {/* Sticky submit */}
       <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-[#e8dcc8] p-4 shadow-[0_-4px_20px_rgba(0,0,0,0.05)]">
@@ -269,48 +250,6 @@ function OrderPage() {
         {error && <div className="max-w-xl mx-auto mt-2 text-xs text-red-700">{error}</div>}
       </div>
 
-      {preview && (
-        <div
-          className="fixed inset-0 z-50 bg-black/60 flex items-end sm:items-center justify-center p-4"
-          onClick={() => setPreview(null)}
-        >
-          <div
-            className="bg-white rounded-3xl max-w-md w-full overflow-hidden shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="aspect-square bg-[#fdf8f1] relative">
-              {preview.image_url ? (
-                <img src={preview.image_url} alt={preview.name} className="w-full h-full object-cover" />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center text-6xl">🥐</div>
-              )}
-              <button
-                onClick={() => setPreview(null)}
-                className="absolute top-3 right-3 w-9 h-9 rounded-full bg-white/90 text-[#2a1810] font-bold shadow flex items-center justify-center"
-                aria-label="Close"
-              >×</button>
-            </div>
-            <div className="p-5">
-              <h3 className="text-xl font-bold leading-tight">{preview.name}</h3>
-              {preview.category && (
-                <div className="text-xs text-[#8b6f4e] mt-0.5">{preview.category}</div>
-              )}
-              <div className="mt-4">
-                <div className="text-[10px] uppercase tracking-widest text-[#8b6f4e] font-semibold mb-1">Ingredients</div>
-                <p className="text-sm text-[#2a1810] leading-relaxed">
-                  {preview.ingredients || "No ingredients listed yet."}
-                </p>
-              </div>
-              <button
-                onClick={() => setPreview(null)}
-                className="mt-5 w-full bg-[#c8362b] hover:bg-[#a82a22] text-white font-semibold py-3 rounded-xl"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
