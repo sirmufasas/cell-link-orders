@@ -227,15 +227,19 @@ function AdminPage() {
               <div className="p-6 text-center text-sm text-[#8b6f4e]">No orders submitted yet.</div>
             )}
             {submissions.map((s) => (
-              <div key={s.id} className="p-3 flex items-center justify-between text-sm">
+              <button
+                key={s.id}
+                onClick={() => openDetail(s.id)}
+                className="w-full text-left p-3 flex items-center justify-between text-sm hover:bg-[#fdf8f1]"
+              >
                 <div className="min-w-0">
                   <div className="font-semibold truncate">{s.customer?.name ?? "—"}</div>
                   <div className="text-xs text-[#8b6f4e]">
                     For {s.for_date} · {s.total_items} items · submitted {new Date(s.created_at).toLocaleString()}
                   </div>
                 </div>
-                <span className="text-green-700 text-xs font-semibold">✓ Synced</span>
-              </div>
+                <span className="text-[#c8362b] text-xs font-semibold">View →</span>
+              </button>
             ))}
           </section>
         )}
