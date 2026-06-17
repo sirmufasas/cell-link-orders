@@ -1,7 +1,7 @@
 import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useState, useMemo } from "react";
 import { useSuspenseQuery, queryOptions, useQueryClient } from "@tanstack/react-query";
-import { getCustomerPage, listProducts, submitOrder, addOnToOrder } from "@/lib/bakery.functions";
+import { getCustomerPage, listProducts, submitOrder, addOnToOrder, changeOrder } from "@/lib/bakery.functions";
 
 const customerPageQuery = (slug: string) =>
   queryOptions({
@@ -53,7 +53,16 @@ function dateLabel(iso: string) {
 type LineKey = string;
 type Mode = "default" | "addon";
 
-const KOTA_ONLY_PRODUCTS = new Set(["Rolls Kota", "Kota"]);
+// Kota-only products: anything starting with "rolls kota" or "kota" (case-insensitive,
+// trimmed), so variants like "Rolls Kota Doz", "Rolls Kota Dozen", "Kota Joe 2" etc.
+// are all caught — not just exact matches.
+const KOTA_ONLY_PREFIXES = ["rolls kota", "kota"];
+
+function isKotaOnlyProduct(name: string | undefined | null) {
+  const n = (name ?? "").trim().toLowerCase();
+  if (!n) return false;
+  return KOTA_ONLY_PREFIXES.some((prefix) => n.startsWith(prefix));
+}
 
 function OrderPage() {
   const { slug } = Route.useParams();
@@ -65,9 +74,10 @@ function OrderPage() {
   const hasPriorOrders = page!.hasPriorOrders;
   const history = page!.history;
 
-  const isKotaJoe = customer.name.trim().toLowerCase() === "kota joe";
+  // "Starts with" so names like "Kota Joe 2" or "Kota Joe - Main" also qualify.
+  const isKotaJoe = customer.name.trim().toLowerCase().startsWith("kota joe");
   const regulars = useMemo(
-    () => regularsAll.filter((r) => isKotaJoe || !KOTA_ONLY_PRODUCTS.has(r.product?.name ?? "")),
+    () => regularsAll.filter((r) => isKotaJoe || !isKotaOnlyProduct(r.product?.name)),
     [regularsAll, isKotaJoe],
   );
 
@@ -77,6 +87,7 @@ function OrderPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [showChangeForm, setShowChangeForm] = useState(false);
   // ordered = true means we just submitted; combined with todayOrder server-data drives the "received" screen
   const [mode, setMode] = useState<Mode>("default");
 
@@ -87,12 +98,29 @@ function OrderPage() {
     [regulars],
   );
 
+  const regularSheetRows = useMemo(
+    () => new Set(regulars.map((r) => r.sheet_row)),
+    [regulars],
+  );
+
+  function buildPrefillFromTodayOrder(): Record<LineKey, number> {
+    const next: Record<LineKey, number> = {};
+    for (const item of todayOrder?.items ?? []) {
+      if (item.sheet_row && regularSheetRows.has(item.sheet_row)) {
+        next[`r:${item.sheet_row}`] = item.quantity;
+      } else if (item.product_id) {
+        next[`x:${item.product_id}`] = item.quantity;
+      }
+    }
+    return next;
+  }
+
   const extraProducts = useMemo(() => {
     if (!showMore || !allProducts) return [];
     const s = productSearch.trim().toLowerCase();
     return allProducts.filter((p) => {
       if (regularProductIds.has(p.id)) return false;
-      if (!isKotaJoe && KOTA_ONLY_PRODUCTS.has(p.name)) return false;
+      if (!isKotaJoe && isKotaOnlyProduct(p.name)) return false;
       if (!s) return true;
       return p.name.toLowerCase().includes(s);
     });
@@ -132,11 +160,14 @@ function OrderPage() {
       const items = buildItems();
       if (mode === "addon") {
         await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items } });
+      } else if (showChangeForm) {
+        await changeOrder({ data: { slug, forDate: tomorrowISO(), items } });
       } else {
         await submitOrder({ data: { slug, forDate: tomorrowISO(), items } });
       }
       setQty({});
       setMode("default");
+      setShowChangeForm(false);
       await qc.invalidateQueries({ queryKey: ["customer-page", slug] });
     } catch (e) {
       setError((e as Error).message);
@@ -146,7 +177,7 @@ function OrderPage() {
   }
 
   // ===== Received-today screen =====
-  if (todayOrder && mode === "default") {
+  if (todayOrder && mode === "default" && !showChangeForm) {
     return (
       <div className="min-h-screen bg-[#fdf8f1] flex items-center justify-center p-6">
         <div className="bg-white rounded-3xl shadow-lg border border-[#e8dcc8] p-8 max-w-md w-full text-center">
@@ -156,6 +187,7 @@ function OrderPage() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold mb-2">Your order has been received!</h1>
+          <h3 className="text-sm font-semibold text-[#8b6f4e] mb-2">New orders can only be submitted tomorrow</h3>
           <p className="text-[#6b5544] mb-6">
             <strong>{customer.name}</strong> — {todayOrder.total_items} items for {tomorrowLabel()}.
           </p>
@@ -166,16 +198,30 @@ function OrderPage() {
             >
               + Add onto Prev Order
             </button>
+            {hasPriorOrders && (
+              <button
+                onClick={() => {
+                  const prefill = buildPrefillFromTodayOrder();
+                  setShowChangeForm(true);
+                  setQty(prefill);
+                  if (Object.keys(prefill).some((k) => k.startsWith("x:"))) setShowMore(true);
+                }}
+                className="border-2 border-[#c8362b] text-[#c8362b] font-bold py-3 rounded-xl hover:bg-[#c8362b]/5"
+                title="Overwrite today's quantities in column C"
+              >
+                Change Order
+              </button>
+            )}
             <button
               onClick={() => setShowHistory(true)}
               className="border border-[#e8dcc8] hover:bg-[#fdf8f1] font-semibold py-3 rounded-xl"
             >
               History
             </button>
-            <Link to="/" className="text-xs text-[#8b6f4e] underline mt-3">Back home</Link>
           </div>
         </div>
         {showHistory && <HistoryModal history={history} onClose={() => setShowHistory(false)} />}
+        {submitting && <SubmittingOverlay mode={mode} showChangeForm={showChangeForm} />}
       </div>
     );
   }
@@ -190,21 +236,28 @@ function OrderPage() {
             <p className="text-[10px] uppercase tracking-widest text-[#8b6f4e] font-semibold">Portugal Bakery</p>
             <h1 className="font-bold leading-tight truncate">{customer.name}</h1>
           </div>
-          {mode === "addon" && (
-            <button onClick={() => setMode("default")} className="text-xs text-[#8b6f4e] underline">Cancel</button>
+          {(mode === "addon" || showChangeForm) && (
+            <button
+              onClick={() => { setMode("default"); setShowChangeForm(false); }}
+              className="px-3 py-1.5 rounded-lg border-2 border-[#c8362b] text-[#c8362b] text-xs font-bold hover:bg-[#c8362b] hover:text-white transition shrink-0"
+            >
+              Cancel
+            </button>
           )}
         </div>
       </header>
 
       <div className="max-w-xl mx-auto px-5 pt-6">
         <div className="inline-flex items-center gap-2 bg-[#c8362b]/10 text-[#c8362b] px-3 py-1 rounded-full text-xs font-semibold mb-3">
-          {mode === "addon" ? "ADD-ON ORDER" : "ORDER FOR TOMORROW"}
+          {mode === "addon" ? "ADD-ON ORDER" : showChangeForm ? "CHANGE ORDER" : "ORDER FOR TOMORROW"}
         </div>
         <h2 className="text-2xl font-bold mb-1">{tomorrowLabel()}</h2>
         <p className="text-sm text-[#8b6f4e] mb-6">
           {mode === "addon"
             ? "Add extra quantities on top of today's order."
-            : "Set quantities and submit. Orders are placed the day before."}
+            : showChangeForm
+              ? "Update your quantities. This will overwrite today's order."
+              : "Set quantities and submit. Orders are placed the day before."}
         </p>
       </div>
 
@@ -216,7 +269,7 @@ function OrderPage() {
             <div key={r.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
               <div className="flex-1 min-w-0">
                 <div className="font-semibold leading-tight text-sm">{product?.name ?? "—"}</div>
-                <div className="text-[10px] text-[#8b6f4e] mt-0.5">Row C{r.sheet_row}{product?.category ? ` · ${product.category}` : ""}</div>
+                {/* <div className="text-[10px] text-[#8b6f4e] mt-0.5">Row C{r.sheet_row}{product?.category ? ` · ${product.category}` : ""}</div> */}
               </div>
               <QtyControl value={qty[k] ?? 0} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} />
             </div>
@@ -236,7 +289,12 @@ function OrderPage() {
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="font-bold">All products</h3>
-              <button onClick={() => setShowMore(false)} className="text-xs text-[#8b6f4e] underline">Hide</button>
+              <button
+                onClick={() => setShowMore(false)}
+                className="px-3 py-1.5 rounded-lg border-2 border-[#c8362b] text-[#c8362b] text-xs font-bold hover:bg-[#c8362b] hover:text-white transition shrink-0"
+              >
+                Hide
+              </button>
             </div>
             <input
               value={productSearch}
@@ -254,7 +312,7 @@ function OrderPage() {
                   <div key={p.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
                     <div className="flex-1 min-w-0">
                       <div className="font-medium text-sm truncate">{p.name}</div>
-                      {p.category && <div className="text-[10px] text-[#8b6f4e]">{p.category}</div>}
+                      {/* {p.category && <div className="text-[10px] text-[#8b6f4e]">{p.category}</div>} */}
                     </div>
                     <QtyControl value={qty[k] ?? 0} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} />
                   </div>
@@ -290,26 +348,30 @@ function OrderPage() {
                 ? "Sending…"
                 : mode === "addon"
                   ? "Submit Add-On"
-                  : "Submit Order"}
+                  : showChangeForm
+                    ? "Save Changes"
+                    : "Submit Order"}
             </button>
-            {mode === "default" && hasPriorOrders && !todayOrder && (
-              <button
-                onClick={handleSubmit}
-                disabled={submitting || totalItems === 0}
-                className="flex-1 border-2 border-[#c8362b] text-[#c8362b] font-bold py-3 rounded-xl disabled:opacity-50"
-                title="Overwrite today's quantities in column C"
-              >
-                Change Order
-              </button>
-            )}
           </div>
           {error && <div className="mt-2 text-xs text-red-700">{error}</div>}
         </div>
       </div>
 
       {showHistory && <HistoryModal history={history} onClose={() => setShowHistory(false)} />}
+      {submitting && <SubmittingOverlay mode={mode} showChangeForm={showChangeForm} />}
     </div>
   );
+}
+
+function orderTypeTag(type?: string | null) {
+  switch (type) {
+    case "changed":
+      return { label: "Changed Order", className: "bg-amber-100 text-amber-800" };
+    case "added":
+      return { label: "Added Order", className: "bg-blue-100 text-blue-800" };
+    default:
+      return { label: "New Order", className: "bg-green-100 text-green-800" };
+  }
 }
 
 function HistoryModal({
@@ -321,6 +383,7 @@ function HistoryModal({
     for_date: string;
     total_items: number;
     created_at: string;
+    order_type?: string | null;
     items: Array<{ product_name: string; quantity: number }>;
   }>;
   onClose: () => void;
@@ -355,24 +418,55 @@ function HistoryModal({
             <div key={day}>
               <h4 className="font-bold text-sm text-[#2a1810] mb-2">{dateLabel(day)}</h4>
               <div className="space-y-3">
-                {subs.map((s) => (
-                  <div key={s.id} className="border border-[#e8dcc8] rounded-xl p-3">
-                    <div className="text-xs text-[#8b6f4e] mb-2">
-                      For {s.for_date} · {s.total_items} items
+                {subs.map((s) => {
+                  const tag = orderTypeTag(s.order_type);
+                  return (
+                    <div key={s.id} className="border border-[#e8dcc8] rounded-xl p-3">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="text-xs text-[#8b6f4e]">
+                          For {s.for_date} · {s.total_items} items
+                        </div>
+                        <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full ${tag.className}`}>
+                          {tag.label}
+                        </span>
+                      </div>
+                      <ul className="text-sm space-y-1">
+                        {s.items.map((it, i) => (
+                          <li key={i} className="flex justify-between">
+                            <span>{it.product_name}</span>
+                            <span className="font-semibold">{it.quantity}</span>
+                          </li>
+                        ))}
+                      </ul>
                     </div>
-                    <ul className="text-sm space-y-1">
-                      {s.items.map((it, i) => (
-                        <li key={i} className="flex justify-between">
-                          <span>{it.product_name}</span>
-                          <span className="font-semibold">{it.quantity}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SubmittingOverlay({ mode, showChangeForm }: { mode: Mode; showChangeForm: boolean }) {
+  const label = mode === "addon" ? "Adding to your order" : showChangeForm ? "Saving changes" : "Sending your order";
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-6">
+      <div className="bg-white rounded-3xl shadow-xl px-8 py-7 flex flex-col items-center gap-4 max-w-xs w-full text-center">
+        <svg
+          className="animate-spin w-9 h-9 text-[#c8362b]"
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden="true"
+        >
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-4a6 6 0 0 0-6-6V2z" />
+        </svg>
+        <div>
+          <p className="font-bold text-[#2a1810]">{label}…</p>
+          <p className="text-xs text-[#8b6f4e] mt-1">Just a moment, please don't close this page.</p>
         </div>
       </div>
     </div>

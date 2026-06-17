@@ -1,7 +1,9 @@
 // Server-only helpers for talking to the Portugal Bakery Google Sheet
-// through the Lovable connector gateway.
+// directly via the Google Sheets API, using a service account.
 
-const GATEWAY = "https://connector-gateway.lovable.dev/google_sheets/v4";
+import { google } from "googleapis";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 export const PORTUGAL_BAKERY_SHEET_ID =
   "18n8m7xpZleB6d9l2ccwOqRWbc8QxLVBXftdBVlxL2tQ";
@@ -11,77 +13,126 @@ export const SHEET_URL = `https://docs.google.com/spreadsheets/d/${PORTUGAL_BAKE
 const TAB_CUSTOMERS = "Customer Order Details";
 const TAB_PRODUCTS = "Products List";
 
-function authHeaders() {
-  const lovable = process.env.LOVABLE_API_KEY;
-  const conn = process.env.GOOGLE_SHEETS_API_KEY;
-  if (!lovable || !conn) {
+// ============================== AUTH ==============================
+
+type ServiceAccountKey = {
+  client_email: string;
+  private_key: string;
+};
+
+function loadServiceAccountKey(): ServiceAccountKey {
+  const inlineJson = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_JSON;
+  if (inlineJson) {
+    try {
+      return JSON.parse(inlineJson) as ServiceAccountKey;
+    } catch {
+      throw new Error(
+        "GOOGLE_SERVICE_ACCOUNT_KEY_JSON is set but is not valid JSON.",
+      );
+    }
+  }
+
+  const keyPath = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH;
+  if (!keyPath) {
     throw new Error(
-      "Google Sheets connector is not configured (missing LOVABLE_API_KEY or GOOGLE_SHEETS_API_KEY).",
+      "Google Sheets is not configured. Set GOOGLE_SERVICE_ACCOUNT_KEY_PATH (path to the service account JSON file) or GOOGLE_SERVICE_ACCOUNT_KEY_JSON (the JSON itself) in your environment.",
     );
   }
-  return {
-    Authorization: `Bearer ${lovable}`,
-    "X-Connection-Api-Key": conn,
-    "Content-Type": "application/json",
-  };
+
+  try {
+    const raw = readFileSync(resolve(keyPath), "utf-8");
+    return JSON.parse(raw) as ServiceAccountKey;
+  } catch (err) {
+    throw new Error(
+      `Failed to read Google service account key at "${keyPath}": ${(err as Error).message}`,
+    );
+  }
 }
 
-async function gw(path: string, init?: RequestInit) {
-  const res = await fetch(`${GATEWAY}/spreadsheets/${PORTUGAL_BAKERY_SHEET_ID}${path}`, {
-    ...init,
-    headers: { ...authHeaders(), ...(init?.headers ?? {}) },
+function getAuthClient() {
+  const key = loadServiceAccountKey();
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: key.client_email,
+      private_key: key.private_key,
+    },
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Sheets gateway ${res.status}: ${body.slice(0, 500)}`);
-  }
-  return res.json();
+  return auth.getClient();
 }
+
+async function getSheetsClient() {
+  const authClient = await getAuthClient();
+  return google.sheets({ version: "v4", auth: authClient as any });
+}
+
+// ============================== READS ==============================
 
 export async function readCustomerRows(): Promise<string[][]> {
-  const data = await gw(`/values/${encodeURI(TAB_CUSTOMERS)}!A1:E2000`);
-  return (data.values as string[][]) ?? [];
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    range: `${TAB_CUSTOMERS}!A1:E2000`,
+  });
+  return (res.data.values as string[][]) ?? [];
 }
 
 export async function readProductRows(): Promise<string[][]> {
-  const data = await gw(`/values/${encodeURI(TAB_PRODUCTS)}!A1:B2000`);
-  return (data.values as string[][]) ?? [];
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    range: `${TAB_PRODUCTS}!A1:B2000`,
+  });
+  return (res.data.values as string[][]) ?? [];
 }
 
 export async function readRowFull(row: number): Promise<string[]> {
-  const data = await gw(`/values/${encodeURI(TAB_CUSTOMERS)}!A${row}:Z${row}`);
-  const vals = (data.values as string[][]) ?? [];
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    range: `${TAB_CUSTOMERS}!A${row}:Z${row}`,
+  });
+  const vals = (res.data.values as string[][]) ?? [];
   return vals[0] ?? [];
 }
+
+// ============================== WRITES ==============================
 
 /** Write quantity values into column C of "Customer Order Details" for the given sheet rows. */
 export async function writeOrderQuantities(
   entries: Array<{ row: number; quantity: number }>,
 ) {
   if (!entries.length) return;
-  const body = {
-    valueInputOption: "USER_ENTERED",
-    data: entries.map((e) => ({
-      range: `${TAB_CUSTOMERS}!C${e.row}`,
-      values: [[e.quantity > 0 ? String(e.quantity) : ""]],
-    })),
-  };
-  await gw(`/values:batchUpdate`, { method: "POST", body: JSON.stringify(body) });
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: entries.map((e) => ({
+        range: `${TAB_CUSTOMERS}!C${e.row}`,
+        values: [[e.quantity > 0 ? String(e.quantity) : ""]],
+      })),
+    },
+  });
+}
+
+/** Clear column C for given rows (used when starting a new daily order). */
+export async function clearOrderQuantities(rows: number[]) {
+  if (!rows.length) return;
+  await writeOrderQuantities(rows.map((r) => ({ row: r, quantity: 0 })));
 }
 
 /** Write arbitrary single-cell values. */
 export async function writeCells(entries: Array<{ range: string; value: string }>) {
   if (!entries.length) return;
-  const body = {
-    valueInputOption: "USER_ENTERED",
-    data: entries.map((e) => ({ range: e.range, values: [[e.value]] })),
-  };
-  await gw(`/values:batchUpdate`, { method: "POST", body: JSON.stringify(body) });
-}
-
-export async function clearOrderQuantities(rows: number[]) {
-  if (!rows.length) return;
-  await writeOrderQuantities(rows.map((r) => ({ row: r, quantity: 0 })));
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: entries.map((e) => ({ range: e.range, values: [[e.value]] })),
+    },
+  });
 }
 
 /** Append new customer rows. Returns the starting row number of the appended block. */
@@ -89,12 +140,19 @@ export async function appendCustomerRows(
   rows: Array<{ customer: string; product: string; driver: string }>,
 ): Promise<number> {
   if (!rows.length) return 0;
+  const sheets = await getSheetsClient();
   const values = rows.map((r) => [r.customer, r.product, "", r.driver, "No"]);
-  const data = await gw(
-    `/values/${encodeURI(TAB_CUSTOMERS)}!A:E:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-    { method: "POST", body: JSON.stringify({ values }) },
-  );
-  const updatedRange: string = data?.updates?.updatedRange ?? "";
+
+  const res = await sheets.spreadsheets.values.append({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    range: `${TAB_CUSTOMERS}!A:E`,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values },
+  });
+
+  // updatedRange looks like "'Customer Order Details'!A742:E750"
+  const updatedRange: string = res.data.updates?.updatedRange ?? "";
   const m = updatedRange.match(/!\w+(\d+):/);
   return m ? parseInt(m[1], 10) : 0;
 }
@@ -102,10 +160,16 @@ export async function appendCustomerRows(
 let _customerSheetId: number | null = null;
 export async function getCustomerSheetId(): Promise<number> {
   if (_customerSheetId !== null) return _customerSheetId;
-  const data = await gw(`?fields=sheets.properties`);
-  const sheets = (data.sheets as Array<{ properties: { sheetId: number; title: string } }>) ?? [];
-  const s = sheets.find((x) => x.properties.title === TAB_CUSTOMERS);
-  if (!s) throw new Error(`Tab "${TAB_CUSTOMERS}" not found`);
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.get({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    fields: "sheets.properties",
+  });
+  const sheetList = res.data.sheets ?? [];
+  const s = sheetList.find((x) => x.properties?.title === TAB_CUSTOMERS);
+  if (!s || s.properties?.sheetId == null) {
+    throw new Error(`Tab "${TAB_CUSTOMERS}" not found`);
+  }
   _customerSheetId = s.properties.sheetId;
   return _customerSheetId;
 }
@@ -127,12 +191,11 @@ export async function insertCustomerProductRow(opts: {
   }
   if (lastRow1 < 0) {
     // Customer doesn't exist yet — append at bottom
-    return await appendCustomerRows([
+    const r = await appendCustomerRows([
       { customer: opts.customerName, product: opts.productName, driver: "Collection" },
-    ]).then(async (r) => {
-      if (opts.quantity > 0) await writeOrderQuantities([{ row: r, quantity: opts.quantity }]);
-      return r;
-    });
+    ]);
+    if (opts.quantity > 0) await writeOrderQuantities([{ row: r, quantity: opts.quantity }]);
+    return r;
   }
 
   const sheetId = await getCustomerSheetId();
@@ -140,10 +203,11 @@ export async function insertCustomerProductRow(opts: {
   const driver = (above[3] ?? "Collection").trim() || "Collection";
   const colE = (above[4] ?? "No").trim() || "No";
 
+  const sheets = await getSheetsClient();
   // Insert blank row at lastRow1 (0-based startIndex = lastRow1)
-  await gw(`:batchUpdate`, {
-    method: "POST",
-    body: JSON.stringify({
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    requestBody: {
       requests: [
         {
           insertDimension: {
@@ -157,7 +221,7 @@ export async function insertCustomerProductRow(opts: {
           },
         },
       ],
-    }),
+    },
   });
 
   const newRow = lastRow1 + 1;
@@ -178,12 +242,23 @@ export async function insertCustomerProductRow(opts: {
  */
 export async function addOnQuantityToRow(row: number, quantity: number): Promise<string> {
   if (quantity <= 0) return "";
-  // Read current C (as formula) and F..Z values
-  const cValue = await gw(`/values/${encodeURI(TAB_CUSTOMERS)}!C${row}?valueRenderOption=FORMULA`);
-  const fzValues = await gw(`/values/${encodeURI(TAB_CUSTOMERS)}!F${row}:Z${row}`);
+  const sheets = await getSheetsClient();
 
-  const cRaw = (cValue?.values?.[0]?.[0] ?? "").toString();
-  const fz = (fzValues?.values?.[0] ?? []) as string[];
+  // Read current C (as formula) and F..Z values
+  const [cValueRes, fzValuesRes] = await Promise.all([
+    sheets.spreadsheets.values.get({
+      spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+      range: `${TAB_CUSTOMERS}!C${row}`,
+      valueRenderOption: "FORMULA",
+    }),
+    sheets.spreadsheets.values.get({
+      spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+      range: `${TAB_CUSTOMERS}!F${row}:Z${row}`,
+    }),
+  ]);
+
+  const cRaw = (cValueRes.data.values?.[0]?.[0] ?? "").toString();
+  const fz = (fzValuesRes.data.values?.[0] ?? []) as string[];
 
   // Find next empty column index (0 = F, 1 = G, ...)
   let idx = 0;
@@ -198,11 +273,7 @@ export async function addOnQuantityToRow(row: number, quantity: number): Promise
 
   let baseExpr: string;
   if (cRaw.startsWith("=")) {
-    // Strip leading "=", reuse expression
     baseExpr = cRaw.slice(1);
-    // If the existing formula already contains add-on cell refs, rebuild from scratch using the first numeric component if any
-    // Safer: rebuild as (existingExpr without trailing +<col><row> refs) + new sums
-    // We'll just keep it simple and append; duplicates can be cleaned by user.
     // Detect existing add-on tokens "+F<row>"..."+Z<row>" and drop them, then re-add fresh.
     const tokenRe = new RegExp(`\\+\\s*[F-Z]${row}\\b`, "g");
     baseExpr = baseExpr.replace(tokenRe, "").trim();
@@ -217,4 +288,23 @@ export async function addOnQuantityToRow(row: number, quantity: number): Promise
     { range: `${TAB_CUSTOMERS}!C${row}`, value: newFormula },
   ]);
   return colLetter;
+}
+
+/**
+ * Blank out every add-on column (F..Z) for the given rows. Used by
+ * changeOrder to fully reset a customer's prior order — including any
+ * add-on quantities written via addOnQuantityToRow — before writing the
+ * new quantities in.
+ */
+export async function clearAddOnColumns(rows: number[]) {
+  if (!rows.length) return;
+  const entries: Array<{ range: string; value: string }> = [];
+  for (const row of rows) {
+    for (let i = 0; i < 21; i++) {
+      // F..Z inclusive
+      const col = String.fromCharCode("F".charCodeAt(0) + i);
+      entries.push({ range: `${TAB_CUSTOMERS}!${col}${row}`, value: "" });
+    }
+  }
+  await writeCells(entries);
 }

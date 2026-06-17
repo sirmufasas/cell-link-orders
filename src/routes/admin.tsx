@@ -43,6 +43,23 @@ function bucketKey(dateStr: string, bucket: Bucket) {
   return d.toISOString().slice(0, 10);
 }
 
+function dateLabel(iso: string) {
+  return new Date(iso).toLocaleDateString(undefined, {
+    weekday: "long", year: "numeric", month: "long", day: "numeric",
+  });
+}
+
+function orderTypeTag(type?: string | null) {
+  switch (type) {
+    case "changed":
+      return { label: "Changed Order", className: "bg-amber-100 text-amber-800" };
+    case "added":
+      return { label: "Added Order", className: "bg-blue-100 text-blue-800" };
+    default:
+      return { label: "New Order", className: "bg-green-100 text-green-800" };
+  }
+}
+
 function AdminPage() {
   const qc = useQueryClient();
   const { data: customers } = useSuspenseQuery(customersQuery);
@@ -83,6 +100,19 @@ function AdminPage() {
     if (!s) return customers;
     return customers.filter((c) => c.name.toLowerCase().includes(s));
   }, [search, customers]);
+
+  // Group submissions by created_at date (local) — same grouping as the
+  // customer-facing HistoryModal, just across all customers.
+  const historyGroups = useMemo(() => {
+    const m = new Map<string, typeof submissions>();
+    for (const s of submissions) {
+      const key = new Date(s.created_at).toISOString().slice(0, 10);
+      const arr = m.get(key) ?? [];
+      arr.push(s);
+      m.set(key, arr);
+    }
+    return Array.from(m.entries()).sort(([a], [b]) => b.localeCompare(a));
+  }, [submissions]);
 
   async function handleSync() {
     setSyncing(true); setSyncMsg(null);
@@ -222,24 +252,39 @@ function AdminPage() {
         )}
 
         {tab === "history" && (
-          <section className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
-            {submissions.length === 0 && (
-              <div className="p-6 text-center text-sm text-[#8b6f4e]">No orders submitted yet.</div>
+          <section className="space-y-5">
+            {historyGroups.length === 0 && (
+              <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e] shadow-sm">
+                No orders submitted yet.
+              </div>
             )}
-            {submissions.map((s) => (
-              <button
-                key={s.id}
-                onClick={() => openDetail(s.id)}
-                className="w-full text-left p-3 flex items-center justify-between text-sm hover:bg-[#fdf8f1]"
-              >
-                <div className="min-w-0">
-                  <div className="font-semibold truncate">{s.customer?.name ?? "—"}</div>
-                  <div className="text-xs text-[#8b6f4e]">
-                    For {s.for_date} · {s.total_items} items · submitted {new Date(s.created_at).toLocaleString()}
-                  </div>
+            {historyGroups.map(([day, subs]) => (
+              <div key={day}>
+                <h4 className="font-bold text-sm text-[#2a1810] mb-2">{dateLabel(day)}</h4>
+                <div className="space-y-3">
+                  {subs.map((s) => {
+                    const tag = orderTypeTag(s.order_type);
+                    return (
+                      <button
+                        key={s.id}
+                        onClick={() => openDetail(s.id)}
+                        className="w-full text-left border border-[#e8dcc8] bg-white rounded-xl p-3 shadow-sm hover:bg-[#fdf8f1]"
+                      >
+                        <div className="flex items-center justify-between mb-1 gap-2">
+                          <div className="font-semibold text-sm truncate">{s.customer?.name ?? "—"}</div>
+                          <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full shrink-0 ${tag.className}`}>
+                            {tag.label}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between text-xs text-[#8b6f4e]">
+                          <span>For {s.for_date} · {s.total_items} items · {new Date(s.created_at).toLocaleString()}</span>
+                          <span className="text-[#c8362b] font-semibold shrink-0">View →</span>
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
-                <span className="text-[#c8362b] text-xs font-semibold">View →</span>
-              </button>
+              </div>
             ))}
           </section>
         )}
@@ -329,6 +374,30 @@ function AdminPage() {
           </div>
         </div>
       )}
+
+      {syncing && <SyncingOverlay />}
+    </div>
+  );
+}
+
+function SyncingOverlay() {
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-6">
+      <div className="bg-white rounded-3xl shadow-xl px-8 py-7 flex flex-col items-center gap-4 max-w-xs w-full text-center">
+        <svg
+          className="animate-spin w-9 h-9 text-[#c8362b]"
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden="true"
+        >
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+          <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-4a6 6 0 0 0-6-6V2z" />
+        </svg>
+        <div>
+          <p className="font-bold text-[#2a1810]">Syncing with sheet…</p>
+          <p className="text-xs text-[#8b6f4e] mt-1">Pulling the latest customers and products.</p>
+        </div>
+      </div>
     </div>
   );
 }

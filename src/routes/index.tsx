@@ -40,7 +40,7 @@ function Home() {
             <div className="w-10 h-10 rounded-full bg-gradient-to-br from-[#c8362b] to-[#8b1e1e] flex items-center justify-center text-white font-bold text-lg shadow-sm">P</div>
             <div>
               <h1 className="font-bold text-lg leading-none">Portugal Bakery</h1>
-              <p className="text-xs text-[#8b6f4e]">Wholesale orders</p>
+              <p className="text-xs text-[#9b8d7d]">Wholesale orders</p>
             </div>
           </div>
           <Link to="/admin" className="text-sm px-4 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition-colors">Admin</Link>
