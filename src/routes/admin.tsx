@@ -7,6 +7,7 @@ import {
 } from "recharts";
 import {
   listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
+  getSubmissionDetail,
 } from "@/lib/bakery.functions";
 
 const SHEET_URL = "https://docs.google.com/spreadsheets/d/18n8m7xpZleB6d9l2ccwOqRWbc8QxLVBXftdBVlxL2tQ/edit";
