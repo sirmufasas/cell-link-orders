@@ -178,14 +178,9 @@ export async function insertCustomerProductRow(opts: {
  */
 export async function addOnQuantityToRow(row: number, quantity: number): Promise<string> {
   if (quantity <= 0) return "";
-  // Read F..Z and current C
-  const rangeReads = await gw(
-    `/values:batchGet?ranges=${encodeURI(TAB_CUSTOMERS)}!C${row}&ranges=${encodeURI(TAB_CUSTOMERS)}!F${row}:Z${row}&ranges=${encodeURI(TAB_CUSTOMERS)}!C${row}?valueRenderOption=FORMULA`,
-  );
-  // The above batchGet collapses params; do it cleanly with two calls instead:
+  // Read current C (as formula) and F..Z values
   const cValue = await gw(`/values/${encodeURI(TAB_CUSTOMERS)}!C${row}?valueRenderOption=FORMULA`);
   const fzValues = await gw(`/values/${encodeURI(TAB_CUSTOMERS)}!F${row}:Z${row}`);
-  void rangeReads;
 
   const cRaw = (cValue?.values?.[0]?.[0] ?? "").toString();
   const fz = (fzValues?.values?.[0] ?? []) as string[];
