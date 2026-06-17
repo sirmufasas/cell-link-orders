@@ -388,33 +388,25 @@ function QtyControl({
   onAdjust: (d: number) => void;
   onSet: (n: number) => void;
 }) {
-  const [text, setText] = useState<string>(String(value));
-  // Sync when external value changes (e.g. after submit/reset)
-  if (text !== String(value) && document.activeElement?.tagName !== "INPUT") {
-    // only when not actively editing
-  }
-
+  const [focused, setFocused] = useState(false);
+  const display = focused && value === 0 ? "" : String(value);
   return (
     <div className="flex items-center gap-1.5">
-      <button aria-label="−" onClick={() => { onAdjust(-1); setText(String(Math.max(0, value - 1))); }} className="w-9 h-9 rounded-full bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center text-lg font-bold active:scale-95">−</button>
+      <button aria-label="−" onClick={() => onAdjust(-1)} className="w-9 h-9 rounded-full bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center text-lg font-bold active:scale-95">−</button>
       <input
         type="text"
         inputMode="numeric"
         pattern="[0-9]*"
-        value={value === 0 && text === "" ? "" : text}
-        onFocus={(e) => {
-          e.currentTarget.select();
-          if (value === 0) setText("");
-        }}
+        value={display}
+        onFocus={(e) => { setFocused(true); e.currentTarget.select(); }}
+        onBlur={() => setFocused(false)}
         onChange={(e) => {
           const raw = e.target.value.replace(/[^0-9]/g, "");
-          setText(raw);
           onSet(raw === "" ? 0 : parseInt(raw, 10));
         }}
-        onBlur={() => setText(String(value))}
         className="w-12 h-9 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b]"
       />
-      <button aria-label="+" onClick={() => { onAdjust(1); setText(String(value + 1)); }} className="w-9 h-9 rounded-full bg-[#c8362b] text-white flex items-center justify-center text-lg font-bold active:scale-95">+</button>
+      <button aria-label="+" onClick={() => onAdjust(1)} className="w-9 h-9 rounded-full bg-[#c8362b] text-white flex items-center justify-center text-lg font-bold active:scale-95">+</button>
     </div>
   );
 }
