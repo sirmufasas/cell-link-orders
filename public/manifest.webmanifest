@@ -1,0 +1,14 @@
+{
+  "name": "Portugal Bakery Orders",
+  "short_name": "PB Orders",
+  "description": "Wholesale order portal for Portugal Bakery customers.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#fdf8f1",
+  "theme_color": "#c8362b",
+  "icons": [
+    { "src": "/favicon.ico", "sizes": "any", "type": "image/x-icon" }
+  ]
+}
