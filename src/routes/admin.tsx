@@ -55,6 +55,19 @@ function AdminPage() {
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [bucket, setBucket] = useState<Bucket>("day");
   const [dim, setDim] = useState<Dim>("items");
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<Awaited<ReturnType<typeof getSubmissionDetail>> | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  async function openDetail(id: string) {
+    setDetailId(id); setDetail(null); setDetailLoading(true);
+    try {
+      const d = await getSubmissionDetail({ data: { id } });
+      setDetail(d);
+    } finally {
+      setDetailLoading(false);
+    }
+  }
 
   // Auto-refresh data every 30s so the dashboard stays live
   useEffect(() => {
