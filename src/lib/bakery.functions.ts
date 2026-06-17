@@ -9,6 +9,12 @@ function slugify(s: string) {
   return base || "x";
 }
 
+function tomorrowISO(): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 // ============================== READS ==============================
 
 export const listCustomers = createServerFn({ method: "GET" }).handler(async () => {
@@ -51,34 +57,66 @@ export const getCustomerPage = createServerFn({ method: "GET" })
       .order("sort_order", { ascending: true });
     if (cpErr) throw cpErr;
 
-    return { customer, regulars: cps ?? [] };
+    // Cleanup: delete history older than 7 days
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    await supabaseAdmin.from("order_submissions").delete().lt("created_at", sevenDaysAgo);
+
+    const todayKey = tomorrowISO();
+    const { data: todaySubs } = await supabaseAdmin
+      .from("order_submissions")
+      .select("id, for_date, total_items, created_at, items:order_submission_items(product_name, quantity)")
+      .eq("customer_id", customer.id)
+      .eq("for_date", todayKey)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    const todayOrder = todaySubs?.[0] ?? null;
+
+    const { count: priorCount } = await supabaseAdmin
+      .from("order_submissions")
+      .select("id", { count: "exact", head: true })
+      .eq("customer_id", customer.id);
+
+    const { data: history } = await supabaseAdmin
+      .from("order_submissions")
+      .select("id, for_date, total_items, created_at, items:order_submission_items(product_name, quantity)")
+      .eq("customer_id", customer.id)
+      .gte("created_at", sevenDaysAgo)
+      .order("created_at", { ascending: false });
+
+    return {
+      customer,
+      regulars: cps ?? [],
+      todayOrder,
+      hasPriorOrders: (priorCount ?? 0) > 0,
+      history: history ?? [],
+    };
   });
 
 // ============================== ORDER SUBMIT ==============================
 
+const SubmitItem = z.object({
+  // sheetRow === 0 means: this product is not in customer's regulars; insert a new row in the sheet.
+  sheetRow: z.number().int().min(0),
+  productName: z.string().min(1),
+  productId: z.string().uuid().nullable().optional(),
+  quantity: z.number().int().min(0),
+});
+
 const SubmitOrderInput = z.object({
   slug: z.string().min(1),
   forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  // Items keyed by customer_product.id with quantity; productId optional for ad-hoc additions.
-  items: z.array(
-    z.object({
-      sheetRow: z.number().int().positive(),
-      productName: z.string().min(1),
-      productId: z.string().uuid().nullable().optional(),
-      quantity: z.number().int().min(0),
-    }),
-  ),
+  items: z.array(SubmitItem),
 });
 
 export const submitOrder = createServerFn({ method: "POST" })
   .inputValidator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { writeOrderQuantities } = await import("./sheets.server");
+    const { writeOrderQuantities, insertCustomerProductRow } = await import("./sheets.server");
 
     const { data: customer, error: cErr } = await supabaseAdmin
       .from("customers")
-      .select("id")
+      .select("id, name")
       .eq("slug", data.slug)
       .maybeSingle();
     if (cErr) throw cErr;
@@ -87,12 +125,26 @@ export const submitOrder = createServerFn({ method: "POST" })
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
 
-    // 1) Write to Google Sheet (column C of Customer Order Details)
+    // 1) For items without a sheet row, insert a new row first (immediately below the customer's last row)
+    let insertedAny = false;
+    for (const item of positive) {
+      if (item.sheetRow === 0) {
+        const newRow = await insertCustomerProductRow({
+          customerName: customer.name,
+          productName: item.productName,
+          quantity: item.quantity,
+        });
+        item.sheetRow = newRow;
+        insertedAny = true;
+      }
+    }
+
+    // 2) Write column C for all positive items
     await writeOrderQuantities(
       positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
     );
 
-    // 2) Persist a copy for history / analytics
+    // 3) Persist a copy for history / analytics
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
@@ -119,6 +171,65 @@ export const submitOrder = createServerFn({ method: "POST" })
       if (iErr) throw iErr;
     }
 
+    return { ok: true, submissionId: submission.id, totalItems, insertedAny };
+  });
+
+// ============================== ADD-ON ORDER ==============================
+
+export const addOnToOrder = createServerFn({ method: "POST" })
+  .inputValidator((d) => SubmitOrderInput.parse(d))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { addOnQuantityToRow, insertCustomerProductRow } = await import("./sheets.server");
+
+    const { data: customer, error: cErr } = await supabaseAdmin
+      .from("customers")
+      .select("id, name")
+      .eq("slug", data.slug)
+      .maybeSingle();
+    if (cErr) throw cErr;
+    if (!customer) throw new Error("Unknown customer");
+
+    const positive = data.items.filter((i) => i.quantity > 0);
+    const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+
+    for (const item of positive) {
+      if (item.sheetRow === 0) {
+        // New product — insert row first with quantity 0, then add-on writes to F
+        const newRow = await insertCustomerProductRow({
+          customerName: customer.name,
+          productName: item.productName,
+          quantity: 0,
+        });
+        item.sheetRow = newRow;
+      }
+      await addOnQuantityToRow(item.sheetRow, item.quantity);
+    }
+
+    const { data: submission, error: sErr } = await supabaseAdmin
+      .from("order_submissions")
+      .insert({
+        customer_id: customer.id,
+        for_date: data.forDate,
+        total_items: totalItems,
+        synced_to_sheet: true,
+      })
+      .select("id")
+      .single();
+    if (sErr) throw sErr;
+
+    if (positive.length) {
+      await supabaseAdmin.from("order_submission_items").insert(
+        positive.map((i) => ({
+          submission_id: submission.id,
+          product_id: i.productId ?? null,
+          product_name: i.productName,
+          quantity: i.quantity,
+          sheet_row: i.sheetRow,
+        })),
+      );
+    }
+
     return { ok: true, submissionId: submission.id, totalItems };
   });
 
@@ -131,7 +242,6 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
   const productRows = await readProductRows();
   const customerRows = await readCustomerRows();
 
-  // ---- Build product set (from products tab + customer rows) ----
   const isSentinel = (s: string) => /insert products above/i.test(s);
   const productMap = new Map<string, string | null>();
   for (const r of productRows.slice(1)) {
@@ -144,7 +254,6 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
     if (p && !isSentinel(p) && !productMap.has(p)) productMap.set(p, null);
   }
 
-  // Merge with existing products (preserve ids + image_url)
   const { data: existingProducts } = await supabaseAdmin
     .from("products")
     .select("id, name, category, image_url");
@@ -166,7 +275,6 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
     }
   }
 
-  // ---- Customers ----
   const seen = new Map<string, { driver: string | null; order: number }>();
   let order = 0;
   for (const r of customerRows.slice(1)) {
@@ -206,7 +314,6 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
     customersTouched += 1;
   }
 
-  // ---- Customer_products ----
   const cId = new Map(Array.from(existingByCName.entries()).map(([n, c]) => [n, c.id]));
   const pId = new Map(Array.from(existingByName.entries()).map(([n, p]) => [n, p.id]));
 
@@ -254,22 +361,17 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
   };
 });
 
-// Auto-seed when DB is empty. Safe to call on every page load.
 export const ensureSeeded = createServerFn({ method: "GET" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { count } = await supabaseAdmin
     .from("customers")
     .select("id", { count: "exact", head: true });
   if ((count ?? 0) > 0) return { seeded: false };
-  // Call sync handler directly
-  const { readCustomerRows, readProductRows } = await import("./sheets.server");
-  await Promise.all([readCustomerRows(), readProductRows()]);
-  // Trigger full sync
   await syncFromSheet();
   return { seeded: true };
 });
 
-// ============================== ADMIN: ORDER HISTORY ==============================
+// ============================== ADMIN ==============================
 
 export const listSubmissions = createServerFn({ method: "GET" })
   .inputValidator((d: { customerId?: string; limit?: number }) =>
@@ -302,12 +404,11 @@ export const getSubmissionDetail = createServerFn({ method: "GET" })
     const { data: items, error: iErr } = await supabaseAdmin
       .from("order_submission_items")
       .select("product_name, quantity, sheet_row")
-      .eq("submission_id", data.id);
+      .eq("submission_id", data.id)
+      .order("product_name", { ascending: true });
     if (iErr) throw iErr;
     return { ...sub, items: items ?? [] };
   });
-
-// ============================== ANALYTICS ==============================
 
 export const analyticsOverview = createServerFn({ method: "GET" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -319,8 +420,6 @@ export const analyticsOverview = createServerFn({ method: "GET" }).handler(async
   if (error) throw error;
   return data ?? [];
 });
-
-// ============================== PRODUCT IMAGES ==============================
 
 export const setProductImageUrl = createServerFn({ method: "POST" })
   .inputValidator((d: { productId: string; imageUrl: string | null }) =>
@@ -335,8 +434,6 @@ export const setProductImageUrl = createServerFn({ method: "POST" })
     if (error) throw error;
     return { ok: true };
   });
-
-// ============================== ADD NEW CUSTOMER (writes to sheet) ==============================
 
 const NewCustomerInput = z.object({
   name: z.string().min(1),
@@ -357,13 +454,11 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
     if (pErr) throw pErr;
     if (!products?.length) throw new Error("No products selected");
 
-    // Append to sheet
     const startRow = await appendCustomerRows(
       products.map((p) => ({ customer: data.name, product: p.name, driver: data.driver })),
     );
     if (!startRow) throw new Error("Sheet did not return inserted row range");
 
-    // Create slug and customer record
     let slug = slugify(data.name);
     const base = slug;
     let i = 2;

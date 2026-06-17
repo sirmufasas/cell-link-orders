@@ -7,6 +7,7 @@ import {
 } from "recharts";
 import {
   listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
+  getSubmissionDetail,
 } from "@/lib/bakery.functions";
 
 const SHEET_URL = "https://docs.google.com/spreadsheets/d/18n8m7xpZleB6d9l2ccwOqRWbc8QxLVBXftdBVlxL2tQ/edit";
@@ -54,6 +55,19 @@ function AdminPage() {
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [bucket, setBucket] = useState<Bucket>("day");
   const [dim, setDim] = useState<Dim>("items");
+  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<Awaited<ReturnType<typeof getSubmissionDetail>> | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  async function openDetail(id: string) {
+    setDetailId(id); setDetail(null); setDetailLoading(true);
+    try {
+      const d = await getSubmissionDetail({ data: { id } });
+      setDetail(d);
+    } finally {
+      setDetailLoading(false);
+    }
+  }
 
   // Auto-refresh data every 30s so the dashboard stays live
   useEffect(() => {
@@ -213,15 +227,19 @@ function AdminPage() {
               <div className="p-6 text-center text-sm text-[#8b6f4e]">No orders submitted yet.</div>
             )}
             {submissions.map((s) => (
-              <div key={s.id} className="p-3 flex items-center justify-between text-sm">
+              <button
+                key={s.id}
+                onClick={() => openDetail(s.id)}
+                className="w-full text-left p-3 flex items-center justify-between text-sm hover:bg-[#fdf8f1]"
+              >
                 <div className="min-w-0">
                   <div className="font-semibold truncate">{s.customer?.name ?? "—"}</div>
                   <div className="text-xs text-[#8b6f4e]">
                     For {s.for_date} · {s.total_items} items · submitted {new Date(s.created_at).toLocaleString()}
                   </div>
                 </div>
-                <span className="text-green-700 text-xs font-semibold">✓ Synced</span>
-              </div>
+                <span className="text-[#c8362b] text-xs font-semibold">View →</span>
+              </button>
             ))}
           </section>
         )}
@@ -279,6 +297,38 @@ function AdminPage() {
           </section>
         )}
       </main>
+
+      {detailId && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => setDetailId(null)}>
+          <div className="bg-white rounded-2xl max-w-md w-full max-h-[85vh] overflow-auto shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-4 border-b border-[#e8dcc8] sticky top-0 bg-white">
+              <h3 className="font-bold">Order details</h3>
+              <button onClick={() => setDetailId(null)} className="text-2xl leading-none text-[#8b6f4e]">×</button>
+            </div>
+            <div className="p-4">
+              {detailLoading && <p className="text-sm text-[#8b6f4e]">Loading…</p>}
+              {detail && (
+                <>
+                  <div className="mb-3">
+                    <div className="font-bold">{detail.customer?.name ?? "—"}</div>
+                    <div className="text-xs text-[#8b6f4e]">
+                      For {detail.for_date} · {detail.total_items} items · {new Date(detail.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                  <ul className="text-sm divide-y divide-[#e8dcc8] border border-[#e8dcc8] rounded-xl">
+                    {detail.items.map((it, i) => (
+                      <li key={i} className="flex justify-between px-3 py-2">
+                        <span>{it.product_name}</span>
+                        <span className="font-semibold">{it.quantity}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
