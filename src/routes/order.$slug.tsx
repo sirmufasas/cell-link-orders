@@ -1,5 +1,5 @@
 import { createFileRoute, Link, notFound } from "@tanstack/react-router";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useSuspenseQuery, queryOptions, useQueryClient } from "@tanstack/react-query";
 import { getCustomerPage, listProducts, submitOrder, addOnToOrder, changeOrder } from "@/lib/bakery.functions";
 
@@ -53,9 +53,6 @@ function dateLabel(iso: string) {
 type LineKey = string;
 type Mode = "default" | "addon";
 
-// Kota-only products: anything starting with "rolls kota" or "kota" (case-insensitive,
-// trimmed), so variants like "Rolls Kota Doz", "Rolls Kota Dozen", "Kota Joe 2" etc.
-// are all caught — not just exact matches.
 const KOTA_ONLY_PREFIXES = ["rolls kota", "kota"];
 
 function isKotaOnlyProduct(name: string | undefined | null) {
@@ -74,7 +71,13 @@ function OrderPage() {
   const hasPriorOrders = page!.hasPriorOrders;
   const history = page!.history;
 
-  // "Starts with" so names like "Kota Joe 2" or "Kota Joe - Main" also qualify.
+  // Save this customer's slug so the homepage can redirect them back here
+  useEffect(() => {
+    try {
+      localStorage.setItem("pb-customer-slug", slug);
+    } catch {}
+  }, [slug]);
+
   const isKotaJoe = customer.name.trim().toLowerCase().startsWith("kota joe");
   const regulars = useMemo(
     () => regularsAll.filter((r) => isKotaJoe || !isKotaOnlyProduct(r.product?.name)),
@@ -88,7 +91,6 @@ function OrderPage() {
   const [error, setError] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [showChangeForm, setShowChangeForm] = useState(false);
-  // ordered = true means we just submitted; combined with todayOrder server-data drives the "received" screen
   const [mode, setMode] = useState<Mode>("default");
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
@@ -231,7 +233,7 @@ function OrderPage() {
     <div className="min-h-screen bg-[#fdf8f1] pb-40">
       <header className="bg-white border-b border-[#e8dcc8] sticky top-0 z-10">
         <div className="max-w-xl mx-auto px-5 py-4 flex items-center gap-3">
-          <Link to="/" className="w-9 h-9 rounded-full bg-gradient-to-br from-[#c8362b] to-[#8b1e1e] flex items-center justify-center text-white font-bold text-sm shadow-sm">P</Link>
+          <div className="w-9 h-9 rounded-full bg-gradient-to-br from-[#c8362b] to-[#8b1e1e] flex items-center justify-center text-white font-bold text-sm shadow-sm">P</div>
           <div className="flex-1 min-w-0">
             <p className="text-[10px] uppercase tracking-widest text-[#8b6f4e] font-semibold">Portugal Bakery</p>
             <h1 className="font-bold leading-tight truncate">{customer.name}</h1>
@@ -269,7 +271,6 @@ function OrderPage() {
             <div key={r.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
               <div className="flex-1 min-w-0">
                 <div className="font-semibold leading-tight text-sm">{product?.name ?? "—"}</div>
-                {/* <div className="text-[10px] text-[#8b6f4e] mt-0.5">Row C{r.sheet_row}{product?.category ? ` · ${product.category}` : ""}</div> */}
               </div>
               <QtyControl value={qty[k] ?? 0} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} />
             </div>
@@ -312,7 +313,6 @@ function OrderPage() {
                   <div key={p.id} className="bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm">
                     <div className="flex-1 min-w-0">
                       <div className="font-medium text-sm truncate">{p.name}</div>
-                      {/* {p.category && <div className="text-[10px] text-[#8b6f4e]">{p.category}</div>} */}
                     </div>
                     <QtyControl value={qty[k] ?? 0} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} />
                   </div>
@@ -388,7 +388,6 @@ function HistoryModal({
   }>;
   onClose: () => void;
 }) {
-  // Group by created_at date (local)
   const groups = useMemo(() => {
     const m = new Map<string, typeof history>();
     for (const h of history) {
