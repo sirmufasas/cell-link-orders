@@ -297,6 +297,38 @@ function AdminPage() {
           </section>
         )}
       </main>
+
+      {detailId && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => setDetailId(null)}>
+          <div className="bg-white rounded-2xl max-w-md w-full max-h-[85vh] overflow-auto shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-4 border-b border-[#e8dcc8] sticky top-0 bg-white">
+              <h3 className="font-bold">Order details</h3>
+              <button onClick={() => setDetailId(null)} className="text-2xl leading-none text-[#8b6f4e]">×</button>
+            </div>
+            <div className="p-4">
+              {detailLoading && <p className="text-sm text-[#8b6f4e]">Loading…</p>}
+              {detail && (
+                <>
+                  <div className="mb-3">
+                    <div className="font-bold">{detail.customer?.name ?? "—"}</div>
+                    <div className="text-xs text-[#8b6f4e]">
+                      For {detail.for_date} · {detail.total_items} items · {new Date(detail.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                  <ul className="text-sm divide-y divide-[#e8dcc8] border border-[#e8dcc8] rounded-xl">
+                    {detail.items.map((it, i) => (
+                      <li key={i} className="flex justify-between px-3 py-2">
+                        <span>{it.product_name}</span>
+                        <span className="font-semibold">{it.quantity}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
