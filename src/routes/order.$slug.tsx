@@ -200,7 +200,7 @@ function OrderPage() {
             >
               + Add onto Prev Order
             </button>
-            {hasPriorOrders && (
+            {/* {hasPriorOrders && (
               <button
                 onClick={() => {
                   const prefill = buildPrefillFromTodayOrder();
@@ -213,7 +213,7 @@ function OrderPage() {
               >
                 Change Order
               </button>
-            )}
+            )} */}
             <button
               onClick={() => setShowHistory(true)}
               className="border border-[#e8dcc8] hover:bg-[#fdf8f1] font-semibold py-3 rounded-xl"
