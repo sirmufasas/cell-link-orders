@@ -65,7 +65,7 @@ export const getCustomerPage = createServerFn({ method: "GET" })
     const { data: todaySubs } = await supabaseAdmin
       .from("order_submissions")
       .select(
-        "id, for_date, total_items, created_at, order_type, items:order_submission_items(product_id, product_name, quantity, sheet_row)",
+        "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_id, product_name, quantity, sheet_row)",
       )
       .eq("customer_id", customer.id)
       .eq("for_date", todayKey)
@@ -80,7 +80,9 @@ export const getCustomerPage = createServerFn({ method: "GET" })
 
     const { data: history } = await supabaseAdmin
       .from("order_submissions")
-      .select("id, for_date, total_items, created_at, order_type, items:order_submission_items(product_name, quantity)")
+      .select(
+        "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_name, quantity)",
+      )
       .eq("customer_id", customer.id)
       .gte("created_at", sevenDaysAgo)
       .order("created_at", { ascending: false });
@@ -108,13 +110,19 @@ const SubmitOrderInput = z.object({
   slug: z.string().min(1),
   forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   items: z.array(SubmitItem),
+  // Required note from the customer — written to column J ("Comments") on
+  // every sheet row touched by this submission. The order will not go
+  // through without this.
+  message: z.string().min(1),
 });
 
 export const submitOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { writeOrderQuantities, insertCustomerProductRow } = await import("./sheets.server");
+    const { writeOrderQuantities, insertCustomerProductRow, writeOrderComment } = await import(
+      "@/lib/sheets.server"
+    );
 
     const { data: customer, error: cErr } = await supabaseAdmin
       .from("customers")
@@ -146,6 +154,9 @@ export const submitOrder = createServerFn({ method: "POST" })
       positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
     );
 
+    // 2b) Write the customer's message into column J on every row touched
+    await writeOrderComment(positive.map((i) => i.sheetRow), data.message);
+
     // 3) Persist a copy for history / analytics
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
@@ -155,6 +166,7 @@ export const submitOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "new",
+        message: data.message,
       })
       .select("id")
       .single();
@@ -192,7 +204,8 @@ export const changeOrder = createServerFn({ method: "POST" })
       writeOrderQuantities,
       insertCustomerProductRow,
       clearAddOnColumns,
-    } = await import("./sheets.server");
+      writeOrderComment,
+    } = await import("@/lib/sheets.server");
 
     const { data: customer, error: cErr } = await supabaseAdmin
       .from("customers")
@@ -239,6 +252,9 @@ export const changeOrder = createServerFn({ method: "POST" })
 
     await writeOrderQuantities(positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })));
 
+    // 3b) Write the customer's message into column J on every row touched
+    await writeOrderComment(positive.map((i) => i.sheetRow), data.message);
+
     // 4) Persist a history record, same shape as submitOrder.
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
@@ -248,6 +264,7 @@ export const changeOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "changed",
+        message: data.message,
       })
       .select("id")
       .single();
@@ -274,7 +291,9 @@ export const addOnToOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { addOnQuantityToRow, insertCustomerProductRow } = await import("./sheets.server");
+    const { addOnQuantityToRow, insertCustomerProductRow, writeOrderComment } = await import(
+      "@/lib/sheets.server"
+    );
 
     const { data: customer, error: cErr } = await supabaseAdmin
       .from("customers")
@@ -300,6 +319,9 @@ export const addOnToOrder = createServerFn({ method: "POST" })
       await addOnQuantityToRow(item.sheetRow, item.quantity);
     }
 
+    // Write the customer's message into column J on every row touched
+    await writeOrderComment(positive.map((i) => i.sheetRow), data.message);
+
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
@@ -308,6 +330,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "added",
+        message: data.message,
       })
       .select("id")
       .single();
@@ -332,7 +355,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
 
 export const syncFromSheet = createServerFn({ method: "POST" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { readCustomerRows, readProductRows } = await import("./sheets.server");
+  const { readCustomerRows, readProductRows } = await import("@/lib/sheets.server");
 
   const productRows = await readProductRows();
   const customerRows = await readCustomerRows();
@@ -466,6 +489,16 @@ export const ensureSeeded = createServerFn({ method: "GET" }).handler(async () =
   return { seeded: true };
 });
 
+// ============================== ACTIVE SHEET INFO ==============================
+
+export const getActiveSheetInfo = createServerFn({ method: "GET" }).handler(async () => {
+  const { getActiveSheetUrl, getActiveSheetLabel } = await import("@/lib/sheets.server");
+  return {
+    url: getActiveSheetUrl(),
+    label: getActiveSheetLabel(),
+  };
+});
+
 // ============================== ADMIN ==============================
 
 export const listSubmissions = createServerFn({ method: "GET" })
@@ -540,7 +573,7 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
   .validator((d) => NewCustomerInput.parse(d))
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { appendCustomerRows } = await import("./sheets.server");
+    const { appendCustomerRows } = await import("@/lib/sheets.server");
 
     const { data: products, error: pErr } = await supabaseAdmin
       .from("products")
@@ -584,4 +617,159 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
     if (cpErr) throw cpErr;
 
     return { ok: true, slug: newCustomer.slug, startRow, count: products.length };
+  });
+
+// ============================== ESTIMATES ==============================
+// No date dimension: each product has ONE persistent estimate quantity
+// that carries forward every day until someone edits and saves it.
+
+export const getEstimateProducts = createServerFn({ method: "GET" }).handler(async () => {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data: products, error: pErr } = await supabaseAdmin
+    .from("products")
+    .select("id, name, category")
+    .not("name", "ilike", "%insert products above%")
+    .order("name", { ascending: true });
+  if (pErr) throw pErr;
+
+  const { data: estimates, error: eErr } = await supabaseAdmin
+    .from("product_estimates")
+    .select("product_id, quantity");
+  if (eErr) throw eErr;
+
+  const qtyByProduct = new Map((estimates ?? []).map((e) => [e.product_id, e.quantity]));
+  return (products ?? []).map((p) => ({
+    id: p.id,
+    name: p.name,
+    category: p.category ?? "Uncategorized",
+    quantity: qtyByProduct.get(p.id) ?? 0,
+  }));
+});
+
+const EstimateUpdate = z.object({ productId: z.string().uuid(), quantity: z.number().int().min(0) });
+const SaveEstimatesInput = z.object({
+  updates: z.array(EstimateUpdate),
+});
+
+export const saveEstimates = createServerFn({ method: "POST" })
+  .validator((d) => SaveEstimatesInput.parse(d))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    if (!data.updates.length) return { ok: true, updated: 0 };
+
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from("product_estimates")
+      .select("id, product_id")
+      .in("product_id", data.updates.map((u) => u.productId));
+    if (exErr) throw exErr;
+    const existingByProduct = new Map((existing ?? []).map((r) => [r.product_id, r.id]));
+
+    const toInsert: Array<{ product_id: string; quantity: number }> = [];
+    const toUpdate: Array<{ id: string; quantity: number }> = [];
+    const toDelete: string[] = [];
+
+    for (const u of data.updates) {
+      const existingId = existingByProduct.get(u.productId);
+      if (u.quantity > 0) {
+        if (existingId) toUpdate.push({ id: existingId, quantity: u.quantity });
+        else toInsert.push({ product_id: u.productId, quantity: u.quantity });
+      } else if (existingId) {
+        toDelete.push(existingId);
+      }
+    }
+
+    if (toInsert.length) {
+      const { error } = await supabaseAdmin.from("product_estimates").insert(toInsert);
+      if (error) throw error;
+    }
+    for (const u of toUpdate) {
+      const { error } = await supabaseAdmin.from("product_estimates").update({ quantity: u.quantity }).eq("id", u.id);
+      if (error) throw error;
+    }
+    if (toDelete.length) {
+      const { error } = await supabaseAdmin.from("product_estimates").delete().in("id", toDelete);
+      if (error) throw error;
+    }
+
+    return { ok: true, updated: data.updates.length };
+  });
+
+// ============================== PRODUCT STOCKS ==============================
+// Two completely separate tables — freezer and production — not one table
+// with a "section" column. Each persists independently.
+
+const StockSection = z.enum(["Production", "Freezer"]);
+
+function stockTableFor(section: "Production" | "Freezer") {
+  return section === "Freezer" ? "product_stocks_freezer" : "product_stocks_production";
+}
+
+export const getProductStocks = createServerFn({ method: "GET" })
+  .validator((d: { section: "Production" | "Freezer" }) =>
+    z.object({ section: StockSection }).parse(d),
+  )
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: products, error: pErr } = await supabaseAdmin
+      .from("products")
+      .select("id, name, category")
+      .not("name", "ilike", "%insert products above%")
+      .order("name", { ascending: true });
+    if (pErr) throw pErr;
+
+    const table = stockTableFor(data.section);
+    const { data: stocks, error: sErr } = await supabaseAdmin
+      .from(table)
+      .select("product_id, quantity");
+    if (sErr) throw sErr;
+
+    const qtyByProduct = new Map((stocks ?? []).map((s: any) => [s.product_id, s.quantity]));
+    return (products ?? []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      category: p.category ?? "Uncategorized",
+      quantity: qtyByProduct.get(p.id) ?? 0,
+    }));
+  });
+
+const StockUpdate = z.object({ productId: z.string().uuid(), quantity: z.number().int().min(0) });
+const SaveStocksInput = z.object({ section: StockSection, updates: z.array(StockUpdate) });
+
+export const saveProductStocks = createServerFn({ method: "POST" })
+  .validator((d) => SaveStocksInput.parse(d))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    if (!data.updates.length) return { ok: true, updated: 0 };
+
+    const table = stockTableFor(data.section);
+
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from(table)
+      .select("id, product_id")
+      .in("product_id", data.updates.map((u) => u.productId));
+    if (exErr) throw exErr;
+    const existingByProduct = new Map((existing ?? []).map((r: any) => [r.product_id, r.id]));
+
+    const toInsert: Array<{ product_id: string; quantity: number }> = [];
+    const toUpdate: Array<{ id: string; quantity: number }> = [];
+
+    for (const u of data.updates) {
+      const existingId = existingByProduct.get(u.productId);
+      if (existingId) toUpdate.push({ id: existingId, quantity: u.quantity });
+      else toInsert.push({ product_id: u.productId, quantity: u.quantity });
+    }
+
+    if (toInsert.length) {
+      const { error } = await supabaseAdmin.from(table).insert(toInsert);
+      if (error) throw error;
+    }
+    for (const u of toUpdate) {
+      const { error } = await supabaseAdmin
+        .from(table)
+        .update({ quantity: u.quantity, updated_at: new Date().toISOString() })
+        .eq("id", u.id);
+      if (error) throw error;
+    }
+
+    return { ok: true, updated: data.updates.length };
   });

@@ -93,6 +93,11 @@ function OrderPage() {
   const [showChangeForm, setShowChangeForm] = useState(false);
   const [mode, setMode] = useState<Mode>("default");
 
+  // Required "message before sending" popup — the order only goes through
+  // once the customer has typed something here and pressed Send.
+  const [showMessageModal, setShowMessageModal] = useState(false);
+  const [message, setMessage] = useState("");
+
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
   const regularProductIds = useMemo(
@@ -156,18 +161,19 @@ function OrderPage() {
     return items;
   }
 
-  async function handleSubmit() {
+  async function handleSubmit(msg: string) {
     setSubmitting(true); setError(null);
     try {
       const items = buildItems();
       if (mode === "addon") {
-        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items } });
+        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
       } else if (showChangeForm) {
-        await changeOrder({ data: { slug, forDate: tomorrowISO(), items } });
+        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
       } else {
-        await submitOrder({ data: { slug, forDate: tomorrowISO(), items } });
+        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
       }
       setQty({});
+      setMessage("");
       setMode("default");
       setShowChangeForm(false);
       await qc.invalidateQueries({ queryKey: ["customer-page", slug] });
@@ -176,6 +182,12 @@ function OrderPage() {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function handleSendMessage() {
+    if (!message.trim()) return;
+    setShowMessageModal(false);
+    void handleSubmit(message);
   }
 
   // ===== Received-today screen =====
@@ -190,10 +202,15 @@ function OrderPage() {
           </div>
           <h1 className="text-2xl font-bold mb-2">Your order has been received!</h1>
           <h3 className="text-sm font-semibold text-[#8b6f4e] mb-2">New orders can only be submitted tomorrow</h3>
-          <p className="text-[#6b5544] mb-6">
+          <p className="text-[#6b5544] mb-2">
             <strong>{customer.name}</strong> — {todayOrder.total_items} items for {tomorrowLabel()}.
           </p>
-          <div className="flex flex-col gap-2">
+          {todayOrder.message && (
+            <p className="text-xs text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-2 mb-4 text-left">
+              <span className="font-semibold">Your note: </span>{todayOrder.message}
+            </p>
+          )}
+          <div className="flex flex-col gap-2 mt-2">
             <button
               onClick={() => { setMode("addon"); setQty({}); }}
               className="bg-[#c8362b] hover:bg-[#a82a22] text-white font-bold py-3 rounded-xl"
@@ -340,7 +357,7 @@ function OrderPage() {
           </div>
           <div className="flex gap-2">
             <button
-              onClick={handleSubmit}
+              onClick={() => setShowMessageModal(true)}
               disabled={submitting || totalItems === 0}
               className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl transition"
             >
@@ -358,6 +375,15 @@ function OrderPage() {
       </div>
 
       {showHistory && <HistoryModal history={history} onClose={() => setShowHistory(false)} />}
+      {showMessageModal && (
+        <MessageModal
+          value={message}
+          onChange={setMessage}
+          onCancel={() => setShowMessageModal(false)}
+          onSend={handleSendMessage}
+          sending={submitting}
+        />
+      )}
       {submitting && <SubmittingOverlay mode={mode} showChangeForm={showChangeForm} />}
     </div>
   );
@@ -384,6 +410,7 @@ function HistoryModal({
     total_items: number;
     created_at: string;
     order_type?: string | null;
+    message?: string | null;
     items: Array<{ product_name: string; quantity: number }>;
   }>;
   onClose: () => void;
@@ -437,12 +464,70 @@ function HistoryModal({
                           </li>
                         ))}
                       </ul>
+                      {s.message && (
+                        <div className="mt-2 pt-2 border-t border-[#e8dcc8] text-xs text-[#6b5544]">
+                          <span className="font-semibold">Note: </span>{s.message}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
               </div>
             </div>
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MessageModal({
+  value,
+  onChange,
+  onCancel,
+  onSend,
+  sending,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onCancel: () => void;
+  onSend: () => void;
+  sending: boolean;
+}) {
+  const canSend = value.trim().length > 0 && !sending;
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onCancel}>
+      <div
+        className="bg-white rounded-2xl max-w-md w-full shadow-xl p-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="font-bold text-lg mb-1">Add a message</h3>
+        <p className="text-sm text-[#8b6f4e] mb-3">
+          Please add a quick note before sending your order (e.g. delivery time, special instructions).
+        </p>
+        <textarea
+          autoFocus
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="Type your message…"
+          rows={4}
+          className="w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b] resize-none"
+        />
+        <div className="flex gap-2 mt-4">
+          <button
+            onClick={onCancel}
+            disabled={sending}
+            className="flex-1 border border-[#e8dcc8] font-semibold py-3 rounded-xl hover:bg-[#fdf8f1] disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onSend}
+            disabled={!canSend}
+            className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl"
+          >
+            {sending ? "Sending…" : "Send"}
+          </button>
         </div>
       </div>
     </div>

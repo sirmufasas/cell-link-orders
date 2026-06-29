@@ -1,17 +1,78 @@
-// Server-only helpers for talking to the Portugal Bakery Google Sheet
+// Server-only helpers for talking to Portugal Bakery Google Sheets
 // directly via the Google Sheets API, using a service account.
+//
+// Two spreadsheets are used, selected based on TOMORROW's delivery day:
+//   Mon / Tue / Wed  → MON_WED_SHEET_ID
+//   Thu / Fri / Sat  → THU_SAT_SHEET_ID
+//   Sunday           → MON_WED_SHEET_ID  (prepares for Monday)
+//
+// Both spreadsheets share the same tab names, so all read/write helpers
+// work against whichever sheet getActiveSheetId() resolves to.
 
 import { google } from "googleapis";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-export const PORTUGAL_BAKERY_SHEET_ID =
-  "18n8m7xpZleB6d9l2ccwOqRWbc8QxLVBXftdBVlxL2tQ";
+// ============================== SHEET IDS ==============================
 
-export const SHEET_URL = `https://docs.google.com/spreadsheets/d/${PORTUGAL_BAKERY_SHEET_ID}/edit`;
+/** Mon–Wed delivery sheet */
+export const MON_WED_SHEET_ID = "137ZxSSgodwcOOUpItZyZplMpwn3QXL8DvdneqQowJ98";
+
+/** Thu–Sat delivery sheet */
+export const THU_SAT_SHEET_ID = "1PvpM6Be4xOCa_GqMYEg7-9M1BwcT1kfznwOxLRImEAw";
+
+/**
+ * Returns the spreadsheet ID to use for today's orders.
+ * Orders entered today are always for TOMORROW's delivery run.
+ *
+ * Tomorrow's day → sheet:
+ *   Monday    (1) → Mon-Wed
+ *   Tuesday   (2) → Mon-Wed
+ *   Wednesday (3) → Mon-Wed
+ *   Thursday  (4) → Thu-Sat
+ *   Friday    (5) → Thu-Sat
+ *   Saturday  (6) → Thu-Sat
+ *   Sunday    (0) → Mon-Wed  (Sunday orders deliver on Monday)
+ */
+export function getActiveSheetId(): string {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  // getDay(): 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+  const tomorrowDay = tomorrow.getDay();
+
+  if (tomorrowDay === 4 || tomorrowDay === 5 || tomorrowDay === 6) {
+    return THU_SAT_SHEET_ID;
+  }
+  // Mon(1), Tue(2), Wed(3), Sun(0) → Mon-Wed sheet
+  return MON_WED_SHEET_ID;
+}
+
+/** Human-readable label for the active sheet, useful for UI / logging. */
+export function getActiveSheetLabel(): string {
+  const id = getActiveSheetId();
+  return id === MON_WED_SHEET_ID ? "Mon–Wed" : "Thu–Sat";
+}
+
+/** The Google Sheets URL for the currently active sheet. */
+export function getActiveSheetUrl(): string {
+  return `https://docs.google.com/spreadsheets/d/${getActiveSheetId()}/edit`;
+}
+
+// ============================== TAB NAMES ==============================
 
 const TAB_CUSTOMERS = "Customer Order Details";
 const TAB_PRODUCTS = "Products List";
+
+// Estimates (column G) and stock (column F) both live on these two tabs.
+// Freezer and Production have different product lists, so the section
+// picked determines both which tab is read and which products show up.
+// NOTE: adjust these two strings if your actual tab names differ.
+const TAB_FREEZER = "Freezer";
+const TAB_PRODUCTION = "Production";
+
+function sectionTabName(section: "Production" | "Freezer") {
+  return section === "Freezer" ? TAB_FREEZER : TAB_PRODUCTION;
+}
 
 // ============================== AUTH ==============================
 
@@ -71,7 +132,7 @@ async function getSheetsClient() {
 export async function readCustomerRows(): Promise<string[][]> {
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: getActiveSheetId(),
     range: `${TAB_CUSTOMERS}!A1:E2000`,
   });
   return (res.data.values as string[][]) ?? [];
@@ -80,7 +141,7 @@ export async function readCustomerRows(): Promise<string[][]> {
 export async function readProductRows(): Promise<string[][]> {
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: getActiveSheetId(),
     range: `${TAB_PRODUCTS}!A1:B2000`,
   });
   return (res.data.values as string[][]) ?? [];
@@ -89,11 +150,46 @@ export async function readProductRows(): Promise<string[][]> {
 export async function readRowFull(row: number): Promise<string[]> {
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: getActiveSheetId(),
     range: `${TAB_CUSTOMERS}!A${row}:Z${row}`,
   });
   const vals = (res.data.values as string[][]) ?? [];
   return vals[0] ?? [];
+}
+
+/**
+ * Reads the Freezer or Production tab on the currently-active (day-based)
+ * spreadsheet. Column A = product name, column F = stock quantity,
+ * column G = estimate quantity. Row 1 is treated as a header row.
+ */
+export async function readSectionRows(
+  section: "Production" | "Freezer",
+): Promise<Array<{ row: number; name: string; stock: number; estimate: number }>> {
+  const sheets = await getSheetsClient();
+  const tab = sectionTabName(section);
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: getActiveSheetId(),
+    range: `${tab}!A1:G2000`,
+  });
+  const rows = (res.data.values as string[][]) ?? [];
+
+  const out: Array<{ row: number; name: string; stock: number; estimate: number }> = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] ?? [];
+    const name = (r[0] ?? "").trim();
+    if (!name) continue;
+    const stockRaw = (r[5] ?? "").toString().trim(); // column F
+    const estimateRaw = (r[6] ?? "").toString().trim(); // column G
+    const stock = stockRaw === "" ? 0 : parseInt(stockRaw, 10);
+    const estimate = estimateRaw === "" ? 0 : parseInt(estimateRaw, 10);
+    out.push({
+      row: i + 1, // 1-based sheet row
+      name,
+      stock: Number.isFinite(stock) ? stock : 0,
+      estimate: Number.isFinite(estimate) ? estimate : 0,
+    });
+  }
+  return out;
 }
 
 // ============================== WRITES ==============================
@@ -105,7 +201,7 @@ export async function writeOrderQuantities(
   if (!entries.length) return;
   const sheets = await getSheetsClient();
   await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: getActiveSheetId(),
     requestBody: {
       valueInputOption: "USER_ENTERED",
       data: entries.map((e) => ({
@@ -123,16 +219,51 @@ export async function clearOrderQuantities(rows: number[]) {
 }
 
 /** Write arbitrary single-cell values. */
-export async function writeCells(entries: Array<{ range: string; value: string }>) {
+export async function writeCells(
+  entries: Array<{ range: string; value: string }>,
+) {
   if (!entries.length) return;
   const sheets = await getSheetsClient();
   await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: getActiveSheetId(),
     requestBody: {
       valueInputOption: "USER_ENTERED",
       data: entries.map((e) => ({ range: e.range, values: [[e.value]] })),
     },
   });
+}
+
+/**
+ * Write the customer's order-message into column J ("Comments") for every
+ * row touched by a submission. Called right after the quantity writes in
+ * submitOrder / changeOrder / addOnToOrder.
+ */
+export async function writeOrderComment(rows: number[], message: string) {
+  const trimmed = message.trim();
+  if (!rows.length || !trimmed) return;
+  const uniqueRows = Array.from(new Set(rows));
+  await writeCells(
+    uniqueRows.map((row) => ({ range: `${TAB_CUSTOMERS}!J${row}`, value: trimmed })),
+  );
+}
+
+/**
+ * Write quantities into column F (stock) or G (estimate) of the Freezer /
+ * Production tab on the active spreadsheet.
+ */
+export async function writeSectionColumn(
+  section: "Production" | "Freezer",
+  column: "F" | "G",
+  entries: Array<{ row: number; quantity: number }>,
+) {
+  if (!entries.length) return;
+  const tab = sectionTabName(section);
+  await writeCells(
+    entries.map((e) => ({
+      range: `${tab}!${column}${e.row}`,
+      value: e.quantity > 0 ? String(e.quantity) : "",
+    })),
+  );
 }
 
 /** Append new customer rows. Returns the starting row number of the appended block. */
@@ -144,7 +275,7 @@ export async function appendCustomerRows(
   const values = rows.map((r) => [r.customer, r.product, "", r.driver, "No"]);
 
   const res = await sheets.spreadsheets.values.append({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: getActiveSheetId(),
     range: `${TAB_CUSTOMERS}!A:E`,
     valueInputOption: "USER_ENTERED",
     insertDataOption: "INSERT_ROWS",
@@ -157,21 +288,28 @@ export async function appendCustomerRows(
   return m ? parseInt(m[1], 10) : 0;
 }
 
-let _customerSheetId: number | null = null;
+// Cache is keyed by sheet ID so switching sheets gets a fresh lookup.
+const _customerSheetIdCache = new Map<string, number>();
+
 export async function getCustomerSheetId(): Promise<number> {
-  if (_customerSheetId !== null) return _customerSheetId;
+  const sheetId = getActiveSheetId();
+  if (_customerSheetIdCache.has(sheetId)) {
+    return _customerSheetIdCache.get(sheetId)!;
+  }
+
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.get({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: sheetId,
     fields: "sheets.properties",
   });
   const sheetList = res.data.sheets ?? [];
   const s = sheetList.find((x) => x.properties?.title === TAB_CUSTOMERS);
   if (!s || s.properties?.sheetId == null) {
-    throw new Error(`Tab "${TAB_CUSTOMERS}" not found`);
+    throw new Error(`Tab "${TAB_CUSTOMERS}" not found in sheet ${sheetId}`);
   }
-  _customerSheetId = s.properties.sheetId;
-  return _customerSheetId;
+
+  _customerSheetIdCache.set(sheetId, s.properties.sheetId);
+  return s.properties.sheetId;
 }
 
 /**
@@ -192,9 +330,14 @@ export async function insertCustomerProductRow(opts: {
   if (lastRow1 < 0) {
     // Customer doesn't exist yet — append at bottom
     const r = await appendCustomerRows([
-      { customer: opts.customerName, product: opts.productName, driver: "Collection" },
+      {
+        customer: opts.customerName,
+        product: opts.productName,
+        driver: "Collection",
+      },
     ]);
-    if (opts.quantity > 0) await writeOrderQuantities([{ row: r, quantity: opts.quantity }]);
+    if (opts.quantity > 0)
+      await writeOrderQuantities([{ row: r, quantity: opts.quantity }]);
     return r;
   }
 
@@ -206,7 +349,7 @@ export async function insertCustomerProductRow(opts: {
   const sheets = await getSheetsClient();
   // Insert blank row at lastRow1 (0-based startIndex = lastRow1)
   await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+    spreadsheetId: getActiveSheetId(),
     requestBody: {
       requests: [
         {
@@ -228,7 +371,10 @@ export async function insertCustomerProductRow(opts: {
   await writeCells([
     { range: `${TAB_CUSTOMERS}!A${newRow}`, value: opts.customerName },
     { range: `${TAB_CUSTOMERS}!B${newRow}`, value: opts.productName },
-    { range: `${TAB_CUSTOMERS}!C${newRow}`, value: opts.quantity > 0 ? String(opts.quantity) : "" },
+    {
+      range: `${TAB_CUSTOMERS}!C${newRow}`,
+      value: opts.quantity > 0 ? String(opts.quantity) : "",
+    },
     { range: `${TAB_CUSTOMERS}!D${newRow}`, value: driver },
     { range: `${TAB_CUSTOMERS}!E${newRow}`, value: colE },
   ]);
@@ -240,19 +386,22 @@ export async function insertCustomerProductRow(opts: {
  * at F, write the add-on quantity there, and update column C so it sums the
  * original value plus all filled add-on columns.
  */
-export async function addOnQuantityToRow(row: number, quantity: number): Promise<string> {
+export async function addOnQuantityToRow(
+  row: number,
+  quantity: number,
+): Promise<string> {
   if (quantity <= 0) return "";
   const sheets = await getSheetsClient();
 
   // Read current C (as formula) and F..Z values
   const [cValueRes, fzValuesRes] = await Promise.all([
     sheets.spreadsheets.values.get({
-      spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+      spreadsheetId: getActiveSheetId(),
       range: `${TAB_CUSTOMERS}!C${row}`,
       valueRenderOption: "FORMULA",
     }),
     sheets.spreadsheets.values.get({
-      spreadsheetId: PORTUGAL_BAKERY_SHEET_ID,
+      spreadsheetId: getActiveSheetId(),
       range: `${TAB_CUSTOMERS}!F${row}:Z${row}`,
     }),
   ]);
@@ -268,7 +417,8 @@ export async function addOnQuantityToRow(row: number, quantity: number): Promise
 
   // Build new C formula: original + every filled add-on column (F..colLetter)
   const filledLetters: string[] = [];
-  for (let i = 0; i < idx; i++) filledLetters.push(String.fromCharCode("F".charCodeAt(0) + i));
+  for (let i = 0; i < idx; i++)
+    filledLetters.push(String.fromCharCode("F".charCodeAt(0) + i));
   filledLetters.push(colLetter);
 
   let baseExpr: string;
@@ -281,7 +431,8 @@ export async function addOnQuantityToRow(row: number, quantity: number): Promise
     const numeric = cRaw.trim();
     baseExpr = numeric === "" ? "0" : numeric;
   }
-  const newFormula = `=${baseExpr}+` + filledLetters.map((L) => `${L}${row}`).join("+");
+  const newFormula =
+    `=${baseExpr}+` + filledLetters.map((L) => `${L}${row}`).join("+");
 
   await writeCells([
     { range: `${TAB_CUSTOMERS}!${colLetter}${row}`, value: String(quantity) },
