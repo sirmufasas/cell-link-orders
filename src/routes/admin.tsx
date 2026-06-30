@@ -8,7 +8,7 @@ import {
 import {
   listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
-  getActiveSheetInfo,
+  getActiveSheetInfo, promotePreOrders,
 } from "@/lib/bakery.functions";
 
 const customersQuery = queryOptions({ queryKey: ["customers"], queryFn: () => listCustomers() });
@@ -73,6 +73,8 @@ function AdminPage() {
   const [search, setSearch] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
+  const [promoting, setPromoting] = useState(false);
+  const [promoteMsg, setPromoteMsg] = useState<string | null>(null);
   const [bucket, setBucket] = useState<Bucket>("day");
   const [dim, setDim] = useState<Dim>("items");
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -128,6 +130,25 @@ function AdminPage() {
       setSyncMsg(`Error: ${(e as Error).message}`);
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function handlePromote() {
+    setPromoting(true); setPromoteMsg(null);
+    try {
+      const r = await promotePreOrders();
+      setPromoteMsg(
+        r.promoted
+          ? r.column
+            ? `Promoted ${r.day}: column ${r.column} → C.`
+            : `${r.day}: nothing to promote (column was empty).`
+          : `No promotion needed today (${r.day}).`
+      );
+      qc.invalidateQueries({ queryKey: ["submissions"] });
+    } catch (e) {
+      setPromoteMsg(`Error: ${(e as Error).message}`);
+    } finally {
+      setPromoting(false);
     }
   }
 
@@ -201,14 +222,21 @@ function AdminPage() {
             >
               📊 {sheetInfo?.label ?? "…"} Sheet
             </a>
+            <button onClick={handlePromote} disabled={promoting}
+              className="text-sm px-3 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white disabled:opacity-50">
+              {promoting ? "Promoting…" : "↑ Promote Pre-Orders"}
+            </button>
             <button onClick={handleSync} disabled={syncing}
               className="text-sm px-3 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white disabled:opacity-50">
               {syncing ? "Syncing…" : "↻ Re-sync"}
             </button>
           </div>
         </div>
-        {syncMsg && (
-          <div className="max-w-6xl mx-auto px-6 pb-3 text-sm text-[#6b5544]">{syncMsg}</div>
+        {(syncMsg || promoteMsg) && (
+          <div className="max-w-6xl mx-auto px-6 pb-3 space-y-1">
+            {syncMsg && <div className="text-sm text-[#6b5544]">{syncMsg}</div>}
+            {promoteMsg && <div className="text-sm text-[#6b5544]">{promoteMsg}</div>}
+          </div>
         )}
       </header>
 

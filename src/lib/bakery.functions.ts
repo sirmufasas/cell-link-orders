@@ -65,7 +65,7 @@ export const getCustomerPage = createServerFn({ method: "GET" })
     const { data: todaySubs } = await supabaseAdmin
       .from("order_submissions")
       .select(
-        "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_id, product_name, quantity, sheet_row)",
+        "id, for_date, total_items, created_at, order_type, items:order_submission_items(product_id, product_name, quantity, sheet_row)",
       )
       .eq("customer_id", customer.id)
       .eq("for_date", todayKey)
@@ -80,9 +80,7 @@ export const getCustomerPage = createServerFn({ method: "GET" })
 
     const { data: history } = await supabaseAdmin
       .from("order_submissions")
-      .select(
-        "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_name, quantity)",
-      )
+      .select("id, for_date, total_items, created_at, order_type, items:order_submission_items(product_name, quantity)")
       .eq("customer_id", customer.id)
       .gte("created_at", sevenDaysAgo)
       .order("created_at", { ascending: false });
@@ -166,7 +164,6 @@ export const submitOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "new",
-        message: data.message,
       })
       .select("id")
       .single();
@@ -264,7 +261,6 @@ export const changeOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "changed",
-        message: data.message,
       })
       .select("id")
       .single();
@@ -330,7 +326,6 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "added",
-        message: data.message,
       })
       .select("id")
       .single();
@@ -773,3 +768,14 @@ export const saveProductStocks = createServerFn({ method: "POST" })
 
     return { ok: true, updated: data.updates.length };
   });
+
+// ============================== PRE-ORDER PROMOTION ==============================
+// Manually triggered from the admin dashboard (no cron/route needed). Copies
+// the day's pre-order column (K or L) into column C and clears the source
+// column. Safe to call any time — it checks the current day itself and is a
+// no-op on days that don't need a promotion (Mon, Wed, Thu, Sun).
+
+export const promotePreOrders = createServerFn({ method: "POST" }).handler(async () => {
+  const { promotePreOrderColumn } = await import("@/lib/sheets.server");
+  return await promotePreOrderColumn();
+});
