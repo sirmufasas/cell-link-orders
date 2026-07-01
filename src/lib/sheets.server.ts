@@ -192,6 +192,48 @@ export async function readSectionRows(
   return out;
 }
 
+/**
+ * Reads column A (customer) and column D (driver) of "Customer Order
+ * Details" on the ACTIVE (day-based) spreadsheet, grouped by customer.
+ * A customer typically has many rows (one per product); this collapses
+ * them down to one entry per customer plus the full list of sheet rows
+ * that belong to them, so a driver change can be written to every row.
+ *
+ * driverOptions is the distinct, sorted list of non-empty driver values
+ * currently in use on this sheet — handy for a dropdown of existing
+ * drivers, while still allowing a free-text new driver name.
+ */
+export async function readDriverAssignments(): Promise<{
+  customers: Array<{ name: string; driver: string; rows: number[] }>;
+  driverOptions: string[];
+}> {
+  const all = await readCustomerRows();
+  const byName = new Map<string, { driver: string; rows: number[] }>();
+  const driverSet = new Set<string>();
+
+  for (let i = 1; i < all.length; i++) {
+    const r = all[i] ?? [];
+    const name = (r[0] ?? "").trim();
+    if (!name) continue;
+    const driver = (r[3] ?? "").toString().trim(); // column D
+    if (driver) driverSet.add(driver);
+
+    const entry = byName.get(name);
+    if (entry) {
+      entry.rows.push(i + 1); // 1-based sheet row
+    } else {
+      byName.set(name, { driver, rows: [i + 1] });
+    }
+  }
+
+  const customers = Array.from(byName.entries())
+    .map(([name, v]) => ({ name, driver: v.driver, rows: v.rows }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const driverOptions = Array.from(driverSet).sort((a, b) => a.localeCompare(b));
+
+  return { customers, driverOptions };
+}
+
 // ============================== WRITES ==============================
 
 /** Write quantity values into column C of "Customer Order Details" for the given sheet rows. */
@@ -264,6 +306,28 @@ export async function writeSectionColumn(
       value: e.quantity > 0 ? String(e.quantity) : "",
     })),
   );
+}
+
+/**
+ * Write a new driver name into column D of "Customer Order Details" for
+ * EVERY row belonging to this customer on the active (day-based) sheet.
+ * Returns the number of rows updated (0 if the customer wasn't found).
+ */
+export async function writeCustomerDriver(
+  customerName: string,
+  driver: string,
+): Promise<number> {
+  const all = await readCustomerRows();
+  const rows: number[] = [];
+  for (let i = 1; i < all.length; i++) {
+    if ((all[i]?.[0] ?? "").trim() === customerName) rows.push(i + 1);
+  }
+  if (!rows.length) return 0;
+
+  await writeCells(
+    rows.map((row) => ({ range: `${TAB_CUSTOMERS}!D${row}`, value: driver })),
+  );
+  return rows.length;
 }
 
 /** Append new customer rows. Returns the starting row number of the appended block. */

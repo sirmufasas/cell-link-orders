@@ -622,6 +622,53 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
     return { ok: true, slug: newCustomer.slug, startRow, count: products.length };
   });
 
+// ============================== DRIVERS ==============================
+// Drivers live in column D of "Customer Order Details" — the very same
+// tab and same active-sheet switching (Mon-Wed vs Thu-Sat, by tomorrow's
+// delivery day) used for order submission. There's no separate "Drivers"
+// tab; this just reads/writes that existing column, grouped by customer
+// so one change updates every row that customer has.
+
+export const getDriverAssignments = createServerFn({ method: "GET" }).handler(async () => {
+  const { readDriverAssignments, getActiveSheetLabel } = await import("@/lib/sheets.server");
+  const { customers, driverOptions } = await readDriverAssignments();
+  return {
+    customers: customers.map((c) => ({ name: c.name, driver: c.driver })),
+    driverOptions,
+    sheetLabel: getActiveSheetLabel(),
+  };
+});
+
+const SaveDriverInput = z.object({
+  customerName: z.string().min(1),
+  driver: z.string().min(1),
+});
+
+export const saveCustomerDriver = createServerFn({ method: "POST" })
+  .validator((d) => SaveDriverInput.parse(d))
+  .handler(async ({ data }) => {
+    const { writeCustomerDriver } = await import("@/lib/sheets.server");
+    const rowsUpdated = await writeCustomerDriver(data.customerName, data.driver);
+    if (rowsUpdated === 0) {
+      throw new Error(`No sheet rows found for customer "${data.customerName}"`);
+    }
+
+    // Best-effort: keep the cached Supabase customers table in sync too,
+    // so the Customers tab reflects the change without a full re-sync.
+    // The sheet write above is the source of truth either way.
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      await supabaseAdmin
+        .from("customers")
+        .update({ driver: data.driver })
+        .eq("name", data.customerName);
+    } catch {
+      // non-fatal
+    }
+
+    return { ok: true, rowsUpdated };
+  });
+
 // ============================== ESTIMATES ==============================
 // Estimates now live directly on the Freezer / Production tab of the
 // ACTIVE (day-based) spreadsheet, in column G — one persistent quantity
