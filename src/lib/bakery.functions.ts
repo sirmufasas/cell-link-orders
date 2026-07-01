@@ -108,10 +108,9 @@ const SubmitOrderInput = z.object({
   slug: z.string().min(1),
   forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   items: z.array(SubmitItem),
-  // Required note from the customer — written to column J ("Comments") on
-  // every sheet row touched by this submission. The order will not go
-  // through without this.
-  message: z.string().min(1),
+  // Optional note from the customer — written to column J ("Comments") on
+  // every sheet row touched by this submission, only when non-empty.
+  message: z.string().optional().default(""),
 });
 
 export const submitOrder = createServerFn({ method: "POST" })
@@ -132,6 +131,7 @@ export const submitOrder = createServerFn({ method: "POST" })
 
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    const message = data.message.trim();
 
     // 1) For items without a sheet row, insert a new row first (immediately below the customer's last row)
     let insertedAny = false;
@@ -152,8 +152,10 @@ export const submitOrder = createServerFn({ method: "POST" })
       positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
     );
 
-    // 2b) Write the customer's message into column J on every row touched
-    await writeOrderComment(positive.map((i) => i.sheetRow), data.message);
+    // 2b) Write the customer's message into column J on every row touched — only if they left one
+    if (message.length > 0) {
+      await writeOrderComment(positive.map((i) => i.sheetRow), message);
+    }
 
     // 3) Persist a copy for history / analytics
     const { data: submission, error: sErr } = await supabaseAdmin
@@ -233,6 +235,7 @@ export const changeOrder = createServerFn({ method: "POST" })
     //    products, then write quantities for everything positive.
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    const message = data.message.trim();
 
     let insertedAny = false;
     for (const item of positive) {
@@ -249,8 +252,10 @@ export const changeOrder = createServerFn({ method: "POST" })
 
     await writeOrderQuantities(positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })));
 
-    // 3b) Write the customer's message into column J on every row touched
-    await writeOrderComment(positive.map((i) => i.sheetRow), data.message);
+    // 3b) Write the customer's message into column J on every row touched — only if they left one
+    if (message.length > 0) {
+      await writeOrderComment(positive.map((i) => i.sheetRow), message);
+    }
 
     // 4) Persist a history record, same shape as submitOrder.
     const { data: submission, error: sErr } = await supabaseAdmin
@@ -301,6 +306,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
 
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    const message = data.message.trim();
 
     for (const item of positive) {
       if (item.sheetRow === 0) {
@@ -315,8 +321,10 @@ export const addOnToOrder = createServerFn({ method: "POST" })
       await addOnQuantityToRow(item.sheetRow, item.quantity);
     }
 
-    // Write the customer's message into column J on every row touched
-    await writeOrderComment(positive.map((i) => i.sheetRow), data.message);
+    // Write the customer's message into column J on every row touched — only if they left one
+    if (message.length > 0) {
+      await writeOrderComment(positive.map((i) => i.sheetRow), message);
+    }
 
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
@@ -615,167 +623,86 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
   });
 
 // ============================== ESTIMATES ==============================
-// No date dimension: each product has ONE persistent estimate quantity
-// that carries forward every day until someone edits and saves it.
+// Estimates now live directly on the Freezer / Production tab of the
+// ACTIVE (day-based) spreadsheet, in column G — one persistent quantity
+// per sheet row that carries forward until someone edits and saves it.
+// Freezer and Production are read/written completely separately (no
+// merging), matched by "section", same as Stocks below. There is no
+// Supabase table involved and no "category" — the sheet has none.
+//
+// Each product is identified by its SHEET ROW NUMBER (not a uuid), since
+// that's what writeSectionColumn() needs to know which cell to update.
 
-export const getEstimateProducts = createServerFn({ method: "GET" }).handler(async () => {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data: products, error: pErr } = await supabaseAdmin
-    .from("products")
-    .select("id, name, category")
-    .not("name", "ilike", "%insert products above%")
-    .order("name", { ascending: true });
-  if (pErr) throw pErr;
+const SECTION_SENTINEL_RE = /insert products above/i;
+const StockSection = z.enum(["Production", "Freezer"]);
 
-  const { data: estimates, error: eErr } = await supabaseAdmin
-    .from("product_estimates")
-    .select("product_id, quantity");
-  if (eErr) throw eErr;
+export const getEstimateProducts = createServerFn({ method: "GET" })
+  .validator((d: { section: "Production" | "Freezer" }) =>
+    z.object({ section: StockSection }).parse(d),
+  )
+  .handler(async ({ data }) => {
+    const { readSectionRows } = await import("@/lib/sheets.server");
+    const rows = await readSectionRows(data.section);
+    return rows
+      .filter((r) => !SECTION_SENTINEL_RE.test(r.name))
+      .map((r) => ({
+        id: r.row, // sheet row number — unique within this section
+        name: r.name,
+        quantity: r.estimate,
+      }));
+  });
 
-  const qtyByProduct = new Map((estimates ?? []).map((e) => [e.product_id, e.quantity]));
-  return (products ?? []).map((p) => ({
-    id: p.id,
-    name: p.name,
-    category: p.category ?? "Uncategorized",
-    quantity: qtyByProduct.get(p.id) ?? 0,
-  }));
-});
-
-const EstimateUpdate = z.object({ productId: z.string().uuid(), quantity: z.number().int().min(0) });
+const EstimateUpdate = z.object({ row: z.number().int().min(1), quantity: z.number().int().min(0) });
 const SaveEstimatesInput = z.object({
+  section: StockSection,
   updates: z.array(EstimateUpdate),
 });
 
 export const saveEstimates = createServerFn({ method: "POST" })
   .validator((d) => SaveEstimatesInput.parse(d))
   .handler(async ({ data }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     if (!data.updates.length) return { ok: true, updated: 0 };
-
-    const { data: existing, error: exErr } = await supabaseAdmin
-      .from("product_estimates")
-      .select("id, product_id")
-      .in("product_id", data.updates.map((u) => u.productId));
-    if (exErr) throw exErr;
-    const existingByProduct = new Map((existing ?? []).map((r) => [r.product_id, r.id]));
-
-    const toInsert: Array<{ product_id: string; quantity: number }> = [];
-    const toUpdate: Array<{ id: string; quantity: number }> = [];
-    const toDelete: string[] = [];
-
-    for (const u of data.updates) {
-      const existingId = existingByProduct.get(u.productId);
-      if (u.quantity > 0) {
-        if (existingId) toUpdate.push({ id: existingId, quantity: u.quantity });
-        else toInsert.push({ product_id: u.productId, quantity: u.quantity });
-      } else if (existingId) {
-        toDelete.push(existingId);
-      }
-    }
-
-    if (toInsert.length) {
-      const { error } = await supabaseAdmin.from("product_estimates").insert(toInsert);
-      if (error) throw error;
-    }
-    for (const u of toUpdate) {
-      const { error } = await supabaseAdmin.from("product_estimates").update({ quantity: u.quantity }).eq("id", u.id);
-      if (error) throw error;
-    }
-    if (toDelete.length) {
-      const { error } = await supabaseAdmin.from("product_estimates").delete().in("id", toDelete);
-      if (error) throw error;
-    }
-
+    const { writeSectionColumn } = await import("@/lib/sheets.server");
+    await writeSectionColumn(
+      data.section,
+      "G",
+      data.updates.map((u) => ({ row: u.row, quantity: u.quantity })),
+    );
     return { ok: true, updated: data.updates.length };
   });
 
 // ============================== PRODUCT STOCKS ==============================
-// Two completely separate tables — freezer and production — not one table
-// with a "section" column. Each persists independently.
-
-const StockSection = z.enum(["Production", "Freezer"]);
-
-function stockTableFor(section: "Production" | "Freezer") {
-  return section === "Freezer" ? "product_stocks_freezer" : "product_stocks_production";
-}
+// Same deal as Estimates, but column F, on the same two tabs. Freezer and
+// Production stock levels are independent — no shared table, no merging.
 
 export const getProductStocks = createServerFn({ method: "GET" })
   .validator((d: { section: "Production" | "Freezer" }) =>
     z.object({ section: StockSection }).parse(d),
   )
   .handler(async ({ data }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { data: products, error: pErr } = await supabaseAdmin
-      .from("products")
-      .select("id, name, category")
-      .not("name", "ilike", "%insert products above%")
-      .order("name", { ascending: true });
-    if (pErr) throw pErr;
-
-    const table = stockTableFor(data.section);
-    const { data: stocks, error: sErr } = await supabaseAdmin
-      .from(table)
-      .select("product_id, quantity");
-    if (sErr) throw sErr;
-
-    const qtyByProduct = new Map((stocks ?? []).map((s: any) => [s.product_id, s.quantity]));
-    return (products ?? []).map((p) => ({
-      id: p.id,
-      name: p.name,
-      category: p.category ?? "Uncategorized",
-      quantity: qtyByProduct.get(p.id) ?? 0,
-    }));
+    const { readSectionRows } = await import("@/lib/sheets.server");
+    const rows = await readSectionRows(data.section);
+    return rows
+      .filter((r) => !SECTION_SENTINEL_RE.test(r.name))
+      .map((r) => ({
+        id: r.row,
+        name: r.name,
+        quantity: r.stock,
+      }));
   });
 
-const StockUpdate = z.object({ productId: z.string().uuid(), quantity: z.number().int().min(0) });
+const StockUpdate = z.object({ row: z.number().int().min(1), quantity: z.number().int().min(0) });
 const SaveStocksInput = z.object({ section: StockSection, updates: z.array(StockUpdate) });
 
 export const saveProductStocks = createServerFn({ method: "POST" })
   .validator((d) => SaveStocksInput.parse(d))
   .handler(async ({ data }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     if (!data.updates.length) return { ok: true, updated: 0 };
-
-    const table = stockTableFor(data.section);
-
-    const { data: existing, error: exErr } = await supabaseAdmin
-      .from(table)
-      .select("id, product_id")
-      .in("product_id", data.updates.map((u) => u.productId));
-    if (exErr) throw exErr;
-    const existingByProduct = new Map((existing ?? []).map((r: any) => [r.product_id, r.id]));
-
-    const toInsert: Array<{ product_id: string; quantity: number }> = [];
-    const toUpdate: Array<{ id: string; quantity: number }> = [];
-
-    for (const u of data.updates) {
-      const existingId = existingByProduct.get(u.productId);
-      if (existingId) toUpdate.push({ id: existingId, quantity: u.quantity });
-      else toInsert.push({ product_id: u.productId, quantity: u.quantity });
-    }
-
-    if (toInsert.length) {
-      const { error } = await supabaseAdmin.from(table).insert(toInsert);
-      if (error) throw error;
-    }
-    for (const u of toUpdate) {
-      const { error } = await supabaseAdmin
-        .from(table)
-        .update({ quantity: u.quantity, updated_at: new Date().toISOString() })
-        .eq("id", u.id);
-      if (error) throw error;
-    }
-
+    const { writeSectionColumn } = await import("@/lib/sheets.server");
+    await writeSectionColumn(
+      data.section,
+      "F",
+      data.updates.map((u) => ({ row: u.row, quantity: u.quantity })),
+    );
     return { ok: true, updated: data.updates.length };
   });
-
-// ============================== PRE-ORDER PROMOTION ==============================
-// Manually triggered from the admin dashboard (no cron/route needed). Copies
-// the day's pre-order column (K or L) into column C and clears the source
-// column. Safe to call any time — it checks the current day itself and is a
-// no-op on days that don't need a promotion (Mon, Wed, Thu, Sun).
-
-export const promotePreOrders = createServerFn({ method: "POST" }).handler(async () => {
-  const { promotePreOrderColumn } = await import("@/lib/sheets.server");
-  return await promotePreOrderColumn();
-});

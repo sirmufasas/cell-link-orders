@@ -8,7 +8,7 @@ import {
 import {
   listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
-  getActiveSheetInfo, promotePreOrders,
+  getActiveSheetInfo,
 } from "@/lib/bakery.functions";
 
 const customersQuery = queryOptions({ queryKey: ["customers"], queryFn: () => listCustomers() });
@@ -73,8 +73,6 @@ function AdminPage() {
   const [search, setSearch] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
-  const [promoting, setPromoting] = useState(false);
-  const [promoteMsg, setPromoteMsg] = useState<string | null>(null);
   const [bucket, setBucket] = useState<Bucket>("day");
   const [dim, setDim] = useState<Dim>("items");
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -130,25 +128,6 @@ function AdminPage() {
       setSyncMsg(`Error: ${(e as Error).message}`);
     } finally {
       setSyncing(false);
-    }
-  }
-
-  async function handlePromote() {
-    setPromoting(true); setPromoteMsg(null);
-    try {
-      const r = await promotePreOrders();
-      setPromoteMsg(
-        r.promoted
-          ? r.column
-            ? `Promoted ${r.day}: column ${r.column} → C.`
-            : `${r.day}: nothing to promote (column was empty).`
-          : `No promotion needed today (${r.day}).`
-      );
-      qc.invalidateQueries({ queryKey: ["submissions"] });
-    } catch (e) {
-      setPromoteMsg(`Error: ${(e as Error).message}`);
-    } finally {
-      setPromoting(false);
     }
   }
 
@@ -222,21 +201,14 @@ function AdminPage() {
             >
               📊 {sheetInfo?.label ?? "…"} Sheet
             </a>
-            <button onClick={handlePromote} disabled={promoting}
-              className="text-sm px-3 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white disabled:opacity-50">
-              {promoting ? "Promoting…" : "↑ Promote Pre-Orders"}
-            </button>
             <button onClick={handleSync} disabled={syncing}
               className="text-sm px-3 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white disabled:opacity-50">
               {syncing ? "Syncing…" : "↻ Re-sync"}
             </button>
           </div>
         </div>
-        {(syncMsg || promoteMsg) && (
-          <div className="max-w-6xl mx-auto px-6 pb-3 space-y-1">
-            {syncMsg && <div className="text-sm text-[#6b5544]">{syncMsg}</div>}
-            {promoteMsg && <div className="text-sm text-[#6b5544]">{promoteMsg}</div>}
-          </div>
+        {syncMsg && (
+          <div className="max-w-6xl mx-auto px-6 pb-3 text-sm text-[#6b5544]">{syncMsg}</div>
         )}
       </header>
 
@@ -418,18 +390,26 @@ function AdminPage() {
   );
 }
 
+// Both Estimates and Stocks now read/write live sheet rows (Freezer /
+// Production tab on the active spreadsheet), split cleanly by section —
+// no merging, no Supabase table, no "category" (the sheet has none).
+// Each product's id is its sheet ROW NUMBER, unique within that section.
+
 function EstimatesTab() {
   const qc = useQueryClient();
+  const [section, setSection] = useState<"Production" | "Freezer">("Production");
   const [search, setSearch] = useState("");
   const [showAll, setShowAll] = useState(false);
-  const [edits, setEdits] = useState<Record<string, number>>({});
+  const [edits, setEdits] = useState<Record<number, number>>({});
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   const query = useQuery({
-    queryKey: ["estimate-products"],
-    queryFn: () => getEstimateProducts(),
+    queryKey: ["estimate-products", section],
+    queryFn: () => getEstimateProducts({ data: { section } }),
   });
+
+  useEffect(() => { setEdits({}); setMessage(null); }, [section]);
 
   const items = query.data ?? [];
 
@@ -448,17 +428,17 @@ function EstimatesTab() {
     });
   }, [items, search, showAll, anyHasValue]);
 
-  const valueFor = (id: string, original: number) => edits[id] ?? original;
+  const valueFor = (id: number, original: number) => edits[id] ?? original;
   const changedCount = Object.keys(edits).length;
 
   async function handleSave() {
     setSaving(true); setMessage(null);
     try {
-      const updates = Object.entries(edits).map(([productId, quantity]) => ({ productId, quantity }));
-      const res = await saveEstimates({ data: { updates } });
+      const updates = Object.entries(edits).map(([row, quantity]) => ({ row: Number(row), quantity }));
+      const res = await saveEstimates({ data: { section, updates } });
       setMessage(`Saved ${res.updated} update${res.updated === 1 ? "" : "s"}.`);
       setEdits({});
-      await qc.invalidateQueries({ queryKey: ["estimate-products"] });
+      await qc.invalidateQueries({ queryKey: ["estimate-products", section] });
     } catch (e) {
       setMessage(`Error: ${(e as Error).message}`);
     } finally {
@@ -469,6 +449,17 @@ function EstimatesTab() {
   return (
     <section className="space-y-3">
       <div className="flex flex-wrap items-center gap-3">
+        <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1">
+          {(["Production", "Freezer"] as const).map((s) => (
+            <button
+              key={s}
+              onClick={() => setSection(s)}
+              className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${section === s ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
@@ -494,7 +485,6 @@ function EstimatesTab() {
           <div key={p.id} className="p-3 flex items-center justify-between gap-3 hover:bg-[#fdf8f1]">
             <div className="min-w-0">
               <div className="font-semibold text-sm truncate">{p.name}</div>
-              <div className="text-xs text-[#8b6f4e] truncate">{p.category}</div>
             </div>
             <input
               type="number"
@@ -533,7 +523,7 @@ function StocksTab() {
   const [section, setSection] = useState<"Production" | "Freezer">("Production");
   const [search, setSearch] = useState("");
   const [showAll, setShowAll] = useState(false);
-  const [edits, setEdits] = useState<Record<string, number>>({});
+  const [edits, setEdits] = useState<Record<number, number>>({});
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -550,24 +540,17 @@ function StocksTab() {
   // one product in THIS section has a value, otherwise show everything.
   const anyHasValue = items.some((p) => p.quantity > 0);
 
-  const valueFor = (id: string, original: number) => edits[id] ?? original;
+  const valueFor = (id: number, original: number) => edits[id] ?? original;
 
-  const grouped = useMemo(() => {
+  const filtered = useMemo(() => {
     const s = search.trim().toLowerCase();
-    const byCategory = new Map<string, typeof items>();
-    for (const p of items) {
-      if (s && !p.name.toLowerCase().includes(s)) continue;
-      if (anyHasValue && !showAll && p.quantity <= 0) continue;
-      const arr = byCategory.get(p.category) ?? [];
-      arr.push(p);
-      byCategory.set(p.category, arr);
-    }
-    return Array.from(byCategory.entries())
-      .sort(([a], [b]) => (a === "Uncategorized" ? 1 : b === "Uncategorized" ? -1 : a.localeCompare(b)))
-      .map(([category, products]) => ({
-        category,
-        products: products.sort((a, b) => a.name.localeCompare(b.name)),
-      }));
+    return items
+      .filter((p) => {
+        if (s && !p.name.toLowerCase().includes(s)) return false;
+        if (anyHasValue && !showAll && p.quantity <= 0) return false;
+        return true;
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
   }, [items, search, showAll, anyHasValue]);
 
   const changedCount = Object.keys(edits).length;
@@ -575,7 +558,7 @@ function StocksTab() {
   async function handleSave() {
     setSaving(true); setMessage(null);
     try {
-      const updates = Object.entries(edits).map(([productId, quantity]) => ({ productId, quantity }));
+      const updates = Object.entries(edits).map(([row, quantity]) => ({ row: Number(row), quantity }));
       const res = await saveProductStocks({ data: { section, updates } });
       setMessage(`Saved ${res.updated} update${res.updated === 1 ? "" : "s"}.`);
       setEdits({});
@@ -616,33 +599,26 @@ function StocksTab() {
       {query.isLoading && <p className="text-sm text-[#8b6f4e]">Loading…</p>}
       {query.isError && <p className="text-sm text-red-700">Failed to load: {(query.error as Error).message}</p>}
 
-      <div className="space-y-5">
-        {grouped.length === 0 && !query.isLoading && (
-          <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e] shadow-sm">
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
+        {filtered.length === 0 && !query.isLoading && (
+          <div className="p-6 text-center text-sm text-[#8b6f4e]">
             {anyHasValue ? 'No products match. Toggle "Show all products" to see everything.' : "No products yet — add quantities below and save."}
           </div>
         )}
-        {grouped.map((cat) => (
-          <div key={cat.category}>
-            <h4 className="font-bold text-sm text-[#2a1810] mb-2">{cat.category}</h4>
-            <div className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
-              {cat.products.map((p) => (
-                <div key={p.id} className="p-3 flex items-center justify-between gap-3 hover:bg-[#fdf8f1]">
-                  <div className="font-semibold text-sm truncate">{p.name}</div>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min={0}
-                    value={valueFor(p.id, p.quantity) === 0 ? "" : valueFor(p.id, p.quantity)}
-                    placeholder="0"
-                    onChange={(e) =>
-                      setEdits((s) => ({ ...s, [p.id]: e.target.value === "" ? 0 : Math.max(0, Number(e.target.value)) }))
-                    }
-                    className="w-20 h-9 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b]"
-                  />
-                </div>
-              ))}
-            </div>
+        {filtered.map((p) => (
+          <div key={p.id} className="p-3 flex items-center justify-between gap-3 hover:bg-[#fdf8f1]">
+            <div className="font-semibold text-sm truncate">{p.name}</div>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={0}
+              value={valueFor(p.id, p.quantity) === 0 ? "" : valueFor(p.id, p.quantity)}
+              placeholder="0"
+              onChange={(e) =>
+                setEdits((s) => ({ ...s, [p.id]: e.target.value === "" ? 0 : Math.max(0, Number(e.target.value)) }))
+              }
+              className="w-20 h-9 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b]"
+            />
           </div>
         ))}
       </div>

@@ -34,8 +34,6 @@ export const Route = createFileRoute("/order/$slug")({
   component: OrderPage,
 });
 
-const MAX_ITEMS = 20;
-
 function tomorrowISO() {
   const d = new Date();
   d.setDate(d.getDate() + 1);
@@ -56,6 +54,10 @@ type LineKey = string;
 type Mode = "default" | "addon";
 
 const KOTA_ONLY_PREFIXES = ["rolls kota", "kota"];
+
+// Max number of distinct product lines (qty > 0) allowed in a single order.
+// Ordering a large quantity of ONE product only uses a single slot.
+const PRODUCT_LIMIT = 20;
 
 function isKotaOnlyProduct(name: string | undefined | null) {
   const n = (name ?? "").trim().toLowerCase();
@@ -95,7 +97,9 @@ function OrderPage() {
   const [showChangeForm, setShowChangeForm] = useState(false);
   const [mode, setMode] = useState<Mode>("default");
 
-  // Message modal state — once cancelled, skip the modal on future submits
+  // Message popup — the first time in a fresh order, pressing Submit opens
+  // this modal. If the customer taps "Skip", we remember that for the rest
+  // of this order session and skip straight to submitting next time.
   const [showMessageModal, setShowMessageModal] = useState(false);
   const [message, setMessage] = useState("");
   const [messageModalSkipped, setMessageModalSkipped] = useState(false);
@@ -135,26 +139,45 @@ function OrderPage() {
     });
   }, [allProducts, regularProductIds, productSearch, showMore, isKotaJoe]);
 
-  // Count distinct products (lines with qty > 0), not total quantity
-  const totalProducts = Object.values(qty).filter((v) => v > 0).length;
-  const remaining = MAX_ITEMS - totalProducts;
-  const atLimit = remaining <= 0;
+  const totalItems = Object.values(qty).reduce((a, b) => a + b, 0);
 
-  const adjust = (k: LineKey, delta: number) => {
-    if (delta > 0) {
-      // Only allow adding a new product line if under the limit
-      const currentQty = qty[k] ?? 0;
-      const isNewLine = currentQty === 0;
-      if (isNewLine && atLimit) return;
-    }
-    setQty((s) => ({ ...s, [k]: Math.max(0, (s[k] || 0) + delta) }));
-  };
-  const setN = (k: LineKey, n: number) => {
-    const currentQty = qty[k] ?? 0;
-    const isNewLine = currentQty === 0 && n > 0;
-    if (isNewLine && atLimit) return;
-    setQty((s) => ({ ...s, [k]: Math.max(0, n || 0) }));
-  };
+  // Distinct product lines with qty > 0 — this is what counts against the limit,
+  // not the total quantity. Ordering 50 of one product still uses just 1 slot.
+  const usedProductCount = useMemo(
+    () => Object.values(qty).filter((v) => v > 0).length,
+    [qty],
+  );
+  const remainingProductSlots = PRODUCT_LIMIT - usedProductCount;
+  const atProductLimit = usedProductCount >= PRODUCT_LIMIT;
+
+  const limitPillClass = atProductLimit
+    ? "bg-red-100 text-red-700"
+    : remainingProductSlots <= 5
+      ? "bg-amber-100 text-amber-800"
+      : "bg-[#c8362b]/10 text-[#c8362b]";
+
+  const adjust = (k: LineKey, delta: number) =>
+    setQty((s) => {
+      const current = s[k] || 0;
+      // Block adding a NEW product line once the limit is reached.
+      if (delta > 0 && current === 0) {
+        const usedNow = Object.values(s).filter((v) => v > 0).length;
+        if (usedNow >= PRODUCT_LIMIT) return s;
+      }
+      return { ...s, [k]: Math.max(0, current + delta) };
+    });
+
+  const setN = (k: LineKey, n: number) =>
+    setQty((s) => {
+      const current = s[k] || 0;
+      const newVal = Math.max(0, n || 0);
+      // Block turning a zero-qty row into a new product line once at the limit.
+      if (current === 0 && newVal > 0) {
+        const usedNow = Object.values(s).filter((v) => v > 0).length;
+        if (usedNow >= PRODUCT_LIMIT) return s;
+      }
+      return { ...s, [k]: newVal };
+    });
 
   function buildItems() {
     const items: Array<{ sheetRow: number; productName: string; productId: string | null; quantity: number }> = [];
@@ -182,13 +205,19 @@ function OrderPage() {
     setSubmitting(true); setError(null);
     try {
       const items = buildItems();
-      const safeMsg = msg.trim() || " ";
+      if (items.length > PRODUCT_LIMIT) {
+        setError(`You can only order up to ${PRODUCT_LIMIT} different products at once. Please remove some items and try again.`);
+        setSubmitting(false);
+        return;
+      }
+      // Message is optional — the backend accepts an empty string and simply
+      // skips writing a sheet comment / history note when there isn't one.
       if (mode === "addon") {
-        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: safeMsg } });
+        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
       } else if (showChangeForm) {
-        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: safeMsg } });
+        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
       } else {
-        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: safeMsg } });
+        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
       }
       setQty({});
       setMessage("");
@@ -203,28 +232,24 @@ function OrderPage() {
     }
   }
 
-  function handleSubmitPress() {
-    if (totalProducts === 0) return;
-    // If they've already dismissed the modal once, skip it and submit directly
+  function handleSendMessage() {
+    setShowMessageModal(false);
+    void handleSubmit(message);
+  }
+
+  function handleSkipMessage() {
+    setShowMessageModal(false);
+    setMessageModalSkipped(true);
+  }
+
+  // Pressing "Submit Order" — if the customer already skipped the message
+  // prompt once this order, go straight through. Otherwise show the modal.
+  function handleSubmitClick() {
     if (messageModalSkipped) {
       void handleSubmit(message);
     } else {
       setShowMessageModal(true);
     }
-  }
-
-  function handleSendMessage() {
-    if (!message.trim() && !messageModalSkipped) {
-      // They clicked Send with no message — treat as skipped
-    }
-    setShowMessageModal(false);
-    void handleSubmit(message);
-  }
-
-  function handleCancelMessage() {
-    setShowMessageModal(false);
-    setMessageModalSkipped(true);
-    // Don't submit — just close and let them submit directly next time
   }
 
   // ===== Received-today screen =====
@@ -242,11 +267,6 @@ function OrderPage() {
           <p className="text-[#6b5544] mb-2">
             <strong>{customer.name}</strong> — {todayOrder.total_items} items for {tomorrowLabel()}.
           </p>
-          {todayOrder.message && (
-            <p className="text-xs text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-2 mb-4 text-left">
-              <span className="font-semibold">Your note: </span>{todayOrder.message}
-            </p>
-          )}
           <div className="flex flex-col gap-2 mt-2">
             <button
               onClick={() => { setMode("addon"); setQty({}); }}
@@ -254,6 +274,20 @@ function OrderPage() {
             >
               + Add onto Prev Order
             </button>
+            {/* {hasPriorOrders && (
+              <button
+                onClick={() => {
+                  const prefill = buildPrefillFromTodayOrder();
+                  setShowChangeForm(true);
+                  setQty(prefill);
+                  if (Object.keys(prefill).some((k) => k.startsWith("x:"))) setShowMore(true);
+                }}
+                className="border-2 border-[#c8362b] text-[#c8362b] font-bold py-3 rounded-xl hover:bg-[#c8362b]/5"
+                title="Overwrite today's quantities in column C"
+              >
+                Change Order
+              </button>
+            )} */}
             <button
               onClick={() => setShowHistory(true)}
               className="border border-[#e8dcc8] hover:bg-[#fdf8f1] font-semibold py-3 rounded-xl"
@@ -301,23 +335,9 @@ function OrderPage() {
               ? "Update your quantities. This will overwrite today's order."
               : "Set quantities and submit. Orders are placed the day before."}
         </p>
-
-        {/* Item limit indicator */}
-        <div className={`flex items-center justify-between text-xs font-semibold px-3 py-2 rounded-xl mb-4 ${
-          atLimit
-            ? "bg-red-50 text-red-700 border border-red-200"
-            : remaining <= 5
-              ? "bg-amber-50 text-amber-700 border border-amber-200"
-              : "bg-[#f5f0e8] text-[#8b6f4e] border border-[#e8dcc8]"
-        }`}>
-          <span>
-            {atLimit
-              ? "Product limit reached — max 20 different products per order"
-              : `${totalProducts} of ${MAX_ITEMS} products used`}
-          </span>
-          <span className={`font-bold ${atLimit ? "text-red-700" : remaining <= 5 ? "text-amber-700" : "text-[#6b5544]"}`}>
-            {remaining > 0 ? `${remaining} left` : "0 left"}
-          </span>
+        <div className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold mb-3 ${limitPillClass}`}>
+          {usedProductCount} of {PRODUCT_LIMIT} products used
+          {atProductLimit ? " · Limit reached" : ` · ${remainingProductSlots} left`}
         </div>
       </div>
 
@@ -325,14 +345,17 @@ function OrderPage() {
         {regulars.map((r) => {
           const k: LineKey = `r:${r.sheet_row}`;
           const product = r.product;
-          const currentQty = qty[k] ?? 0;
-          const isLocked = atLimit && currentQty === 0;
+          const rowQty = qty[k] ?? 0;
+          const locked = atProductLimit && rowQty === 0;
           return (
-            <div key={r.id} className={`bg-white rounded-2xl border p-3 flex items-center gap-3 shadow-sm ${isLocked ? "border-[#e8dcc8] opacity-50" : "border-[#e8dcc8]"}`}>
+            <div
+              key={r.id}
+              className={`bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm transition-opacity ${locked ? "opacity-50" : ""}`}
+            >
               <div className="flex-1 min-w-0">
                 <div className="font-semibold leading-tight text-sm">{product?.name ?? "—"}</div>
               </div>
-              <QtyControl value={currentQty} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} disablePlus={isLocked} />
+              <QtyControl value={rowQty} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} locked={locked} />
             </div>
           );
         })}
@@ -369,14 +392,17 @@ function OrderPage() {
             <div className="space-y-2">
               {extraProducts.map((p) => {
                 const k: LineKey = `x:${p.id}`;
-                const currentQty = qty[k] ?? 0;
-                const isLocked = atLimit && currentQty === 0;
+                const rowQty = qty[k] ?? 0;
+                const locked = atProductLimit && rowQty === 0;
                 return (
-                  <div key={p.id} className={`bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm ${isLocked ? "opacity-50" : ""}`}>
+                  <div
+                    key={p.id}
+                    className={`bg-white rounded-2xl border border-[#e8dcc8] p-3 flex items-center gap-3 shadow-sm transition-opacity ${locked ? "opacity-50" : ""}`}
+                  >
                     <div className="flex-1 min-w-0">
                       <div className="font-medium text-sm truncate">{p.name}</div>
                     </div>
-                    <QtyControl value={currentQty} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} disablePlus={isLocked} />
+                    <QtyControl value={rowQty} onAdjust={(d) => adjust(k, d)} onSet={(n) => setN(k, n)} locked={locked} />
                   </div>
                 );
               })}
@@ -390,8 +416,10 @@ function OrderPage() {
         <div className="max-w-xl mx-auto">
           <div className="flex items-center gap-2 mb-2">
             <div className="flex-1">
-              <div className="text-xs text-[#8b6f4e]">Products selected</div>
-              <div className="font-bold text-lg">{totalProducts} <span className="text-sm font-normal text-[#8b6f4e]">/ {MAX_ITEMS}</span></div>
+              <div className="text-xs text-[#8b6f4e]">Products</div>
+              <div className={`font-bold text-lg ${atProductLimit ? "text-red-600" : remainingProductSlots <= 5 ? "text-amber-600" : ""}`}>
+                {usedProductCount} / {PRODUCT_LIMIT}
+              </div>
             </div>
             <button
               onClick={() => setShowHistory(true)}
@@ -402,8 +430,8 @@ function OrderPage() {
           </div>
           <div className="flex gap-2">
             <button
-              onClick={handleSubmitPress}
-              disabled={submitting || totalProducts === 0}
+              onClick={handleSubmitClick}
+              disabled={submitting || totalItems === 0 || usedProductCount > PRODUCT_LIMIT}
               className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl transition"
             >
               {submitting
@@ -424,7 +452,7 @@ function OrderPage() {
         <MessageModal
           value={message}
           onChange={setMessage}
-          onCancel={handleCancelMessage}
+          onSkip={handleSkipMessage}
           onSend={handleSendMessage}
           sending={submitting}
         />
@@ -455,7 +483,6 @@ function HistoryModal({
     total_items: number;
     created_at: string;
     order_type?: string | null;
-    message?: string | null;
     items: Array<{ product_name: string; quantity: number }>;
   }>;
   onClose: () => void;
@@ -509,11 +536,6 @@ function HistoryModal({
                           </li>
                         ))}
                       </ul>
-                      {s.message && (
-                        <div className="mt-2 pt-2 border-t border-[#e8dcc8] text-xs text-[#6b5544]">
-                          <span className="font-semibold">Note: </span>{s.message}
-                        </div>
-                      )}
                     </div>
                   );
                 })}
@@ -529,37 +551,38 @@ function HistoryModal({
 function MessageModal({
   value,
   onChange,
-  onCancel,
+  onSkip,
   onSend,
   sending,
 }: {
   value: string;
   onChange: (v: string) => void;
-  onCancel: () => void;
+  onSkip: () => void;
   onSend: () => void;
   sending: boolean;
 }) {
+  const canSend = !sending;
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onCancel}>
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onSkip}>
       <div
         className="bg-white rounded-2xl max-w-md w-full shadow-xl p-5"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="font-bold text-lg mb-1">Add a message <span className="text-sm font-normal text-[#8b6f4e]">(optional)</span></h3>
+        <h3 className="font-bold text-lg mb-1">Add a message (optional)</h3>
         <p className="text-sm text-[#8b6f4e] mb-3">
-          Add a quick note with your order (e.g. delivery time, special instructions).
+          Add a quick note before sending your order (e.g. delivery time, special instructions) — or skip this and send without one.
         </p>
         <textarea
           autoFocus
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="Type your message…"
+          placeholder="Type your message… (optional)"
           rows={4}
           className="w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b] resize-none"
         />
         <div className="flex gap-2 mt-4">
           <button
-            onClick={onCancel}
+            onClick={onSkip}
             disabled={sending}
             className="flex-1 border border-[#e8dcc8] font-semibold py-3 rounded-xl hover:bg-[#fdf8f1] disabled:opacity-50"
           >
@@ -567,7 +590,7 @@ function MessageModal({
           </button>
           <button
             onClick={onSend}
-            disabled={sending}
+            disabled={!canSend}
             className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl"
           >
             {sending ? "Sending…" : "Send"}
@@ -605,12 +628,12 @@ function QtyControl({
   value,
   onAdjust,
   onSet,
-  disablePlus,
+  locked,
 }: {
   value: number;
   onAdjust: (d: number) => void;
   onSet: (n: number) => void;
-  disablePlus?: boolean;
+  locked?: boolean;
 }) {
   const [focused, setFocused] = useState(false);
   const display = focused && value === 0 ? "" : String(value);
@@ -622,20 +645,24 @@ function QtyControl({
         inputMode="numeric"
         pattern="[0-9]*"
         value={display}
+        readOnly={!!locked}
         onFocus={(e) => { setFocused(true); e.currentTarget.select(); }}
         onBlur={() => setFocused(false)}
         onChange={(e) => {
+          if (locked) return;
           const raw = e.target.value.replace(/[^0-9]/g, "");
           onSet(raw === "" ? 0 : parseInt(raw, 10));
         }}
-        className="w-12 h-9 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b]"
+        className={`w-12 h-9 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b] ${locked ? "opacity-60 cursor-not-allowed" : ""}`}
       />
       <button
         aria-label="+"
-        onClick={() => onAdjust(1)}
-        disabled={disablePlus}
-        className="w-9 h-9 rounded-full bg-[#c8362b] text-white flex items-center justify-center text-lg font-bold active:scale-95 disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e]"
-      >+</button>
+        onClick={() => { if (!locked) onAdjust(1); }}
+        disabled={!!locked}
+        className={`w-9 h-9 rounded-full flex items-center justify-center text-lg font-bold ${locked ? "bg-[#e8dcc8] text-[#8b6f4e] cursor-not-allowed" : "bg-[#c8362b] text-white active:scale-95"}`}
+      >
+        +
+      </button>
     </div>
   );
 }
