@@ -365,16 +365,29 @@ function AdminPage() {
           ))}
         </section>
 
-        <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 w-fit flex-wrap">
-          {/* "drivers" temporarily hidden — DriversTab is still defined below, just not linked in the nav */}
-          {(["customers", "history", "analytics", "estimates", "stocks"] as const).map((t) => (
-            <button key={t} onClick={() => setTab(t)}
-              className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${tab === t ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}>
-              {t === "customers" ? "Customers" : t === "history" ? "Order History" : t === "analytics" ? "Analytics" : t === "estimates" ? "Estimates" : "Stocks"}
-            </button>
-          ))}
-        </div>
-
+       <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 w-fit flex-wrap">
+        {(["customers", "history", "analytics", "estimates", "stocks", "drivers"] as const).map((t) => (
+    <button
+      key={t}
+      onClick={() => setTab(t)}
+      className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
+        tab === t ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
+      }`}
+    >
+      {t === "customers"
+        ? "Customers"
+        : t === "history"
+        ? "Order History"
+        : t === "analytics"
+        ? "Analytics"
+        : t === "estimates"
+        ? "Estimates"
+        : t === "stocks"
+        ? "Stocks"
+        : "Drivers"}
+    </button>
+  ))}
+</div>
         {tab === "customers" && (
           <section className="space-y-3">
             <input value={search} onChange={(e) => setSearch(e.target.value)}
