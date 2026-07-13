@@ -491,7 +491,7 @@ function AdminPage() {
 
         {tab === "estimates" && <EstimatesTab />}
         {tab === "stocks" && <StocksTab />}
-        {/* {tab === "drivers" && <DriversTab />} — hidden for now */}
+        {tab === "drivers" && <DriversTab />}
       </main>
 
       {detailId && (
