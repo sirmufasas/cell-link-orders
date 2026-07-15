@@ -35,14 +35,103 @@ type Bucket = "day" | "week" | "month";
 type Dim = "items" | "products" | "customers";
 type AdminTab = "customers" | "history" | "analytics" | "estimates" | "stocks" | "drivers";
 
+// ---------------------------------------------------------------------------
+// Simple password gate
+//
+// Every admin tab except "Order History" requires this password before its
+// content is shown. This is a lightweight, client-side gate (not real auth —
+// there's no backend check), meant to keep casual visitors from poking at
+// customer data, estimates, stocks, or driver assignments. Once entered
+// correctly it stays unlocked for the rest of the browser tab's session
+// (sessionStorage), so people don't have to re-type it every time they
+// switch admin tabs, but a closed tab/browser will ask again.
+// ---------------------------------------------------------------------------
+
+const ADMIN_PASSWORD = "portugalbakery";
+const UNLOCK_STORAGE_KEY = "bakery_admin_unlocked";
+const PROTECTED_TABS: AdminTab[] = ["customers", "analytics", "estimates", "stocks", "drivers"];
+
+function LockScreen({
+  pwInput,
+  setPwInput,
+  pwError,
+  onUnlock,
+}: {
+  pwInput: string;
+  setPwInput: (v: string) => void;
+  pwError: boolean;
+  onUnlock: (e: React.FormEvent) => void;
+}) {
+  return (
+    <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm p-8 max-w-sm mx-auto text-center space-y-4">
+      <div className="w-12 h-12 mx-auto rounded-full bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center text-xl">
+        🔒
+      </div>
+      <div>
+        <h3 className="font-bold text-[#2a1810]">This section is locked</h3>
+        <p className="text-xs text-[#8b6f4e] mt-1">Enter the admin password to continue.</p>
+      </div>
+      <form onSubmit={onUnlock} className="space-y-2">
+        <input
+          type="password"
+          autoFocus
+          value={pwInput}
+          onChange={(e) => setPwInput(e.target.value)}
+          placeholder="Password"
+          className={`w-full bg-[#fdf8f1] border rounded-xl px-4 py-2.5 text-sm text-center focus:outline-none ${
+            pwError ? "border-red-400" : "border-[#e8dcc8] focus:border-[#c8362b]"
+          }`}
+        />
+        {pwError && <p className="text-xs text-red-600">Incorrect password, try again.</p>}
+        <button
+          type="submit"
+          className="w-full bg-[#c8362b] hover:bg-[#a82a22] text-white font-bold py-2.5 rounded-xl transition text-sm"
+        >
+          Unlock
+        </button>
+      </form>
+    </div>
+  );
+}
+
+// Builds a YYYY-MM-DD key from a Date's *local* calendar fields. This is the
+// piece that toISOString() gets wrong for this purpose — toISOString always
+// converts to UTC first, so for anyone west/east of UTC at certain times of
+// day it silently returns the previous/next calendar day. Since our data is
+// keyed by real calendar dates (for_date), we build the string from local
+// fields instead so the bucket always matches the actual date.
+function toLocalISODate(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function bucketKey(dateStr: string, bucket: Bucket) {
   const d = new Date(dateStr + "T00:00:00");
   if (bucket === "day") return dateStr;
   if (bucket === "month") return dateStr.slice(0, 7);
-  // week: ISO-ish, Monday start
-  const day = (d.getDay() + 6) % 7;
-  d.setDate(d.getDate() - day);
-  return d.toISOString().slice(0, 10);
+  // week: Monday start, computed and serialized entirely in local time so
+  // the resulting key lines up with the real date the order was placed for.
+  const dow = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - dow);
+  return toLocalISODate(d);
+}
+
+// Human-readable label for a bucket key, used consistently across day/week/
+// month so all three render the same way on the chart (no raw ISO strings
+// or raw "YYYY-MM" leaking into the axis/tooltip).
+function bucketLabel(key: string, bucket: Bucket) {
+  if (key.trim() === "" || key === "—") return key;
+  if (bucket === "month") {
+    const [y, m] = key.split("-").map(Number);
+    if (!y || !m) return key;
+    return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "short", year: "numeric" });
+  }
+  const d = new Date(key + "T00:00:00");
+  if (Number.isNaN(d.getTime())) return key;
+  const day = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return bucket === "week" ? `Week of ${day}` : day;
 }
 
 function dateLabel(iso: string) {
@@ -218,6 +307,28 @@ function AdminPage() {
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof getSubmissionDetail>> | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
+  // Password gate state — unlocked once per browser tab session.
+  const [unlocked, setUnlocked] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return sessionStorage.getItem(UNLOCK_STORAGE_KEY) === "true";
+  });
+  const [pwInput, setPwInput] = useState("");
+  const [pwError, setPwError] = useState(false);
+
+  function handleUnlock(e: React.FormEvent) {
+    e.preventDefault();
+    if (pwInput === ADMIN_PASSWORD) {
+      setUnlocked(true);
+      sessionStorage.setItem(UNLOCK_STORAGE_KEY, "true");
+      setPwInput("");
+      setPwError(false);
+    } else {
+      setPwError(true);
+    }
+  }
+
+  const needsPassword = PROTECTED_TABS.includes(tab) && !unlocked;
+
   async function openDetail(id: string) {
     setDetailId(id); setDetail(null); setDetailLoading(true);
     try {
@@ -270,7 +381,10 @@ function AdminPage() {
     }
   }
 
-  // Build time-series chart data based on bucket + dimension
+  // Build time-series chart data based on bucket + dimension. This is the
+  // real per-order data (analytics), grouped by real calendar dates via
+  // bucketKey — day/week/month all go through the exact same aggregation
+  // and rendering path below, they just group by a different-sized bucket.
   const timeSeries = useMemo(() => {
     if (dim === "items") {
       const m = new Map<string, number>();
@@ -344,6 +458,18 @@ function AdminPage() {
               className="text-sm px-3 py-2 rounded-lg border border-[#2a1810] hover:bg-[#2a1810] hover:text-white disabled:opacity-50">
               {syncing ? "Syncing…" : "↻ Re-sync"}
             </button>
+            {unlocked && (
+              <button
+                onClick={() => {
+                  setUnlocked(false);
+                  sessionStorage.removeItem(UNLOCK_STORAGE_KEY);
+                }}
+                className="text-sm px-3 py-2 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+                title="Lock protected tabs again"
+              >
+                🔒 Lock
+              </button>
+            )}
           </div>
         </div>
         {syncMsg && (
@@ -385,9 +511,17 @@ function AdminPage() {
         : t === "stocks"
         ? "Stocks"
         : "Drivers"}
+      {PROTECTED_TABS.includes(t) && !unlocked ? " 🔒" : ""}
     </button>
   ))}
 </div>
+
+        {needsPassword ? (
+          <div className="py-10">
+            <LockScreen pwInput={pwInput} setPwInput={setPwInput} pwError={pwError} onUnlock={handleUnlock} />
+          </div>
+        ) : (
+        <>
         {tab === "customers" && (
           <section className="space-y-3">
             <input value={search} onChange={(e) => setSearch(e.target.value)}
@@ -477,9 +611,13 @@ function AdminPage() {
                 {dim === "items" ? (
                   <LineChart data={timeSeries}>
                     <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
-                    <XAxis dataKey="key" tick={{ fontSize: 11 }} />
+                    <XAxis
+                      dataKey="key"
+                      tick={{ fontSize: 11 }}
+                      tickFormatter={(k: string) => bucketLabel(k, bucket)}
+                    />
                     <YAxis tick={{ fontSize: 11 }} allowDecimals={false} domain={[0, "auto"]} />
-                    <Tooltip />
+                    <Tooltip labelFormatter={(k: string) => bucketLabel(k, bucket)} />
                     <Line type="monotone" dataKey="value" stroke="#c8362b" strokeWidth={2} dot />
                   </LineChart>
                 ) : (
@@ -505,6 +643,8 @@ function AdminPage() {
         {tab === "estimates" && <EstimatesTab />}
         {tab === "stocks" && <StocksTab />}
         {tab === "drivers" && <DriversTab />}
+        </>
+        )}
       </main>
 
       {detailId && (
