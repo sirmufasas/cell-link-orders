@@ -74,6 +74,11 @@ function sectionTabName(section: "Production" | "Freezer") {
   return section === "Freezer" ? TAB_FREEZER : TAB_PRODUCTION;
 }
 
+// Column E ("Customer Order Details") holds a Yes/No formula that derives
+// its value from other cells in the same row (e.g. whether column C has a
+// quantity in it). 0-based column index, used by copyPaste requests below.
+const COL_E_INDEX = 4; // A=0, B=1, C=2, D=3, E=4
+
 // ============================== AUTH ==============================
 
 type ServiceAccountKey = {
@@ -378,7 +383,14 @@ export async function getCustomerSheetId(): Promise<number> {
 
 /**
  * Insert a new row for a customer immediately below their last existing row.
- * Copies col A (customer), D (driver), E from row above; sets B (product), C (quantity).
+ * Copies col A (customer), D (driver) from the row above; sets B (product),
+ * C (quantity). Column E (the Yes/No indicator) is copied as a FORMULA —
+ * not a static value — from the row above via a Sheets copyPaste request,
+ * so the Sheets API shifts its relative references (e.g. C245 → C246) the
+ * same way dragging the formula down in the UI would. This keeps the new
+ * row's Yes/No live and reactive instead of frozen at whatever the row
+ * above happened to show at insert time.
+ *
  * Returns the inserted row number (1-based).
  */
 export async function insertCustomerProductRow(opts: {
@@ -408,10 +420,15 @@ export async function insertCustomerProductRow(opts: {
   const sheetId = await getCustomerSheetId();
   const above = all[lastRow1 - 1] ?? [];
   const driver = (above[3] ?? "Collection").trim() || "Collection";
-  const colE = (above[4] ?? "No").trim() || "No";
 
   const sheets = await getSheetsClient();
-  // Insert blank row at lastRow1 (0-based startIndex = lastRow1)
+  const newRow = lastRow1 + 1;
+
+  // Insert the blank row, then copy column E's FORMULA (not its computed
+  // value) from the row above down into the new row, in the same
+  // batchUpdate call. inheritFromBefore only copies cell formatting — it
+  // does not copy formulas — so the copyPaste request is what actually
+  // makes the Yes/No cell live again on the new row.
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: getActiveSheetId(),
     requestBody: {
@@ -427,11 +444,29 @@ export async function insertCustomerProductRow(opts: {
             inheritFromBefore: true,
           },
         },
+        {
+          copyPaste: {
+            source: {
+              sheetId,
+              startRowIndex: lastRow1 - 1, // 0-based row above (unaffected by the insert)
+              endRowIndex: lastRow1,
+              startColumnIndex: COL_E_INDEX,
+              endColumnIndex: COL_E_INDEX + 1,
+            },
+            destination: {
+              sheetId,
+              startRowIndex: newRow - 1, // 0-based new row
+              endRowIndex: newRow,
+              startColumnIndex: COL_E_INDEX,
+              endColumnIndex: COL_E_INDEX + 1,
+            },
+            pasteType: "PASTE_FORMULA",
+          },
+        },
       ],
     },
   });
 
-  const newRow = lastRow1 + 1;
   await writeCells([
     { range: `${TAB_CUSTOMERS}!A${newRow}`, value: opts.customerName },
     { range: `${TAB_CUSTOMERS}!B${newRow}`, value: opts.productName },
@@ -440,7 +475,8 @@ export async function insertCustomerProductRow(opts: {
       value: opts.quantity > 0 ? String(opts.quantity) : "",
     },
     { range: `${TAB_CUSTOMERS}!D${newRow}`, value: driver },
-    { range: `${TAB_CUSTOMERS}!E${newRow}`, value: colE },
+    // Column E intentionally NOT written here — its formula was just
+    // copied down above and will recalculate from this row's own C value.
   ]);
   return newRow;
 }
