@@ -65,6 +65,59 @@ function isKotaOnlyProduct(name: string | undefined | null) {
   return KOTA_ONLY_PREFIXES.some((prefix) => n.startsWith(prefix));
 }
 
+// ---------------------------------------------------------------------------
+// Delivery-day ordering restrictions
+//
+// A handful of customers are locked to specific delivery agreements — they
+// can only submit an order on the day *before* their delivery day (since
+// orders in this app are always placed "for tomorrow"). Matching is done by
+// a case-insensitive substring check against the customer's name so it
+// covers name variants automatically (e.g. "Rapido Nossa Cassa" matches the
+// same "nossa cassa" rule as "Nossa Cassa").
+//
+// DAY_NAMES / getDay(): 0=Sunday … 6=Saturday.
+// `days` below are the days it's OK to PLACE an order (i.e. the day before
+// the matching delivery day), not the delivery day itself:
+//   - Delivery Mon/Wed/Fri  -> order on Sun/Tue/Thu
+//   - Delivery Tue/Thu/Sat  -> order on Mon/Wed/Fri
+//   - Delivery Thu          -> order on Wed
+// ---------------------------------------------------------------------------
+
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+type OrderSchedule = { days: number[]; deliveryDays: string };
+
+const ORDER_SCHEDULES: Array<{ match: (name: string) => boolean; schedule: OrderSchedule }> = [
+  {
+    match: (n) => ["dalpark", "carnival", "lambton"].some((k) => n.includes(k)),
+    schedule: { days: [0, 2, 4], deliveryDays: "Mon/Wed/Fri" }, // order Sun/Tue/Thu
+  },
+  {
+    match: (n) => n.includes("braza"),
+    schedule: { days: [1, 3, 5], deliveryDays: "Tue/Thu/Sat" }, // order Mon/Wed/Fri
+  },
+  {
+    match: (n) => n.includes("nossa cassa"),
+    schedule: { days: [3], deliveryDays: "Thu" }, // order Wed
+  },
+];
+
+function getOrderSchedule(customerName: string): OrderSchedule | null {
+  const n = customerName.trim().toLowerCase();
+  for (const rule of ORDER_SCHEDULES) {
+    if (rule.match(n)) return rule.schedule;
+  }
+  return null;
+}
+
+function nextAllowedOrderDay(days: number[], today: number): string {
+  for (let i = 1; i <= 7; i++) {
+    const d = (today + i) % 7;
+    if (days.includes(d)) return DAY_NAMES[d];
+  }
+  return DAY_NAMES[days[0]];
+}
+
 function OrderPage() {
   const { slug } = Route.useParams();
   const qc = useQueryClient();
@@ -105,6 +158,11 @@ function OrderPage() {
   const [messageModalSkipped, setMessageModalSkipped] = useState(false);
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
+
+  // Delivery-day restriction check for this customer.
+  const orderSchedule = useMemo(() => getOrderSchedule(customer.name), [customer.name]);
+  const todayDow = new Date().getDay();
+  const orderingBlocked = !!orderSchedule && !orderSchedule.days.includes(todayDow);
 
   const regularProductIds = useMemo(
     () => new Set(regulars.map((r) => r.product?.id).filter(Boolean) as string[]),
@@ -250,6 +308,41 @@ function OrderPage() {
     } else {
       setShowMessageModal(true);
     }
+  }
+
+  // ===== Delivery-day blocked screen =====
+  // Takes priority over everything else (received-today, add-on, change
+  // order) — this customer's delivery agreement simply doesn't allow
+  // ordering today, regardless of what else is going on with their order.
+  if (orderingBlocked && orderSchedule) {
+    const nextDay = nextAllowedOrderDay(orderSchedule.days, todayDow);
+    return (
+      <div className="min-h-screen bg-[#fdf8f1] flex items-center justify-center p-6">
+        <div className="bg-white rounded-3xl shadow-lg border border-[#e8dcc8] p-8 max-w-md w-full text-center">
+          <div className="w-16 h-16 rounded-full bg-amber-100 flex items-center justify-center mx-auto mb-4">
+            <svg className="w-8 h-8 text-amber-600" fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          </div>
+          <h1 className="text-2xl font-bold mb-2">Orders aren't open today</h1>
+          <p className="text-[#6b5544] mb-1">
+            <strong>{customer.name}</strong> delivers on <strong>{orderSchedule.deliveryDays}</strong>.
+          </p>
+          <p className="text-[#6b5544] mb-4">
+            Please wait until <strong>{nextDay}</strong> to place your order.
+          </p>
+          <div className="flex flex-col gap-2 mt-2">
+            <button
+              onClick={() => setShowHistory(true)}
+              className="border border-[#e8dcc8] hover:bg-[#fdf8f1] font-semibold py-3 rounded-xl"
+            >
+              History
+            </button>
+          </div>
+        </div>
+        {showHistory && <HistoryModal history={history} onClose={() => setShowHistory(false)} />}
+      </div>
+    );
   }
 
   // ===== Received-today screen =====
