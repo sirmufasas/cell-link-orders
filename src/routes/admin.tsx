@@ -19,31 +19,28 @@ const sheetInfoQuery = queryOptions({ queryKey: ["sheet-info"], queryFn: () => g
 // ---------------------------------------------------------------------------
 // New-order sound alert
 //
-// Generated entirely with the Web Audio API — no external audio file, so
-// there's nothing to fetch and nothing that can 404. Browsers block audio
-// from playing before the user has interacted with the page at least once,
-// so the AudioContext is created/resumed lazily on the first click anywhere
-// on the page (see the useEffect in AdminPage), then reused for every alert.
+// Uses the browser's built-in speech synthesis (SpeechSynthesisUtterance) —
+// no external audio file, nothing to fetch, nothing that can 404 or need a
+// network connection. It shouts "NEW ORDER" (or "LATE ORDER" for late
+// orders) ten times in a row, loud and fast, so it's impossible to miss.
+// Browsers block audio — speech included — from playing before the user has
+// interacted with the page at least once, so speech is only ever triggered
+// from inside the submissions-changed effect below, well after that first
+// click has happened (see the primeSpeech effect in AdminPage).
 const SOUND_PREF_KEY = "adminSoundAlertsEnabled";
+const ALERT_REPEAT_COUNT = 10;
 
-function playNewOrderAlert(ctx: AudioContext) {
-  const now = ctx.currentTime;
-  const pulses = 3;
-  for (let i = 0; i < pulses; i++) {
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = "square"; // buzzier / more attention-grabbing than a sine
-    osc.frequency.value = 880;
-    const start = now + i * 0.32;
-    const peak = start + 0.03;
-    const end = start + 0.22;
-    gain.gain.setValueAtTime(0, start);
-    gain.gain.linearRampToValueAtTime(0.9, peak);
-    gain.gain.linearRampToValueAtTime(0, end);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(start);
-    osc.stop(end + 0.02);
+function shoutAlert(phrase: "NEW ORDER" | "LATE ORDER") {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  // Cancel anything still queued from a previous alert so back-to-back
+  // orders don't pile up into a long backlog of speech.
+  window.speechSynthesis.cancel();
+  for (let i = 0; i < ALERT_REPEAT_COUNT; i++) {
+    const utter = new SpeechSynthesisUtterance(phrase);
+    utter.pitch = 2; // max pitch — sharper, more urgent/"shouted" tone
+    utter.rate = 1.3; // slightly fast so ten reps don't drag on too long
+    utter.volume = 1; // max volume
+    window.speechSynthesis.speak(utter);
   }
 }
 
@@ -354,7 +351,6 @@ function AdminPage() {
     const stored = localStorage.getItem(SOUND_PREF_KEY);
     return stored === null ? true : stored === "true";
   });
-  const audioCtxRef = useRef<AudioContext | null>(null);
   const lastSeenSubmissionIdRef = useRef<string | null>(null);
 
   function toggleSound() {
@@ -365,26 +361,27 @@ function AdminPage() {
     });
   }
 
-  // Browsers require a user gesture before audio can play. Any click on the
-  // page (unlock, a tab, re-sync, anywhere) creates/resumes the AudioContext
-  // once, so it's ready by the time a real new-order alert needs to fire.
+  // Browsers block speech synthesis (like all audio) until the user has
+  // interacted with the page at least once. Any click anywhere — unlocking,
+  // switching tabs, re-syncing — touches the speech API once so voices are
+  // loaded and ready by the time a real alert needs to fire.
   useEffect(() => {
-    function primeAudio() {
-      if (!audioCtxRef.current) {
-        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-        if (Ctx) audioCtxRef.current = new Ctx();
+    function primeSpeech() {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.getVoices();
       }
-      audioCtxRef.current?.resume().catch(() => {});
     }
-    document.addEventListener("click", primeAudio);
-    return () => document.removeEventListener("click", primeAudio);
+    document.addEventListener("click", primeSpeech);
+    return () => document.removeEventListener("click", primeSpeech);
   }, []);
 
   // Fires whenever the submissions list changes (including the 30s
   // auto-refresh below). The list is sorted newest-first, so if the newest
-  // id isn't the one we saw last time, a new order has come in.
+  // id isn't the one we saw last time, a new order has come in. Late orders
+  // (order_type "late") shout "LATE ORDER" instead of "NEW ORDER".
   useEffect(() => {
-    const newestId = submissions[0]?.id ?? null;
+    const newest = submissions[0];
+    const newestId = newest?.id ?? null;
     if (lastSeenSubmissionIdRef.current === null) {
       // First load — just record where we are, don't alert retroactively.
       lastSeenSubmissionIdRef.current = newestId;
@@ -392,8 +389,8 @@ function AdminPage() {
     }
     if (newestId && newestId !== lastSeenSubmissionIdRef.current) {
       lastSeenSubmissionIdRef.current = newestId;
-      if (soundEnabled && audioCtxRef.current) {
-        playNewOrderAlert(audioCtxRef.current);
+      if (soundEnabled) {
+        shoutAlert(newest?.order_type === "late" ? "LATE ORDER" : "NEW ORDER");
       }
     }
   }, [submissions, soundEnabled]);
