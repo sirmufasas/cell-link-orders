@@ -54,35 +54,65 @@ function getPreferredMaleVoice(): SpeechSynthesisVoice | null {
   return male ?? null;
 }
 
-/** One harsh siren "whoop": a fast rising sawtooth sweep at max gain. */
+/**
+ * One harsh siren "whoop": two oscillators stacked together (a rising
+ * sawtooth plus a lower square wave underneath), both at max gain. Layering
+ * two waveforms adds more broadband energy/harmonics than a single tone at
+ * the same peak level, which is what makes it read as noticeably louder and
+ * harsher rather than just "the same volume with a different timbre."
+ */
 function playSirenWhoop(ctx: AudioContext, startTime: number): number {
   const duration = 0.28;
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = "sawtooth"; // harsher/buzzier than sine — reads as more "alarm"
-  osc.frequency.setValueAtTime(500, startTime);
-  osc.frequency.exponentialRampToValueAtTime(1400, startTime + duration);
-  gain.gain.setValueAtTime(0, startTime);
-  gain.gain.linearRampToValueAtTime(1, startTime + 0.02); // max gain
-  gain.gain.linearRampToValueAtTime(0, startTime + duration);
-  osc.connect(gain);
-  gain.connect(ctx.destination);
-  osc.start(startTime);
-  osc.stop(startTime + duration + 0.02);
+
+  const osc1 = ctx.createOscillator();
+  const gain1 = ctx.createGain();
+  osc1.type = "sawtooth";
+  osc1.frequency.setValueAtTime(500, startTime);
+  osc1.frequency.exponentialRampToValueAtTime(1400, startTime + duration);
+  gain1.gain.setValueAtTime(0, startTime);
+  gain1.gain.linearRampToValueAtTime(1, startTime + 0.02);
+  gain1.gain.linearRampToValueAtTime(0, startTime + duration);
+  osc1.connect(gain1);
+  gain1.connect(ctx.destination);
+  osc1.start(startTime);
+  osc1.stop(startTime + duration + 0.02);
+
+  const osc2 = ctx.createOscillator();
+  const gain2 = ctx.createGain();
+  osc2.type = "square";
+  osc2.frequency.setValueAtTime(250, startTime);
+  osc2.frequency.exponentialRampToValueAtTime(700, startTime + duration);
+  gain2.gain.setValueAtTime(0, startTime);
+  gain2.gain.linearRampToValueAtTime(0.9, startTime + 0.02);
+  gain2.gain.linearRampToValueAtTime(0, startTime + duration);
+  osc2.connect(gain2);
+  gain2.connect(ctx.destination);
+  osc2.start(startTime);
+  osc2.stop(startTime + duration + 0.02);
+
   return duration;
+}
+
+// Fills the given window with back-to-back siren whoops — used to keep the
+// siren running continuously underneath the whole shouted sequence, instead
+// of just a brief intro, so there's no quiet gap at any point in the alert.
+function playSirenLayer(ctx: AudioContext, totalDuration: number) {
+  let t = ctx.currentTime;
+  const end = ctx.currentTime + totalDuration;
+  while (t < end) {
+    const dur = playSirenWhoop(ctx, t);
+    t += dur + 0.05;
+  }
 }
 
 function shoutAlert(phrase: "NEW ORDER" | "LATE ORDER", audioCtx?: AudioContext | null) {
   if (typeof window === "undefined") return;
 
-  // Layer 1: a loud siren burst up front to grab attention immediately,
-  // before the voice even starts.
+  // Layer 1: siren whoops running continuously for the whole alert, not
+  // just an intro — the voice shouts on top of it the entire time, so
+  // there's constant sound rather than louder-then-quieter gaps.
   if (audioCtx) {
-    let t = audioCtx.currentTime;
-    for (let i = 0; i < 4; i++) {
-      const dur = playSirenWhoop(audioCtx, t);
-      t += dur + 0.06;
-    }
+    playSirenLayer(audioCtx, ALERT_REPEAT_COUNT * 0.85);
   }
 
   // Layer 2: the shouted phrase, repeated.
