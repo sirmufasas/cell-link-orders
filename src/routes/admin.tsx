@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { useSuspenseQuery, useQuery, queryOptions, useQueryClient } from "@tanstack/react-query";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -15,6 +15,37 @@ const customersQuery = queryOptions({ queryKey: ["customers"], queryFn: () => li
 const submissionsQuery = queryOptions({ queryKey: ["submissions"], queryFn: () => listSubmissions({ data: {} }) });
 const analyticsQuery = queryOptions({ queryKey: ["analytics"], queryFn: () => analyticsOverview() });
 const sheetInfoQuery = queryOptions({ queryKey: ["sheet-info"], queryFn: () => getActiveSheetInfo() });
+
+// ---------------------------------------------------------------------------
+// New-order sound alert
+//
+// Generated entirely with the Web Audio API — no external audio file, so
+// there's nothing to fetch and nothing that can 404. Browsers block audio
+// from playing before the user has interacted with the page at least once,
+// so the AudioContext is created/resumed lazily on the first click anywhere
+// on the page (see the useEffect in AdminPage), then reused for every alert.
+const SOUND_PREF_KEY = "adminSoundAlertsEnabled";
+
+function playNewOrderAlert(ctx: AudioContext) {
+  const now = ctx.currentTime;
+  const pulses = 3;
+  for (let i = 0; i < pulses; i++) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "square"; // buzzier / more attention-grabbing than a sine
+    osc.frequency.value = 880;
+    const start = now + i * 0.32;
+    const peak = start + 0.03;
+    const end = start + 0.22;
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(0.9, peak);
+    gain.gain.linearRampToValueAtTime(0, end);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(start);
+    osc.stop(end + 0.02);
+  }
+}
 
 export const Route = createFileRoute("/admin")({
   head: () => ({ meta: [{ title: "Admin · Portugal Bakery" }] }),
@@ -317,6 +348,56 @@ function AdminPage() {
   const [pwInput, setPwInput] = useState("");
   const [pwError, setPwError] = useState(false);
 
+  // --- New-order sound alert ---
+  const [soundEnabled, setSoundEnabled] = useState(() => {
+    if (typeof window === "undefined") return true;
+    const stored = localStorage.getItem(SOUND_PREF_KEY);
+    return stored === null ? true : stored === "true";
+  });
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const lastSeenSubmissionIdRef = useRef<string | null>(null);
+
+  function toggleSound() {
+    setSoundEnabled((prev) => {
+      const next = !prev;
+      localStorage.setItem(SOUND_PREF_KEY, String(next));
+      return next;
+    });
+  }
+
+  // Browsers require a user gesture before audio can play. Any click on the
+  // page (unlock, a tab, re-sync, anywhere) creates/resumes the AudioContext
+  // once, so it's ready by the time a real new-order alert needs to fire.
+  useEffect(() => {
+    function primeAudio() {
+      if (!audioCtxRef.current) {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        if (Ctx) audioCtxRef.current = new Ctx();
+      }
+      audioCtxRef.current?.resume().catch(() => {});
+    }
+    document.addEventListener("click", primeAudio);
+    return () => document.removeEventListener("click", primeAudio);
+  }, []);
+
+  // Fires whenever the submissions list changes (including the 30s
+  // auto-refresh below). The list is sorted newest-first, so if the newest
+  // id isn't the one we saw last time, a new order has come in.
+  useEffect(() => {
+    const newestId = submissions[0]?.id ?? null;
+    if (lastSeenSubmissionIdRef.current === null) {
+      // First load — just record where we are, don't alert retroactively.
+      lastSeenSubmissionIdRef.current = newestId;
+      return;
+    }
+    if (newestId && newestId !== lastSeenSubmissionIdRef.current) {
+      lastSeenSubmissionIdRef.current = newestId;
+      if (soundEnabled && audioCtxRef.current) {
+        playNewOrderAlert(audioCtxRef.current);
+      }
+    }
+  }, [submissions, soundEnabled]);
+
   function handleUnlock(e: React.FormEvent) {
     e.preventDefault();
     if (pwInput === ADMIN_PASSWORD) {
@@ -448,6 +529,17 @@ function AdminPage() {
             </Link>
           </div>
           <div className="flex gap-2">
+            <button
+              onClick={toggleSound}
+              className={`text-sm px-3 py-2 rounded-lg border font-semibold ${
+                soundEnabled
+                  ? "border-[#2a1810] bg-[#2a1810] text-white"
+                  : "border-[#e8dcc8] text-[#8b6f4e] hover:bg-[#fdf8f1]"
+              }`}
+              title={soundEnabled ? "New-order sound alerts are ON — click to mute" : "New-order sound alerts are OFF — click to unmute"}
+            >
+              {soundEnabled ? "🔊 Alerts On" : "🔇 Alerts Off"}
+            </button>
             <a
               href={sheetInfo?.url ?? "#"}
               target="_blank"
