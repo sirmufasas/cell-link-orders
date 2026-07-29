@@ -19,14 +19,17 @@ const sheetInfoQuery = queryOptions({ queryKey: ["sheet-info"], queryFn: () => g
 // ---------------------------------------------------------------------------
 // New-order sound alert
 //
-// Uses the browser's built-in speech synthesis (SpeechSynthesisUtterance) —
-// no external audio file, nothing to fetch, nothing that can 404 or need a
-// network connection. It shouts "NEW ORDER" (or "LATE ORDER" for late
-// orders) ten times in a row, loud and fast, so it's impossible to miss.
-// Browsers block audio — speech included — from playing before the user has
-// interacted with the page at least once, so speech is only ever triggered
-// from inside the submissions-changed effect below, well after that first
-// click has happened (see the primeSpeech effect in AdminPage).
+// Two layers, both generated in-browser (no audio file, nothing to fetch):
+//  1. A harsh siren tone (Web Audio API) — this is what makes it read as
+//     "loud alarm" rather than just a voice. Browser/OS volume is the only
+//     hard ceiling; there is no way for page code to exceed "1.0" gain, so
+//     this maxes out every gain/volume value it controls and uses a harsh
+//     sawtooth wave (perceived as louder/more piercing than a pure tone).
+//  2. The shouted phrase itself (SpeechSynthesisUtterance), repeated ten
+//     times, using a male voice where available.
+// Browsers block all audio — tones and speech alike — from playing before
+// the user has interacted with the page at least once (see the primeAlerts
+// effect in AdminPage).
 const SOUND_PREF_KEY = "adminSoundAlertsEnabled";
 const ALERT_REPEAT_COUNT = 10;
 
@@ -51,18 +54,47 @@ function getPreferredMaleVoice(): SpeechSynthesisVoice | null {
   return male ?? null;
 }
 
-function shoutAlert(phrase: "NEW ORDER" | "LATE ORDER") {
-  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-  // Cancel anything still queued from a previous alert so back-to-back
-  // orders don't pile up into a long backlog of speech.
-  window.speechSynthesis.cancel();
+/** One harsh siren "whoop": a fast rising sawtooth sweep at max gain. */
+function playSirenWhoop(ctx: AudioContext, startTime: number): number {
+  const duration = 0.28;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sawtooth"; // harsher/buzzier than sine — reads as more "alarm"
+  osc.frequency.setValueAtTime(500, startTime);
+  osc.frequency.exponentialRampToValueAtTime(1400, startTime + duration);
+  gain.gain.setValueAtTime(0, startTime);
+  gain.gain.linearRampToValueAtTime(1, startTime + 0.02); // max gain
+  gain.gain.linearRampToValueAtTime(0, startTime + duration);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(startTime);
+  osc.stop(startTime + duration + 0.02);
+  return duration;
+}
+
+function shoutAlert(phrase: "NEW ORDER" | "LATE ORDER", audioCtx?: AudioContext | null) {
+  if (typeof window === "undefined") return;
+
+  // Layer 1: a loud siren burst up front to grab attention immediately,
+  // before the voice even starts.
+  if (audioCtx) {
+    let t = audioCtx.currentTime;
+    for (let i = 0; i < 4; i++) {
+      const dur = playSirenWhoop(audioCtx, t);
+      t += dur + 0.06;
+    }
+  }
+
+  // Layer 2: the shouted phrase, repeated.
+  if (!("speechSynthesis" in window)) return;
+  window.speechSynthesis.cancel(); // clear anything queued from a previous alert
   const maleVoice = getPreferredMaleVoice();
   for (let i = 0; i < ALERT_REPEAT_COUNT; i++) {
     const utter = new SpeechSynthesisUtterance(phrase);
     if (maleVoice) utter.voice = maleVoice;
-    utter.pitch = 0.7; // lower pitch — deeper, more "man's voice"
-    utter.rate = 1.15; // slightly fast/urgent, but still intelligible
-    utter.volume = 1; // max volume
+    utter.pitch = 1.1; // slightly raised — closer to how a real shout sounds
+    utter.rate = 1.2; // fast/urgent
+    utter.volume = 1; // max volume — the hard ceiling of the API
     window.speechSynthesis.speak(utter);
   }
 }
@@ -375,6 +407,7 @@ function AdminPage() {
     return stored === null ? true : stored === "true";
   });
   const lastSeenSubmissionIdRef = useRef<string | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
   function toggleSound() {
     setSoundEnabled((prev) => {
@@ -384,23 +417,31 @@ function AdminPage() {
     });
   }
 
-  // Browsers block speech synthesis (like all audio) until the user has
-  // interacted with the page at least once. Any click anywhere — unlocking,
-  // switching tabs, re-syncing — touches the speech API once so voices are
-  // loaded and ready by the time a real alert needs to fire. Chrome in
-  // particular loads its voice list asynchronously, so also listen for
-  // "voiceschanged" to make sure getPreferredMaleVoice() has real data.
+  // Browsers block all audio — the siren tone and speech alike — until the
+  // user has interacted with the page at least once. Any click anywhere —
+  // unlocking, switching tabs, re-syncing — creates/resumes the AudioContext
+  // and touches the speech API once, so both are ready by the time a real
+  // alert needs to fire. Chrome in particular loads its voice list
+  // asynchronously, so also listen for "voiceschanged".
   useEffect(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    function primeSpeech() {
-      window.speechSynthesis.getVoices();
+    function primeAlerts() {
+      if (!audioCtxRef.current) {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        if (Ctx) audioCtxRef.current = new Ctx();
+      }
+      audioCtxRef.current?.resume().catch(() => {});
+      if ("speechSynthesis" in window) window.speechSynthesis.getVoices();
     }
-    primeSpeech();
-    window.speechSynthesis.addEventListener("voiceschanged", primeSpeech);
-    document.addEventListener("click", primeSpeech);
+    primeAlerts();
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.addEventListener("voiceschanged", primeAlerts);
+    }
+    document.addEventListener("click", primeAlerts);
     return () => {
-      window.speechSynthesis.removeEventListener("voiceschanged", primeSpeech);
-      document.removeEventListener("click", primeSpeech);
+      if ("speechSynthesis" in window) {
+        window.speechSynthesis.removeEventListener("voiceschanged", primeAlerts);
+      }
+      document.removeEventListener("click", primeAlerts);
     };
   }, []);
 
@@ -452,7 +493,7 @@ function AdminPage() {
     if (newestId && newestId !== lastSeenSubmissionIdRef.current) {
       lastSeenSubmissionIdRef.current = newestId;
       if (soundEnabled) {
-        shoutAlert(newest?.order_type === "late" ? "LATE ORDER" : "NEW ORDER");
+        shoutAlert(newest?.order_type === "late" ? "LATE ORDER" : "NEW ORDER", audioCtxRef.current);
       }
     }
   }, [submissions, soundEnabled]);
@@ -600,7 +641,7 @@ function AdminPage() {
               {soundEnabled ? "🔊 Alerts On" : "🔇 Alerts Off"}
             </button>
             <button
-              onClick={() => shoutAlert("NEW ORDER")}
+              onClick={() => shoutAlert("NEW ORDER", audioCtxRef.current)}
               className="text-sm px-3 py-2 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
               title="Play the alert now, without waiting for a real order"
             >
