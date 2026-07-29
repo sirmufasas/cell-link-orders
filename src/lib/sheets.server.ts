@@ -265,6 +265,31 @@ export async function clearOrderQuantities(rows: number[]) {
   await writeOrderQuantities(rows.map((r) => ({ row: r, quantity: 0 })));
 }
 
+/**
+ * Write quantity values into column K ("Late Orders") of "Customer Order
+ * Details" for the given sheet rows. Used for new orders submitted at/after
+ * the 8:30 PM cutoff — kept separate from column C on purpose so the main
+ * order total isn't affected by late submissions. The "LATE" tab reads this
+ * column live via SUMIF formulas, so no extra write is needed to keep
+ * per-product totals current.
+ */
+export async function writeLateOrderQuantities(
+  entries: Array<{ row: number; quantity: number }>,
+) {
+  if (!entries.length) return;
+  const sheets = await getSheetsClient();
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: getActiveSheetId(),
+    requestBody: {
+      valueInputOption: "USER_ENTERED",
+      data: entries.map((e) => ({
+        range: `${TAB_CUSTOMERS}!K${e.row}`,
+        values: [[e.quantity > 0 ? String(e.quantity) : ""]],
+      })),
+    },
+  });
+}
+
 /** Write arbitrary single-cell values. */
 export async function writeCells(
   entries: Array<{ range: string; value: string }>,

@@ -15,6 +15,20 @@ function tomorrowISO(): string {
   return d.toISOString().slice(0, 10);
 }
 
+// A NEW order is "late" if it's submitted at or after 8:30 PM, server local
+// time. Late new orders are written to column K instead of column C (see
+// writeLateOrderQuantities in sheets.server.ts) so they don't affect the
+// main order total, and so the "LATE" tab can total them up per product.
+const LATE_CUTOFF_HOUR = 20;
+const LATE_CUTOFF_MINUTE = 30;
+
+function isLateOrder(): boolean {
+  const now = new Date();
+  const minutesNow = now.getHours() * 60 + now.getMinutes();
+  const cutoff = LATE_CUTOFF_HOUR * 60 + LATE_CUTOFF_MINUTE;
+  return minutesNow >= cutoff;
+}
+
 // ============================== READS ==============================
 
 export const listCustomers = createServerFn({ method: "GET" }).handler(async () => {
@@ -117,9 +131,12 @@ export const submitOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { writeOrderQuantities, insertCustomerProductRow, writeOrderComment } = await import(
-      "@/lib/sheets.server"
-    );
+    const {
+      writeOrderQuantities,
+      writeLateOrderQuantities,
+      insertCustomerProductRow,
+      writeOrderComment,
+    } = await import("@/lib/sheets.server");
 
     const { data: customer, error: cErr } = await supabaseAdmin
       .from("customers")
@@ -132,25 +149,36 @@ export const submitOrder = createServerFn({ method: "POST" })
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
     const message = data.message.trim();
+    const late = isLateOrder();
 
-    // 1) For items without a sheet row, insert a new row first (immediately below the customer's last row)
+    // 1) For items without a sheet row, insert a new row first (immediately
+    // below the customer's last row). When the order is late, insert with
+    // quantity 0 so column C stays untouched — the actual quantity goes to
+    // column K in step 2 instead.
     let insertedAny = false;
     for (const item of positive) {
       if (item.sheetRow === 0) {
         const newRow = await insertCustomerProductRow({
           customerName: customer.name,
           productName: item.productName,
-          quantity: item.quantity,
+          quantity: late ? 0 : item.quantity,
         });
         item.sheetRow = newRow;
         insertedAny = true;
       }
     }
 
-    // 2) Write column C for all positive items
-    await writeOrderQuantities(
-      positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
-    );
+    // 2) Late new orders (>= 8:30 PM) go to column K only; everything else
+    // writes to column C as before.
+    if (late) {
+      await writeLateOrderQuantities(
+        positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+      );
+    } else {
+      await writeOrderQuantities(
+        positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+      );
+    }
 
     // 2b) Write the customer's message into column J on every row touched — only if they left one
     if (message.length > 0) {
@@ -165,7 +193,7 @@ export const submitOrder = createServerFn({ method: "POST" })
         for_date: data.forDate,
         total_items: totalItems,
         synced_to_sheet: true,
-        order_type: "new",
+        order_type: late ? "late" : "new",
       })
       .select("id")
       .single();

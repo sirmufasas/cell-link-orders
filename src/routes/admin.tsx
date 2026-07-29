@@ -146,6 +146,8 @@ function orderTypeTag(type?: string | null) {
       return { label: "Changed Order", className: "bg-amber-100 text-amber-800" };
     case "added":
       return { label: "Added Order", className: "bg-blue-100 text-blue-800" };
+    case "late":
+      return { label: "Late Order", className: "bg-red-100 text-red-800" };
     default:
       return { label: "New Order", className: "bg-green-100 text-green-800" };
   }
