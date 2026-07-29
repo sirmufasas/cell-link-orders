@@ -404,6 +404,39 @@ function AdminPage() {
     };
   }, []);
 
+  // Known Chrome bug: speechSynthesis silently stops working after the
+  // engine has been idle for ~15 seconds (this gets worse if the tab isn't
+  // focused) and never recovers on its own — this is almost certainly why
+  // an alert works once and then goes silent later. The standard workaround
+  // is to "tap" pause/resume periodically so Chrome's engine never goes
+  // idle long enough to lock up.
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const t = setInterval(() => {
+      // Deliberately unconditional — the Chrome bug happens specifically
+      // during idle gaps, so gating this on "is currently speaking" would
+      // skip the exact moments it's needed. Pause+resume on an idle queue
+      // is a harmless no-op.
+      window.speechSynthesis.pause();
+      window.speechSynthesis.resume();
+    }, 10000);
+    return () => clearInterval(t);
+  }, []);
+
+  // If the browser tab was backgrounded, timers (including the 30s
+  // auto-refresh below) can get throttled or paused, so a new order might
+  // not show up until well after it actually came in. Force an immediate
+  // refetch as soon as the tab becomes visible again to catch up right away.
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState === "visible") {
+        qc.invalidateQueries({ queryKey: ["submissions"] });
+      }
+    }
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [qc]);
+
   // Fires whenever the submissions list changes (including the 30s
   // auto-refresh below). The list is sorted newest-first, so if the newest
   // id isn't the one we saw last time, a new order has come in. Late orders
@@ -565,6 +598,13 @@ function AdminPage() {
               title={soundEnabled ? "New-order sound alerts are ON — click to mute" : "New-order sound alerts are OFF — click to unmute"}
             >
               {soundEnabled ? "🔊 Alerts On" : "🔇 Alerts Off"}
+            </button>
+            <button
+              onClick={() => shoutAlert("NEW ORDER")}
+              className="text-sm px-3 py-2 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+              title="Play the alert now, without waiting for a real order"
+            >
+              🔔 Test Alert
             </button>
             <a
               href={sheetInfo?.url ?? "#"}
