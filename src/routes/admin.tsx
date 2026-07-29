@@ -30,15 +30,38 @@ const sheetInfoQuery = queryOptions({ queryKey: ["sheet-info"], queryFn: () => g
 const SOUND_PREF_KEY = "adminSoundAlertsEnabled";
 const ALERT_REPEAT_COUNT = 10;
 
+// Known male voice names across the browsers/OSes people are likely to run
+// this on (Chrome/Edge on Windows, Chrome on Android, Safari on macOS/iOS).
+// The Web Speech API has no standard "gender" field, so name-matching is
+// the only real option — availability still depends entirely on what voices
+// the device/browser ships with.
+const MALE_VOICE_HINTS = [
+  "male", "david", "mark", "daniel", "alex", "fred", "george",
+  "james", "thomas", "oliver", "arthur", "guy", "ryan", "eric", "matthew",
+];
+
+function getPreferredMaleVoice(): SpeechSynthesisVoice | null {
+  const voices = window.speechSynthesis.getVoices();
+  const englishVoices = voices.filter((v) => v.lang?.toLowerCase().startsWith("en"));
+  const pool = englishVoices.length ? englishVoices : voices;
+  const male = pool.find((v) => {
+    const n = v.name.toLowerCase();
+    return !n.includes("female") && MALE_VOICE_HINTS.some((hint) => n.includes(hint));
+  });
+  return male ?? null;
+}
+
 function shoutAlert(phrase: "NEW ORDER" | "LATE ORDER") {
   if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
   // Cancel anything still queued from a previous alert so back-to-back
   // orders don't pile up into a long backlog of speech.
   window.speechSynthesis.cancel();
+  const maleVoice = getPreferredMaleVoice();
   for (let i = 0; i < ALERT_REPEAT_COUNT; i++) {
     const utter = new SpeechSynthesisUtterance(phrase);
-    utter.pitch = 2; // max pitch — sharper, more urgent/"shouted" tone
-    utter.rate = 1.3; // slightly fast so ten reps don't drag on too long
+    if (maleVoice) utter.voice = maleVoice;
+    utter.pitch = 0.7; // lower pitch — deeper, more "man's voice"
+    utter.rate = 1.15; // slightly fast/urgent, but still intelligible
     utter.volume = 1; // max volume
     window.speechSynthesis.speak(utter);
   }
@@ -364,15 +387,21 @@ function AdminPage() {
   // Browsers block speech synthesis (like all audio) until the user has
   // interacted with the page at least once. Any click anywhere — unlocking,
   // switching tabs, re-syncing — touches the speech API once so voices are
-  // loaded and ready by the time a real alert needs to fire.
+  // loaded and ready by the time a real alert needs to fire. Chrome in
+  // particular loads its voice list asynchronously, so also listen for
+  // "voiceschanged" to make sure getPreferredMaleVoice() has real data.
   useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
     function primeSpeech() {
-      if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.getVoices();
-      }
+      window.speechSynthesis.getVoices();
     }
+    primeSpeech();
+    window.speechSynthesis.addEventListener("voiceschanged", primeSpeech);
     document.addEventListener("click", primeSpeech);
-    return () => document.removeEventListener("click", primeSpeech);
+    return () => {
+      window.speechSynthesis.removeEventListener("voiceschanged", primeSpeech);
+      document.removeEventListener("click", primeSpeech);
+    };
   }, []);
 
   // Fires whenever the submissions list changes (including the 30s
