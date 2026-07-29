@@ -320,9 +320,12 @@ export const addOnToOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { addOnQuantityToRow, insertCustomerProductRow, writeOrderComment } = await import(
-      "@/lib/sheets.server"
-    );
+    const {
+      addOnQuantityToRow,
+      addLateOrderQuantityToRow,
+      insertCustomerProductRow,
+      writeOrderComment,
+    } = await import("@/lib/sheets.server");
 
     const { data: customer, error: cErr } = await supabaseAdmin
       .from("customers")
@@ -335,10 +338,11 @@ export const addOnToOrder = createServerFn({ method: "POST" })
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
     const message = data.message.trim();
+    const late = isLateOrder();
 
     for (const item of positive) {
       if (item.sheetRow === 0) {
-        // New product — insert row first with quantity 0, then add-on writes to F
+        // New product — insert row first with quantity 0, then add-on writes to F (or K if late)
         const newRow = await insertCustomerProductRow({
           customerName: customer.name,
           productName: item.productName,
@@ -346,7 +350,13 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         });
         item.sheetRow = newRow;
       }
-      await addOnQuantityToRow(item.sheetRow, item.quantity);
+      if (late) {
+        // Late add-ons (>= 8:30 PM) accumulate into column K, kept separate
+        // from column C, instead of using an F..Z add-on column.
+        await addLateOrderQuantityToRow(item.sheetRow, item.quantity);
+      } else {
+        await addOnQuantityToRow(item.sheetRow, item.quantity);
+      }
     }
 
     // Write the customer's message into column J on every row touched — only if they left one
@@ -361,7 +371,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         for_date: data.forDate,
         total_items: totalItems,
         synced_to_sheet: true,
-        order_type: "added",
+        order_type: late ? "late" : "added",
       })
       .select("id")
       .single();

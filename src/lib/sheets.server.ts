@@ -290,6 +290,30 @@ export async function writeLateOrderQuantities(
   });
 }
 
+/**
+ * Add a late add-on quantity into column K for a single row, ACCUMULATING on
+ * top of whatever is already there rather than overwriting it — a customer
+ * can place more than one late add-on in an evening, and each one should add
+ * to the running late total for that row instead of clobbering the last one.
+ */
+export async function addLateOrderQuantityToRow(
+  row: number,
+  quantity: number,
+): Promise<void> {
+  if (quantity <= 0) return;
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: getActiveSheetId(),
+    range: `${TAB_CUSTOMERS}!K${row}`,
+  });
+  const currentRaw = (res.data.values?.[0]?.[0] ?? "").toString().trim();
+  const current = currentRaw === "" ? 0 : parseInt(currentRaw, 10);
+  const newTotal = (Number.isFinite(current) ? current : 0) + quantity;
+  await writeCells([
+    { range: `${TAB_CUSTOMERS}!K${row}`, value: String(newTotal) },
+  ]);
+}
+
 /** Write arbitrary single-cell values. */
 export async function writeCells(
   entries: Array<{ range: string; value: string }>,
