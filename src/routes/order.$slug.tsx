@@ -34,15 +34,25 @@ export const Route = createFileRoute("/order/$slug")({
   component: OrderPage,
 });
 
-function tomorrowISO() {
+// ---------------------------------------------------------------------------
+// Next delivery date
+//
+// Orders are always placed "for tomorrow" — except no deliveries go out on
+// Sunday. So an order placed on Saturday is for Monday (skip Sunday), not
+// Sunday. Every other day of the week behaves as before (tomorrow).
+// ---------------------------------------------------------------------------
+function getNextDeliveryDate(): Date {
   const d = new Date();
-  d.setDate(d.getDate() + 1);
-  return d.toISOString().slice(0, 10);
+  const dow = d.getDay(); // 0=Sunday … 6=Saturday
+  const addDays = dow === 6 ? 2 : 1; // Saturday -> skip Sunday, land on Monday
+  d.setDate(d.getDate() + addDays);
+  return d;
+}
+function tomorrowISO() {
+  return getNextDeliveryDate().toISOString().slice(0, 10);
 }
 function tomorrowLabel() {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  return d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+  return getNextDeliveryDate().toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
 }
 function dateLabel(iso: string) {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -55,6 +65,10 @@ type Mode = "default" | "addon";
 
 const KOTA_ONLY_PREFIXES = ["rolls kota", "kota"];
 
+// Products that should only be visible/orderable by Mediterranean or Rio
+// Dourro customers (e.g. "ROLLS RIO/MED").
+const RIO_MED_ONLY_PREFIXES = ["rolls rio/med", "rio/med"];
+
 // Max number of distinct product lines (qty > 0) allowed in a single order.
 // Ordering a large quantity of ONE product only uses a single slot.
 const PRODUCT_LIMIT = 20;
@@ -63,6 +77,20 @@ function isKotaOnlyProduct(name: string | undefined | null) {
   const n = (name ?? "").trim().toLowerCase();
   if (!n) return false;
   return KOTA_ONLY_PREFIXES.some((prefix) => n.startsWith(prefix));
+}
+
+function isRioMedOnlyProduct(name: string | undefined | null) {
+  const n = (name ?? "").trim().toLowerCase();
+  if (!n) return false;
+  return RIO_MED_ONLY_PREFIXES.some((prefix) => n.startsWith(prefix)) || n.includes("rio/med");
+}
+
+// Customers allowed to see/order the Rio/Med-only products. Matching is a
+// case-insensitive substring check against the customer's name, so it
+// covers name variants automatically.
+function isRioMedCustomer(customerName: string) {
+  const n = customerName.trim().toLowerCase();
+  return n.includes("mediteran") || n.includes("rio dourro");
 }
 
 // ---------------------------------------------------------------------------
@@ -136,9 +164,15 @@ function OrderPage() {
   }, [slug]);
 
   const isKotaJoe = customer.name.trim().toLowerCase().startsWith("kota joe");
+  const canSeeRioMed = useMemo(() => isRioMedCustomer(customer.name), [customer.name]);
   const regulars = useMemo(
-    () => regularsAll.filter((r) => isKotaJoe || !isKotaOnlyProduct(r.product?.name)),
-    [regularsAll, isKotaJoe],
+    () =>
+      regularsAll.filter((r) => {
+        if (!isKotaJoe && isKotaOnlyProduct(r.product?.name)) return false;
+        if (!canSeeRioMed && isRioMedOnlyProduct(r.product?.name)) return false;
+        return true;
+      }),
+    [regularsAll, isKotaJoe, canSeeRioMed],
   );
 
   const [qty, setQty] = useState<Record<LineKey, number>>({});
@@ -192,10 +226,11 @@ function OrderPage() {
     return allProducts.filter((p) => {
       if (regularProductIds.has(p.id)) return false;
       if (!isKotaJoe && isKotaOnlyProduct(p.name)) return false;
+      if (!canSeeRioMed && isRioMedOnlyProduct(p.name)) return false;
       if (!s) return true;
       return p.name.toLowerCase().includes(s);
     });
-  }, [allProducts, regularProductIds, productSearch, showMore, isKotaJoe]);
+  }, [allProducts, regularProductIds, productSearch, showMore, isKotaJoe, canSeeRioMed]);
 
   const totalItems = Object.values(qty).reduce((a, b) => a + b, 0);
 
