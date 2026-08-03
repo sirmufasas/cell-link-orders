@@ -669,11 +669,10 @@ export const analyticsOverview = createServerFn({ method: "GET" }).handler(async
 //   1. "Customer Order Details" — the flat listing (Customer, Product,
 //      Quantity, Driver, Comments), colored to match the live Google
 //      Sheet's look (header band + a light color per customer).
-//   2. "Freezer" — a pivoted Driver > Customer > Product breakdown with a
-//      Sum of Quantity column and subtotals, restricted to products whose
-//      category (from the Products List / products table) is FREEZER.
-//   3. "Production" — the same pivot shape, restricted to PRODUCTION
-//      products.
+//   2. "Freezer" — every FREEZER-category product ordered today, summed
+//      across all customers/drivers into one Product + Quantity row per
+//      product (category comes from the Products List / products table).
+//   3. "Production" — the same shape, restricted to PRODUCTION products.
 //   4. "Uncategorized" — same shape again, only added if any ordered
 //      product couldn't be matched to a category at all (see
 //      buildProductCategoryMap below for why that can happen), so nothing
@@ -755,22 +754,21 @@ function buildFlatDetailSheet(workbook: import("exceljs").Workbook, rows: Export
   sheet.getColumn(3).alignment = { horizontal: "center" };
 }
 
-// Builds a Driver > Customer > Product pivot on a new sheet, with a "Sum
-// of Quantity" column, bold subtotal rows for each driver and customer,
-// and a Grand Total row at the bottom — the same shape as Excel's own
-// PivotTable "compact" layout, just built by hand since a real interactive
-// PivotTable object isn't something ExcelJS can reliably author.
-function buildPivotSheet(
+// Builds a flat Product + Total Quantity table on a new sheet — every
+// product ordered in this category, summed across every customer and
+// driver, sorted alphabetically. Just two columns: the product name
+// (header labeled per-category, e.g. "PRODUCT NAME FOR FREEZER") and the
+// total quantity ordered.
+function buildProductTotalsSheet(
   workbook: import("exceljs").Workbook,
   sheetName: string,
+  productHeaderLabel: string,
   rows: ExportOrderRow[],
 ) {
   const sheet = workbook.addWorksheet(sheetName, { views: [{ state: "frozen", ySplit: 1 }] });
   sheet.columns = [
-    { header: "Driver", key: "driver", width: 20 },
-    { header: "Customer", key: "customer", width: 28 },
-    { header: "Product", key: "product", width: 32 },
-    { header: "Sum of Quantity", key: "quantity", width: 16 },
+    { header: productHeaderLabel, key: "product", width: 36 },
+    { header: "Quantity", key: "quantity", width: 14 },
   ];
 
   const headerRow = sheet.getRow(1);
@@ -779,71 +777,23 @@ function buildPivotSheet(
   headerRow.alignment = { vertical: "middle" };
 
   if (!rows.length) {
-    const emptyRow = sheet.addRow({
-      driver: "No orders in this category for this date",
-      customer: "",
-      product: "",
-      quantity: "",
-    });
+    const emptyRow = sheet.addRow({ product: "No orders in this category for this date", quantity: "" });
     emptyRow.font = { italic: true, color: { argb: "FF8B6F4E" } };
     return;
   }
 
-  // driver -> customer -> product -> summed quantity
-  const byDriver = new Map<string, Map<string, Map<string, number>>>();
+  const totals = new Map<string, number>();
   for (const r of rows) {
-    const driverKey = r.driver || "Unassigned";
-    if (!byDriver.has(driverKey)) byDriver.set(driverKey, new Map());
-    const customers = byDriver.get(driverKey)!;
-    if (!customers.has(r.customer)) customers.set(r.customer, new Map());
-    const products = customers.get(r.customer)!;
-    products.set(r.product, (products.get(r.product) ?? 0) + r.quantity);
+    const qty = Number.isFinite(r.quantity) ? r.quantity : 0;
+    totals.set(r.product, (totals.get(r.product) ?? 0) + qty);
   }
 
-  const driverNames = Array.from(byDriver.keys()).sort((a, b) => a.localeCompare(b));
-  let grandTotal = 0;
-
-  for (const driverName of driverNames) {
-    const customers = byDriver.get(driverName)!;
-    const customerNames = Array.from(customers.keys()).sort((a, b) => a.localeCompare(b));
-
-    const customerTotals = new Map<string, number>();
-    let driverTotal = 0;
-    for (const cName of customerNames) {
-      const products = customers.get(cName)!;
-      let cTotal = 0;
-      for (const q of products.values()) cTotal += q;
-      customerTotals.set(cName, cTotal);
-      driverTotal += cTotal;
-    }
-    grandTotal += driverTotal;
-
-    const driverRow = sheet.addRow({ driver: driverName, customer: "", product: "", quantity: driverTotal });
-    driverRow.font = { bold: true };
-    driverRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF3E9DA" } };
-
-    for (const cName of customerNames) {
-      const custRow = sheet.addRow({
-        driver: "",
-        customer: cName,
-        product: "",
-        quantity: customerTotals.get(cName),
-      });
-      custRow.font = { bold: true, italic: true };
-
-      const products = customers.get(cName)!;
-      const productNames = Array.from(products.keys()).sort((a, b) => a.localeCompare(b));
-      for (const pName of productNames) {
-        sheet.addRow({ driver: "", customer: "", product: pName, quantity: products.get(pName) });
-      }
-    }
+  const productNames = Array.from(totals.keys()).sort((a, b) => a.localeCompare(b));
+  for (const pName of productNames) {
+    sheet.addRow({ product: pName, quantity: totals.get(pName) });
   }
 
-  const totalRow = sheet.addRow({ driver: "Grand Total", customer: "", product: "", quantity: grandTotal });
-  totalRow.font = { bold: true };
-  totalRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8DCC8" } };
-
-  sheet.getColumn(4).alignment = { horizontal: "right" };
+  sheet.getColumn(2).alignment = { horizontal: "center" };
 }
 
 // Looks up each product's category (FREEZER / PRODUCTION) from the
@@ -898,10 +848,10 @@ async function buildOrdersWorkbookBase64(rows: ExportOrderRow[]): Promise<string
     else uncategorizedRows.push(r);
   }
 
-  buildPivotSheet(workbook, "Freezer", freezerRows);
-  buildPivotSheet(workbook, "Production", productionRows);
+  buildProductTotalsSheet(workbook, "Freezer", "PRODUCT NAME FOR FREEZER", freezerRows);
+  buildProductTotalsSheet(workbook, "Production", "PRODUCT NAME FOR PRODUCTION", productionRows);
   if (uncategorizedRows.length) {
-    buildPivotSheet(workbook, "Uncategorized", uncategorizedRows);
+    buildProductTotalsSheet(workbook, "Uncategorized", "PRODUCT NAME (UNCATEGORIZED)", uncategorizedRows);
   }
 
   const buffer = await workbook.xlsx.writeBuffer();
