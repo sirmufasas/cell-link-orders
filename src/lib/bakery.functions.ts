@@ -29,6 +29,62 @@ function isLateOrder(): boolean {
   return minutesNow >= cutoff;
 }
 
+// ============================== AUTO-SYNC ==============================
+// Keeps Supabase's cached copy of customers/products in step with the
+// Google Sheet WITHOUT relying on someone remembering to click "Re-sync".
+// When the sheet is edited directly — a customer added, a product added,
+// rows shifted — but nobody resyncs, that staleness is what breaks orders:
+// a brand-new customer's page 404s ("Unknown customer"), or a quantity
+// write lands on the wrong sheet row because the cached sheet_row mapping
+// is out of date.
+//
+// A full syncFromSheet() reads two tabs and does a batch of upserts, so
+// running it on EVERY request would slow every page load down with extra
+// Google Sheets API calls for no reason most of the time. Instead this
+// throttles it: at most once every AUTO_SYNC_INTERVAL_MS, the next request
+// that needs fresh data triggers a sync, and everything else in that
+// window rides on whatever's already cached. syncFromSheet() is
+// idempotent (it upserts by name/slug), so even if two serverless
+// instances both decide to sync at nearly the same moment, nothing
+// breaks — worst case is a little duplicate work.
+//
+// The timestamp lives in module scope, so a cold start resets it to 0;
+// that just means the very first request after a cold start always
+// triggers a sync, which is the safe direction to be wrong in.
+const AUTO_SYNC_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+let lastAutoSyncAt = 0;
+let autoSyncInFlight: Promise<void> | null = null;
+
+async function maybeAutoSync(): Promise<void> {
+  const now = Date.now();
+  if (now - lastAutoSyncAt < AUTO_SYNC_INTERVAL_MS) return;
+
+  if (autoSyncInFlight) {
+    // A sync is already running (e.g. two requests landed back-to-back) —
+    // piggyback on that one instead of kicking off a second sync in parallel.
+    await autoSyncInFlight;
+    return;
+  }
+
+  lastAutoSyncAt = now;
+  autoSyncInFlight = syncFromSheet()
+    .then(() => undefined)
+    .catch((err) => {
+      // Never let a failed background sync break the actual page load that
+      // triggered it — the request still gets whatever Supabase already
+      // has, stale or not, rather than an error screen. Reset the
+      // timestamp so the next request is willing to retry soon instead of
+      // waiting out the full interval after a failure.
+      lastAutoSyncAt = 0;
+      console.error("Auto-sync from sheet failed:", err);
+    })
+    .finally(() => {
+      autoSyncInFlight = null;
+    });
+
+  await autoSyncInFlight;
+}
+
 // ============================== READS ==============================
 
 export const listCustomers = createServerFn({ method: "GET" }).handler(async () => {
@@ -55,6 +111,11 @@ export const listProducts = createServerFn({ method: "GET" }).handler(async () =
 export const getCustomerPage = createServerFn({ method: "GET" })
   .validator((d: { slug: string }) => z.object({ slug: z.string().min(1) }).parse(d))
   .handler(async ({ data }) => {
+    // Self-healing: make sure the cached customer/product data is fresh
+    // before reading it, instead of trusting that someone remembered to
+    // hit "Re-sync" after editing the sheet. Throttled — see maybeAutoSync.
+    await maybeAutoSync();
+
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: customer, error: cErr } = await supabaseAdmin
       .from("customers")
@@ -530,6 +591,15 @@ export const ensureSeeded = createServerFn({ method: "GET" }).handler(async () =
   return { seeded: true };
 });
 
+// Thin wrapper so callers outside this file (e.g. the admin page's route
+// loader) can trigger the same throttled background sync used by
+// getCustomerPage, instead of only ever syncing when the customers table
+// is completely empty (which is all ensureSeeded covers).
+export const autoSyncIfStale = createServerFn({ method: "GET" }).handler(async () => {
+  await maybeAutoSync();
+  return { ok: true };
+});
+
 // ============================== ACTIVE SHEET INFO ==============================
 
 export const getActiveSheetInfo = createServerFn({ method: "GET" }).handler(async () => {
@@ -593,15 +663,30 @@ export const analyticsOverview = createServerFn({ method: "GET" }).handler(async
 // ============================== EXPORT ORDERS (download button) ==============================
 // Powers the "Download orders for a date" button on the admin Order History
 // tab. Pulls every order_submission (+ its items) placed FOR a given
-// calendar date (for_date), across all customers, and flattens it into one
-// row per product ordered — joined with the customer's name and driver.
+// calendar date (for_date), across all customers, flattens it into one row
+// per product ordered, and builds a real, styled .xlsx that mirrors the
+// look of the live "Customer Order Details" sheet — a colored header band
+// plus a light background color per customer, grouping that customer's
+// rows the same way the manually-colored blocks do on the sheet (though
+// the exact colors here just cycle through a small palette rather than
+// matching whatever specific color happens to be assigned to each customer
+// on the sheet, since that's a manual, per-customer choice with no
+// equivalent stored in Supabase).
+//
+// Columns are Customer, Product, Quantity, Driver, Comments — matching the
+// sheet's layout minus the Yes/No indicator and blank add-on columns
+// (F..I), which only have meaning on the live, editable sheet and don't
+// apply to a static historical export. Comments is always blank: order
+// messages are written straight to the Google Sheet's column J at
+// submit-time (see writeOrderComment in sheets.server.ts) and were never
+// persisted to Supabase, so there's nothing to pull in here yet.
 //
 // Only ever includes items that were actually ordered: submitOrder,
 // changeOrder, and addOnToOrder all filter to `positive` (quantity > 0)
 // before inserting into order_submission_items, so there's nothing to
 // filter out here — no zero-quantity / not-ordered product rows exist in
-// this table at all, unlike the master "Customer Order Details" sheet
-// which lists every regular product whether ordered or not.
+// this table at all, unlike the master sheet which lists every regular
+// product whether ordered or not.
 //
 // Note: getCustomerPage deletes order_submissions older than 7 days on
 // every page load, so forDate values older than ~7 days will return no
@@ -616,8 +701,64 @@ export type ExportOrderRow = {
   product: string;
   quantity: number;
   driver: string;
-  orderType: string;
 };
+
+// Light background colors cycled per customer (not per row) so each
+// customer's block of product rows reads as one visual group, the same
+// idea as the manually color-coded blocks on the live sheet.
+const EXPORT_BAND_COLORS = ["FFFDF6E3", "FFEAF4FB", "FFFBEAF0", "FFEFF7EA"];
+
+async function buildOrdersWorkbookBase64(rows: ExportOrderRow[]): Promise<string> {
+  const ExcelJS = (await import("exceljs")).default;
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "Portugal Bakery Admin";
+  workbook.created = new Date();
+
+  const sheet = workbook.addWorksheet("Customer Order Details", {
+    views: [{ state: "frozen", ySplit: 1 }],
+  });
+
+  sheet.columns = [
+    { header: "Customers", key: "customer", width: 28 },
+    { header: "Product", key: "product", width: 32 },
+    { header: "Quantity", key: "quantity", width: 12 },
+    { header: "Driver", key: "driver", width: 16 },
+    { header: "Comments", key: "comments", width: 30 },
+  ];
+
+  // Header row — bold white text on the bakery's brand red, matching the
+  // header band on the live Google Sheet.
+  const headerRow = sheet.getRow(1);
+  headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC8362B" } };
+  headerRow.alignment = { vertical: "middle" };
+
+  let bandIndex = -1;
+  let lastCustomer: string | null = null;
+
+  for (const r of rows) {
+    if (r.customer !== lastCustomer) {
+      bandIndex = (bandIndex + 1) % EXPORT_BAND_COLORS.length;
+      lastCustomer = r.customer;
+    }
+    const row = sheet.addRow({
+      customer: r.customer,
+      product: r.product,
+      quantity: r.quantity,
+      driver: r.driver,
+      comments: "",
+    });
+    row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: EXPORT_BAND_COLORS[bandIndex] } };
+    row.eachCell((cell) => {
+      cell.border = { bottom: { style: "thin", color: { argb: "FFE8DCC8" } } };
+    });
+  }
+
+  sheet.getColumn(3).alignment = { horizontal: "center" };
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  return Buffer.from(buffer).toString("base64");
+}
 
 export const exportOrdersForDate = createServerFn({ method: "GET" })
   .validator((d) => ExportOrdersInput.parse(d))
@@ -626,7 +767,7 @@ export const exportOrdersForDate = createServerFn({ method: "GET" })
     const { data: subs, error } = await supabaseAdmin
       .from("order_submissions")
       .select(
-        "id, order_type, created_at, customer:customers(name, driver), items:order_submission_items(product_name, quantity)",
+        "id, created_at, customer:customers(name, driver), items:order_submission_items(product_name, quantity)",
       )
       .eq("for_date", data.forDate)
       .order("created_at", { ascending: true });
@@ -642,13 +783,17 @@ export const exportOrdersForDate = createServerFn({ method: "GET" })
           product: it.product_name,
           quantity: it.quantity,
           driver,
-          orderType: s.order_type ?? "new",
         });
       }
     }
     rows.sort((a, b) => a.customer.localeCompare(b.customer) || a.product.localeCompare(b.product));
 
-    return { forDate: data.forDate, rows };
+    if (!rows.length) {
+      return { forDate: data.forDate, rows, fileBase64: null };
+    }
+
+    const fileBase64 = await buildOrdersWorkbookBase64(rows);
+    return { forDate: data.forDate, rows, fileBase64 };
   });
 
 export const setProductImageUrl = createServerFn({ method: "POST" })
