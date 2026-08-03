@@ -9,6 +9,7 @@ import {
   listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
+  autoSyncIfStale,
 } from "@/lib/bakery.functions";
 
 const customersQuery = queryOptions({ queryKey: ["customers"], queryFn: () => listCustomers() });
@@ -134,6 +135,10 @@ export const Route = createFileRoute("/admin")({
   loader: async ({ context }) => {
     // Auto-seed if empty — runs once, no-op afterwards
     try { await ensureSeeded(); } catch (_) {}
+    // Self-healing background sync (throttled server-side, see
+    // autoSyncIfStale / maybeAutoSync in bakery.functions.ts) — keeps the
+    // dashboard current even if nobody remembered to hit "Re-sync".
+    try { await autoSyncIfStale(); } catch (_) {}
     context.queryClient.ensureQueryData(customersQuery);
     context.queryClient.ensureQueryData(submissionsQuery);
     context.queryClient.ensureQueryData(analyticsQuery);
