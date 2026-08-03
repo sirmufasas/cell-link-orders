@@ -8,7 +8,7 @@ import {
 import {
   listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
-  getActiveSheetInfo, getDriverAssignments, saveCustomerDriver,
+  getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
 } from "@/lib/bakery.functions";
 
 const customersQuery = queryOptions({ queryKey: ["customers"], queryFn: () => listCustomers() });
@@ -266,6 +266,14 @@ function orderTypeTag(type?: string | null) {
   }
 }
 
+// Turns a single field into a CSV-safe value: wraps in double quotes (and
+// escapes any inner quotes) whenever the value contains a comma, quote, or
+// newline — otherwise left bare. Standard CSV quoting rule.
+function toCsvValue(v: string | number) {
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
 // ---------------------------------------------------------------------------
 // Shared: sheet-context awareness
 //
@@ -422,6 +430,11 @@ function AdminPage() {
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof getSubmissionDetail>> | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
+  // --- Order History export (download button) ---
+  const [exportDate, setExportDate] = useState(() => toLocalISODate(new Date()));
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
   // Password gate state — unlocked once per browser tab session.
   const [unlocked, setUnlocked] = useState(() => {
     if (typeof window === "undefined") return false;
@@ -549,6 +562,44 @@ function AdminPage() {
       setDetail(d);
     } finally {
       setDetailLoading(false);
+    }
+  }
+
+  // Builds a CSV of every order placed FOR `exportDate`, one row per
+  // product ordered (Customer, Product, Quantity, Driver, Order Type), and
+  // triggers a browser download. Only ordered items ever reach
+  // order_submission_items (see submitOrder/addOnToOrder/changeOrder — all
+  // filter to positive-quantity items before inserting), so there's nothing
+  // to filter out here: every row returned is something that was actually
+  // ordered.
+  async function handleExportOrders() {
+    setExporting(true); setExportError(null);
+    try {
+      const { forDate, rows } = await exportOrdersForDate({ data: { forDate: exportDate } });
+      if (!rows.length) {
+        setExportError(`No orders found for ${forDate}.`);
+        return;
+      }
+      const header = ["Customer", "Product", "Quantity", "Driver", "Order Type"];
+      const lines = [header.join(",")];
+      for (const r of rows) {
+        lines.push(
+          [r.customer, r.product, r.quantity, r.driver, r.orderType].map(toCsvValue).join(","),
+        );
+      }
+      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `orders_${forDate}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setExportError((e as Error).message);
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -778,6 +829,24 @@ function AdminPage() {
 
         {tab === "history" && (
           <section className="space-y-5">
+            <div className="flex flex-wrap items-center gap-2 bg-white border border-[#e8dcc8] rounded-xl p-3 shadow-sm">
+              <label className="text-xs font-semibold text-[#6b5544]">Download orders for:</label>
+              <input
+                type="date"
+                value={exportDate}
+                onChange={(e) => setExportDate(e.target.value)}
+                className="border border-[#e8dcc8] rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b]"
+              />
+              <button
+                onClick={handleExportOrders}
+                disabled={exporting}
+                className="text-sm px-3 py-1.5 rounded-lg bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold"
+              >
+                {exporting ? "Preparing…" : "⬇ Download"}
+              </button>
+              {exportError && <span className="text-xs text-red-600">{exportError}</span>}
+            </div>
+
             {historyGroups.length === 0 && (
               <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e] shadow-sm">
                 No orders submitted yet.
