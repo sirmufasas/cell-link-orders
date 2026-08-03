@@ -198,15 +198,66 @@ export async function readSectionRows(
 }
 
 /**
+ * Reads the Data Validation rule attached to column D ("Driver") of
+ * "Customer Order Details" on the currently-active spreadsheet, and
+ * returns its dropdown list of allowed values (if the column uses a
+ * "list of items" validation rule, which is how the sheet's driver
+ * dropdown is normally configured).
+ *
+ * This exists so a driver added to the sheet's dropdown shows up in the
+ * app immediately — even before any customer has actually been assigned
+ * to that driver yet. Scanning column D's *values* (see below) can only
+ * ever surface drivers that are already in use somewhere, which silently
+ * hides brand-new options until the chicken-and-egg problem is solved by
+ * hand. Different rows can technically carry different validation rules
+ * (e.g. if the dropdown was extended partway down the sheet), so this
+ * checks every row's rule and unions all the values found, rather than
+ * assuming row 2's rule speaks for the whole column.
+ *
+ * Returns an empty array (never throws) if there's no validation rule to
+ * read, or if the API call fails for any reason — callers should treat
+ * this as a best-effort enhancement on top of the values actually in use.
+ */
+async function readDriverDropdownOptions(): Promise<string[]> {
+  try {
+    const sheets = await getSheetsClient();
+    const res = await sheets.spreadsheets.get({
+      spreadsheetId: getActiveSheetId(),
+      ranges: [`${TAB_CUSTOMERS}!D2:D2000`],
+      fields: "sheets.data.rowData.values.dataValidation",
+    });
+    const rowData = res.data.sheets?.[0]?.data?.[0]?.rowData ?? [];
+    const found = new Set<string>();
+    for (const row of rowData) {
+      const condition = row.values?.[0]?.dataValidation?.condition;
+      if (condition?.type !== "ONE_OF_LIST") continue;
+      for (const v of condition.values ?? []) {
+        const val = (v.userEnteredValue ?? "").trim();
+        if (val) found.add(val);
+      }
+    }
+    return Array.from(found);
+  } catch {
+    // Non-fatal — e.g. insufficient API scope, or no validation rule set.
+    // Callers fall back to whatever driver names are actually in use.
+    return [];
+  }
+}
+
+/**
  * Reads column A (customer) and column D (driver) of "Customer Order
  * Details" on the ACTIVE (day-based) spreadsheet, grouped by customer.
  * A customer typically has many rows (one per product); this collapses
  * them down to one entry per customer plus the full list of sheet rows
  * that belong to them, so a driver change can be written to every row.
  *
- * driverOptions is the distinct, sorted list of non-empty driver values
- * currently in use on this sheet — handy for a dropdown of existing
- * drivers, while still allowing a free-text new driver name.
+ * driverOptions is the distinct, sorted list of driver names available to
+ * pick from: every value currently in use in column D, UNIONED with the
+ * sheet's own dropdown list (from column D's Data Validation rule, see
+ * readDriverDropdownOptions). Using values-in-use alone would hide any
+ * driver added to the sheet's dropdown until someone has already been
+ * assigned to them — this makes sure newly added drivers show up in the
+ * app right away, matching what's actually selectable in the sheet.
  */
 export async function readDriverAssignments(): Promise<{
   customers: Array<{ name: string; driver: string; rows: number[] }>;
@@ -230,6 +281,11 @@ export async function readDriverAssignments(): Promise<{
       byName.set(name, { driver, rows: [i + 1] });
     }
   }
+
+  // Union in the sheet's own dropdown list so newly-added drivers show up
+  // even before anyone has been assigned to them.
+  const dropdownOptions = await readDriverDropdownOptions();
+  for (const d of dropdownOptions) driverSet.add(d);
 
   const customers = Array.from(byName.entries())
     .map(([name, v]) => ({ name, driver: v.driver, rows: v.rows }))
