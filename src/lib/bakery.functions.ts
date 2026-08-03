@@ -590,6 +590,67 @@ export const analyticsOverview = createServerFn({ method: "GET" }).handler(async
   return data ?? [];
 });
 
+// ============================== EXPORT ORDERS (download button) ==============================
+// Powers the "Download orders for a date" button on the admin Order History
+// tab. Pulls every order_submission (+ its items) placed FOR a given
+// calendar date (for_date), across all customers, and flattens it into one
+// row per product ordered — joined with the customer's name and driver.
+//
+// Only ever includes items that were actually ordered: submitOrder,
+// changeOrder, and addOnToOrder all filter to `positive` (quantity > 0)
+// before inserting into order_submission_items, so there's nothing to
+// filter out here — no zero-quantity / not-ordered product rows exist in
+// this table at all, unlike the master "Customer Order Details" sheet
+// which lists every regular product whether ordered or not.
+//
+// Note: getCustomerPage deletes order_submissions older than 7 days on
+// every page load, so forDate values older than ~7 days will return no
+// rows — same retention window the customer-facing History modal uses.
+
+const ExportOrdersInput = z.object({
+  forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+});
+
+export type ExportOrderRow = {
+  customer: string;
+  product: string;
+  quantity: number;
+  driver: string;
+  orderType: string;
+};
+
+export const exportOrdersForDate = createServerFn({ method: "GET" })
+  .validator((d) => ExportOrdersInput.parse(d))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data: subs, error } = await supabaseAdmin
+      .from("order_submissions")
+      .select(
+        "id, order_type, created_at, customer:customers(name, driver), items:order_submission_items(product_name, quantity)",
+      )
+      .eq("for_date", data.forDate)
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+
+    const rows: ExportOrderRow[] = [];
+    for (const s of subs ?? []) {
+      const customerName = s.customer?.name ?? "—";
+      const driver = s.customer?.driver ?? "";
+      for (const it of s.items ?? []) {
+        rows.push({
+          customer: customerName,
+          product: it.product_name,
+          quantity: it.quantity,
+          driver,
+          orderType: s.order_type ?? "new",
+        });
+      }
+    }
+    rows.sort((a, b) => a.customer.localeCompare(b.customer) || a.product.localeCompare(b.product));
+
+    return { forDate: data.forDate, rows };
+  });
+
 export const setProductImageUrl = createServerFn({ method: "POST" })
   .validator((d: { productId: string; imageUrl: string | null }) =>
     z.object({ productId: z.string().uuid(), imageUrl: z.string().url().nullable() }).parse(d),
