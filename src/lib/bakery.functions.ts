@@ -664,22 +664,25 @@ export const analyticsOverview = createServerFn({ method: "GET" }).handler(async
 // Powers the "Download orders for a date" button on the admin Order History
 // tab. Pulls every order_submission (+ its items) placed FOR a given
 // calendar date (for_date), across all customers, flattens it into one row
-// per product ordered, and builds a real, styled .xlsx that mirrors the
-// look of the live "Customer Order Details" sheet — a colored header band
-// plus a light background color per customer, grouping that customer's
-// rows the same way the manually-colored blocks do on the sheet (though
-// the exact colors here just cycle through a small palette rather than
-// matching whatever specific color happens to be assigned to each customer
-// on the sheet, since that's a manual, per-customer choice with no
-// equivalent stored in Supabase).
+// per product ordered, and builds a real, multi-sheet .xlsx:
 //
-// Columns are Customer, Product, Quantity, Driver, Comments — matching the
-// sheet's layout minus the Yes/No indicator and blank add-on columns
-// (F..I), which only have meaning on the live, editable sheet and don't
-// apply to a static historical export. Comments is always blank: order
-// messages are written straight to the Google Sheet's column J at
-// submit-time (see writeOrderComment in sheets.server.ts) and were never
-// persisted to Supabase, so there's nothing to pull in here yet.
+//   1. "Customer Order Details" — the flat listing (Customer, Product,
+//      Quantity, Driver, Comments), colored to match the live Google
+//      Sheet's look (header band + a light color per customer).
+//   2. "Freezer" — a pivoted Driver > Customer > Product breakdown with a
+//      Sum of Quantity column and subtotals, restricted to products whose
+//      category (from the Products List / products table) is FREEZER.
+//   3. "Production" — the same pivot shape, restricted to PRODUCTION
+//      products.
+//   4. "Uncategorized" — same shape again, only added if any ordered
+//      product couldn't be matched to a category at all (see
+//      buildProductCategoryMap below for why that can happen), so nothing
+//      silently vanishes from the export instead of surfacing the gap.
+//
+// Comments is always blank in sheet 1: order messages are written straight
+// to the Google Sheet's column J at submit-time (see writeOrderComment in
+// sheets.server.ts) and were never persisted to Supabase, so there's
+// nothing to pull in here yet.
 //
 // Only ever includes items that were actually ordered: submitOrder,
 // changeOrder, and addOnToOrder all filter to `positive` (quantity > 0)
@@ -708,12 +711,7 @@ export type ExportOrderRow = {
 // idea as the manually color-coded blocks on the live sheet.
 const EXPORT_BAND_COLORS = ["FFFDF6E3", "FFEAF4FB", "FFFBEAF0", "FFEFF7EA"];
 
-async function buildOrdersWorkbookBase64(rows: ExportOrderRow[]): Promise<string> {
-  const ExcelJS = (await import("exceljs")).default;
-  const workbook = new ExcelJS.Workbook();
-  workbook.creator = "Portugal Bakery Admin";
-  workbook.created = new Date();
-
+function buildFlatDetailSheet(workbook: import("exceljs").Workbook, rows: ExportOrderRow[]) {
   const sheet = workbook.addWorksheet("Customer Order Details", {
     views: [{ state: "frozen", ySplit: 1 }],
   });
@@ -755,6 +753,156 @@ async function buildOrdersWorkbookBase64(rows: ExportOrderRow[]): Promise<string
   }
 
   sheet.getColumn(3).alignment = { horizontal: "center" };
+}
+
+// Builds a Driver > Customer > Product pivot on a new sheet, with a "Sum
+// of Quantity" column, bold subtotal rows for each driver and customer,
+// and a Grand Total row at the bottom — the same shape as Excel's own
+// PivotTable "compact" layout, just built by hand since a real interactive
+// PivotTable object isn't something ExcelJS can reliably author.
+function buildPivotSheet(
+  workbook: import("exceljs").Workbook,
+  sheetName: string,
+  rows: ExportOrderRow[],
+) {
+  const sheet = workbook.addWorksheet(sheetName, { views: [{ state: "frozen", ySplit: 1 }] });
+  sheet.columns = [
+    { header: "Driver", key: "driver", width: 20 },
+    { header: "Customer", key: "customer", width: 28 },
+    { header: "Product", key: "product", width: 32 },
+    { header: "Sum of Quantity", key: "quantity", width: 16 },
+  ];
+
+  const headerRow = sheet.getRow(1);
+  headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC8362B" } };
+  headerRow.alignment = { vertical: "middle" };
+
+  if (!rows.length) {
+    const emptyRow = sheet.addRow({
+      driver: "No orders in this category for this date",
+      customer: "",
+      product: "",
+      quantity: "",
+    });
+    emptyRow.font = { italic: true, color: { argb: "FF8B6F4E" } };
+    return;
+  }
+
+  // driver -> customer -> product -> summed quantity
+  const byDriver = new Map<string, Map<string, Map<string, number>>>();
+  for (const r of rows) {
+    const driverKey = r.driver || "Unassigned";
+    if (!byDriver.has(driverKey)) byDriver.set(driverKey, new Map());
+    const customers = byDriver.get(driverKey)!;
+    if (!customers.has(r.customer)) customers.set(r.customer, new Map());
+    const products = customers.get(r.customer)!;
+    products.set(r.product, (products.get(r.product) ?? 0) + r.quantity);
+  }
+
+  const driverNames = Array.from(byDriver.keys()).sort((a, b) => a.localeCompare(b));
+  let grandTotal = 0;
+
+  for (const driverName of driverNames) {
+    const customers = byDriver.get(driverName)!;
+    const customerNames = Array.from(customers.keys()).sort((a, b) => a.localeCompare(b));
+
+    const customerTotals = new Map<string, number>();
+    let driverTotal = 0;
+    for (const cName of customerNames) {
+      const products = customers.get(cName)!;
+      let cTotal = 0;
+      for (const q of products.values()) cTotal += q;
+      customerTotals.set(cName, cTotal);
+      driverTotal += cTotal;
+    }
+    grandTotal += driverTotal;
+
+    const driverRow = sheet.addRow({ driver: driverName, customer: "", product: "", quantity: driverTotal });
+    driverRow.font = { bold: true };
+    driverRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF3E9DA" } };
+
+    for (const cName of customerNames) {
+      const custRow = sheet.addRow({
+        driver: "",
+        customer: cName,
+        product: "",
+        quantity: customerTotals.get(cName),
+      });
+      custRow.font = { bold: true, italic: true };
+
+      const products = customers.get(cName)!;
+      const productNames = Array.from(products.keys()).sort((a, b) => a.localeCompare(b));
+      for (const pName of productNames) {
+        sheet.addRow({ driver: "", customer: "", product: pName, quantity: products.get(pName) });
+      }
+    }
+  }
+
+  const totalRow = sheet.addRow({ driver: "Grand Total", customer: "", product: "", quantity: grandTotal });
+  totalRow.font = { bold: true };
+  totalRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8DCC8" } };
+
+  sheet.getColumn(4).alignment = { horizontal: "right" };
+}
+
+// Looks up each product's category (FREEZER / PRODUCTION) from the
+// products table, which syncFromSheet keeps populated straight from the
+// "Products List" tab — so this always reflects whatever's currently in
+// the sheet, no separate hardcoded list to maintain.
+//
+// Matching is done case-insensitively (trimmed): syncFromSheet builds its
+// product map with exact, case-sensitive string keys, so a product typed
+// with different casing on a customer's row in "Customer Order Details"
+// than on the "Products List" tab itself (e.g. "crumbs kg" vs "CRUMBS
+// KG") can end up as two separate rows in the products table — one of
+// which may have no category at all. Normalizing case here means either
+// variant still resolves to a real category as long as ONE of them does.
+async function buildProductCategoryMap(): Promise<Map<string, string>> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { data, error } = await supabaseAdmin.from("products").select("name, category");
+  if (error) throw error;
+
+  const map = new Map<string, string>();
+  for (const p of data ?? []) {
+    const key = (p.name ?? "").trim().toLowerCase();
+    if (!key) continue;
+    const category = (p.category ?? "").trim().toUpperCase();
+    // Prefer whichever entry for this normalized name actually has a
+    // category set, in case of a casing-variant duplicate as described
+    // above where one copy has a category and the other doesn't.
+    if (!map.has(key) || (!map.get(key) && category)) {
+      map.set(key, category);
+    }
+  }
+  return map;
+}
+
+async function buildOrdersWorkbookBase64(rows: ExportOrderRow[]): Promise<string> {
+  const ExcelJS = (await import("exceljs")).default;
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "Portugal Bakery Admin";
+  workbook.created = new Date();
+
+  buildFlatDetailSheet(workbook, rows);
+
+  const categoryMap = await buildProductCategoryMap();
+  const freezerRows: ExportOrderRow[] = [];
+  const productionRows: ExportOrderRow[] = [];
+  const uncategorizedRows: ExportOrderRow[] = [];
+
+  for (const r of rows) {
+    const category = categoryMap.get(r.product.trim().toLowerCase());
+    if (category === "FREEZER") freezerRows.push(r);
+    else if (category === "PRODUCTION") productionRows.push(r);
+    else uncategorizedRows.push(r);
+  }
+
+  buildPivotSheet(workbook, "Freezer", freezerRows);
+  buildPivotSheet(workbook, "Production", productionRows);
+  if (uncategorizedRows.length) {
+    buildPivotSheet(workbook, "Uncategorized", uncategorizedRows);
+  }
 
   const buffer = await workbook.xlsx.writeBuffer();
   return Buffer.from(buffer).toString("base64");
