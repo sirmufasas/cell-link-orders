@@ -271,12 +271,16 @@ function orderTypeTag(type?: string | null) {
   }
 }
 
-// Turns a single field into a CSV-safe value: wraps in double quotes (and
-// escapes any inner quotes) whenever the value contains a comma, quote, or
-// newline — otherwise left bare. Standard CSV quoting rule.
-function toCsvValue(v: string | number) {
-  const s = String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+// Decodes a base64 string (as returned by exportOrdersForDate) into a Blob
+// with the correct .xlsx MIME type, ready to hand to the browser as a
+// download.
+function base64ToXlsxBlob(base64: string): Blob {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -570,33 +574,29 @@ function AdminPage() {
     }
   }
 
-  // Builds a CSV of every order placed FOR `exportDate`, one row per
-  // product ordered (Customer, Product, Quantity, Driver, Order Type), and
-  // triggers a browser download. Only ordered items ever reach
-  // order_submission_items (see submitOrder/addOnToOrder/changeOrder — all
-  // filter to positive-quantity items before inserting), so there's nothing
-  // to filter out here: every row returned is something that was actually
-  // ordered.
+  // Downloads a real, styled .xlsx of every order placed FOR `exportDate` —
+  // one row per product ordered (Customer, Product, Quantity, Driver,
+  // Comments), colored to match the live Google Sheet's look (header band
+  // + a light color per customer). The file itself is built server-side in
+  // exportOrdersForDate (via ExcelJS) and handed back as base64; this just
+  // decodes it into a Blob and triggers the browser download. Only ordered
+  // items ever reach order_submission_items (see
+  // submitOrder/addOnToOrder/changeOrder — all filter to positive-quantity
+  // items before inserting), so there's nothing to filter out here: every
+  // row in the file is something that was actually ordered.
   async function handleExportOrders() {
     setExporting(true); setExportError(null);
     try {
-      const { forDate, rows } = await exportOrdersForDate({ data: { forDate: exportDate } });
-      if (!rows.length) {
+      const { forDate, rows, fileBase64 } = await exportOrdersForDate({ data: { forDate: exportDate } });
+      if (!rows.length || !fileBase64) {
         setExportError(`No orders found for ${forDate}.`);
         return;
       }
-      const header = ["Customer", "Product", "Quantity", "Driver", "Order Type"];
-      const lines = [header.join(",")];
-      for (const r of rows) {
-        lines.push(
-          [r.customer, r.product, r.quantity, r.driver, r.orderType].map(toCsvValue).join(","),
-        );
-      }
-      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const blob = base64ToXlsxBlob(fileBase64);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `orders_${forDate}.csv`;
+      a.download = `orders_${forDate}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
