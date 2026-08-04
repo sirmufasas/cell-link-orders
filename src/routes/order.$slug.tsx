@@ -66,7 +66,7 @@ type Mode = "default" | "addon";
 const KOTA_ONLY_PREFIXES = ["rolls kota", "kota"];
 
 // Products that should only be visible/orderable by Mediterranean or Rio
-// Dourro customers (e.g. "ROLLS RIO/MED").
+// Douro customers (e.g. "ROLLS RIO/MED").
 const RIO_MED_ONLY_PREFIXES = ["rolls rio/med", "rio/med"];
 
 // Max number of distinct product lines (qty > 0) allowed in a single order.
@@ -88,9 +88,14 @@ function isRioMedOnlyProduct(name: string | undefined | null) {
 // Customers allowed to see/order the Rio/Med-only products. Matching is a
 // case-insensitive substring check against the customer's name, so it
 // covers name variants automatically.
+//
+// FIXED: previously checked "mediteran" (single r) and "rio dourro"
+// (double r) — neither of which actually appears in "Mediterranean
+// Fisheries" or "Rio Douro", so the product was silently hidden from
+// EVERY customer, including the two it was meant for.
 function isRioMedCustomer(customerName: string) {
   const n = customerName.trim().toLowerCase();
-  return n.includes("mediteran") || n.includes("rio dourro");
+  return n.includes("mediterranean") || n.includes("rio douro");
 }
 
 // ---------------------------------------------------------------------------
