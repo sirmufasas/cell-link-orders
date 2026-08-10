@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
+import { tomorrowISOInBakeryTimezone, bakeryMinutesNow } from "@/lib/sheets.server";
 
 function slugify(s: string) {
   const base = s
@@ -9,24 +10,30 @@ function slugify(s: string) {
   return base || "x";
 }
 
+// NOTE: "tomorrow" and "late" both need to reflect the bakery's actual
+// local clock (Africa/Johannesburg), not the server process's own
+// timezone. This runs as a Netlify function with no TZ env var set, so
+// `new Date().getHours()`/`getDay()` here would silently read UTC — a
+// 2-hour gap from SAST that (a) shifted the 8:30 PM cutoff later in real
+// local time, and (b) around local midnight, made "tomorrow" land a full
+// day behind reality, occasionally routing late orders to the wrong one
+// of the two delivery spreadsheets. See tomorrowISOInBakeryTimezone /
+// bakeryMinutesNow in sheets.server.ts for the timezone-safe versions.
 function tomorrowISO(): string {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + 1);
-  return d.toISOString().slice(0, 10);
+  return tomorrowISOInBakeryTimezone();
 }
 
-// A NEW order is "late" if it's submitted at or after 8:30 PM, server local
-// time. Late new orders are written to column K instead of column C (see
-// writeLateOrderQuantities in sheets.server.ts) so they don't affect the
-// main order total, and so the "LATE" tab can total them up per product.
+// A NEW order is "late" if it's submitted at or after 8:30 PM, BAKERY LOCAL
+// time (Africa/Johannesburg). Late new orders are written to column K
+// instead of column C (see writeLateOrderQuantities in sheets.server.ts) so
+// they don't affect the main order total, and so the "LATE" tab can total
+// them up per product.
 const LATE_CUTOFF_HOUR = 20;
 const LATE_CUTOFF_MINUTE = 30;
 
 function isLateOrder(): boolean {
-  const now = new Date();
-  const minutesNow = now.getHours() * 60 + now.getMinutes();
   const cutoff = LATE_CUTOFF_HOUR * 60 + LATE_CUTOFF_MINUTE;
-  return minutesNow >= cutoff;
+  return bakeryMinutesNow() >= cutoff;
 }
 
 // ============================== AUTO-SYNC ==============================
