@@ -13,6 +13,84 @@ import { google } from "googleapis";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+// ============================== TIMEZONE ==============================
+// The bakery operates in Africa/Johannesburg (SAST, UTC+2), but this code
+// runs as Netlify serverless functions, which default to UTC and have no
+// TZ env var set. Using `new Date().getDay()` / `getHours()` directly (as
+// this file used to) reads the SERVER's clock, not the bakery's — a ~2hr
+// gap that caused two bugs:
+//   1. The 8:30 PM late-order cutoff effectively fired 2 hours later than
+//      intended in real local time.
+//   2. Right after local midnight (00:00–01:59 SAST, which is still
+//      22:00–23:59 the PREVIOUS day in UTC), "tomorrow" was computed a
+//      full day behind reality. At the Wed/Thu and Sat/Sun sheet-group
+//      boundaries this routed orders to the WRONG spreadsheet entirely
+//      (e.g. very-late-Friday-night orders meant for the Mon–Wed sheet
+//      silently landing in the Thu–Sat sheet instead), which is why late
+//      orders sometimes never showed up under Mon–Wed.
+//
+// Fix: derive "now" from the Africa/Johannesburg wall-clock explicitly,
+// regardless of what timezone the server process itself is running in.
+const BAKERY_TIMEZONE = "Africa/Johannesburg";
+
+/** Returns {year, month, day, hour, minute, weekday} for "now" in the bakery's timezone. */
+function nowInBakeryTimezone(): {
+  year: number;
+  month: number; // 1-12
+  day: number;
+  hour: number;
+  minute: number;
+} {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: BAKERY_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "0";
+  return {
+    year: parseInt(get("year"), 10),
+    month: parseInt(get("month"), 10),
+    day: parseInt(get("day"), 10),
+    hour: parseInt(get("hour") === "24" ? "0" : get("hour"), 10),
+    minute: parseInt(get("minute"), 10),
+  };
+}
+
+/**
+ * Day of week (0=Sun..6=Sat) for a given Y/M/D, computed via UTC-anchored
+ * Date math so it isn't re-interpreted through the server's own timezone.
+ */
+function weekdayOf(year: number, month: number, day: number): number {
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+}
+
+/** Minutes since local midnight, right now, in the bakery's timezone. */
+export function bakeryMinutesNow(): number {
+  const { hour, minute } = nowInBakeryTimezone();
+  return hour * 60 + minute;
+}
+
+/** Tomorrow's weekday (0=Sun..6=Sat), computed from the bakery's local "today". */
+function tomorrowWeekdayInBakeryTimezone(): number {
+  const { year, month, day } = nowInBakeryTimezone();
+  // Add one calendar day via UTC-anchored math, then re-derive the weekday —
+  // this avoids DST/rollover edge cases from hand-rolling day-of-month math.
+  const tomorrow = new Date(Date.UTC(year, month - 1, day + 1));
+  return weekdayOf(tomorrow.getUTCFullYear(), tomorrow.getUTCMonth() + 1, tomorrow.getUTCDate());
+}
+
+/** Tomorrow's date (bakery-local) as YYYY-MM-DD. */
+export function tomorrowISOInBakeryTimezone(): string {
+  const { year, month, day } = nowInBakeryTimezone();
+  const tomorrow = new Date(Date.UTC(year, month - 1, day + 1));
+  return tomorrow.toISOString().slice(0, 10);
+}
+
 // ============================== SHEET IDS ==============================
 
 /** Mon–Wed delivery sheet */
@@ -35,10 +113,8 @@ export const THU_SAT_SHEET_ID = "1PvpM6Be4xOCa_GqMYEg7-9M1BwcT1kfznwOxLRImEAw";
  *   Sunday    (0) → Mon-Wed  (Sunday orders deliver on Monday)
  */
 export function getActiveSheetId(): string {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  // getDay(): 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
-  const tomorrowDay = tomorrow.getDay();
+  // getDay()-style: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+  const tomorrowDay = tomorrowWeekdayInBakeryTimezone();
 
   if (tomorrowDay === 4 || tomorrowDay === 5 || tomorrowDay === 6) {
     return THU_SAT_SHEET_ID;
