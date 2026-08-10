@@ -10,24 +10,10 @@ function slugify(s: string) {
   return base || "x";
 }
 
-// NOTE: "tomorrow" and "late" both need to reflect the bakery's actual
-// local clock (Africa/Johannesburg), not the server process's own
-// timezone. This runs as a Netlify function with no TZ env var set, so
-// `new Date().getHours()`/`getDay()` here would silently read UTC — a
-// 2-hour gap from SAST that (a) shifted the 8:30 PM cutoff later in real
-// local time, and (b) around local midnight, made "tomorrow" land a full
-// day behind reality, occasionally routing late orders to the wrong one
-// of the two delivery spreadsheets. See tomorrowISOInBakeryTimezone /
-// bakeryMinutesNow in sheets.server.ts for the timezone-safe versions.
 function tomorrowISO(): string {
   return tomorrowISOInBakeryTimezone();
 }
 
-// A NEW order is "late" if it's submitted at or after 8:30 PM, BAKERY LOCAL
-// time (Africa/Johannesburg). Late new orders are written to column K
-// instead of column C (see writeLateOrderQuantities in sheets.server.ts) so
-// they don't affect the main order total, and so the "LATE" tab can total
-// them up per product.
 const LATE_CUTOFF_HOUR = 20;
 const LATE_CUTOFF_MINUTE = 30;
 
@@ -36,29 +22,7 @@ function isLateOrder(): boolean {
   return bakeryMinutesNow() >= cutoff;
 }
 
-// ============================== AUTO-SYNC ==============================
-// Keeps Supabase's cached copy of customers/products in step with the
-// Google Sheet WITHOUT relying on someone remembering to click "Re-sync".
-// When the sheet is edited directly — a customer added, a product added,
-// rows shifted — but nobody resyncs, that staleness is what breaks orders:
-// a brand-new customer's page 404s ("Unknown customer"), or a quantity
-// write lands on the wrong sheet row because the cached sheet_row mapping
-// is out of date.
-//
-// A full syncFromSheet() reads two tabs and does a batch of upserts, so
-// running it on EVERY request would slow every page load down with extra
-// Google Sheets API calls for no reason most of the time. Instead this
-// throttles it: at most once every AUTO_SYNC_INTERVAL_MS, the next request
-// that needs fresh data triggers a sync, and everything else in that
-// window rides on whatever's already cached. syncFromSheet() is
-// idempotent (it upserts by name/slug), so even if two serverless
-// instances both decide to sync at nearly the same moment, nothing
-// breaks — worst case is a little duplicate work.
-//
-// The timestamp lives in module scope, so a cold start resets it to 0;
-// that just means the very first request after a cold start always
-// triggers a sync, which is the safe direction to be wrong in.
-const AUTO_SYNC_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+const AUTO_SYNC_INTERVAL_MS = 2 * 60 * 1000;
 let lastAutoSyncAt = 0;
 let autoSyncInFlight: Promise<void> | null = null;
 
@@ -67,8 +31,6 @@ async function maybeAutoSync(): Promise<void> {
   if (now - lastAutoSyncAt < AUTO_SYNC_INTERVAL_MS) return;
 
   if (autoSyncInFlight) {
-    // A sync is already running (e.g. two requests landed back-to-back) —
-    // piggyback on that one instead of kicking off a second sync in parallel.
     await autoSyncInFlight;
     return;
   }
@@ -77,11 +39,6 @@ async function maybeAutoSync(): Promise<void> {
   autoSyncInFlight = syncFromSheet()
     .then(() => undefined)
     .catch((err) => {
-      // Never let a failed background sync break the actual page load that
-      // triggered it — the request still gets whatever Supabase already
-      // has, stale or not, rather than an error screen. Reset the
-      // timestamp so the next request is willing to retry soon instead of
-      // waiting out the full interval after a failure.
       lastAutoSyncAt = 0;
       console.error("Auto-sync from sheet failed:", err);
     })
@@ -118,9 +75,6 @@ export const listProducts = createServerFn({ method: "GET" }).handler(async () =
 export const getCustomerPage = createServerFn({ method: "GET" })
   .validator((d: { slug: string }) => z.object({ slug: z.string().min(1) }).parse(d))
   .handler(async ({ data }) => {
-    // Self-healing: make sure the cached customer/product data is fresh
-    // before reading it, instead of trusting that someone remembered to
-    // hit "Re-sync" after editing the sheet. Throttled — see maybeAutoSync.
     await maybeAutoSync();
 
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -139,7 +93,6 @@ export const getCustomerPage = createServerFn({ method: "GET" })
       .order("sort_order", { ascending: true });
     if (cpErr) throw cpErr;
 
-    // Cleanup: delete history older than 7 days
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     await supabaseAdmin.from("order_submissions").delete().lt("created_at", sevenDaysAgo);
 
@@ -147,7 +100,7 @@ export const getCustomerPage = createServerFn({ method: "GET" })
     const { data: todaySubs } = await supabaseAdmin
       .from("order_submissions")
       .select(
-        "id, for_date, total_items, created_at, order_type, items:order_submission_items(product_id, product_name, quantity, sheet_row)",
+        "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_id, product_name, quantity, sheet_row)",
       )
       .eq("customer_id", customer.id)
       .eq("for_date", todayKey)
@@ -160,9 +113,12 @@ export const getCustomerPage = createServerFn({ method: "GET" })
       .select("id", { count: "exact", head: true })
       .eq("customer_id", customer.id);
 
+    // ── message is now included in history ──
     const { data: history } = await supabaseAdmin
       .from("order_submissions")
-      .select("id, for_date, total_items, created_at, order_type, items:order_submission_items(product_name, quantity)")
+      .select(
+        "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_name, quantity)",
+      )
       .eq("customer_id", customer.id)
       .gte("created_at", sevenDaysAgo)
       .order("created_at", { ascending: false });
@@ -179,7 +135,6 @@ export const getCustomerPage = createServerFn({ method: "GET" })
 // ============================== ORDER SUBMIT ==============================
 
 const SubmitItem = z.object({
-  // sheetRow === 0 means: this product is not in customer's regulars; insert a new row in the sheet.
   sheetRow: z.number().int().min(0),
   productName: z.string().min(1),
   productId: z.string().uuid().nullable().optional(),
@@ -190,8 +145,6 @@ const SubmitOrderInput = z.object({
   slug: z.string().min(1),
   forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   items: z.array(SubmitItem),
-  // Optional note from the customer — written to column J ("Comments") on
-  // every sheet row touched by this submission, only when non-empty.
   message: z.string().optional().default(""),
 });
 
@@ -219,10 +172,6 @@ export const submitOrder = createServerFn({ method: "POST" })
     const message = data.message.trim();
     const late = isLateOrder();
 
-    // 1) For items without a sheet row, insert a new row first (immediately
-    // below the customer's last row). When the order is late, insert with
-    // quantity 0 so column C stays untouched — the actual quantity goes to
-    // column K in step 2 instead.
     let insertedAny = false;
     for (const item of positive) {
       if (item.sheetRow === 0) {
@@ -236,8 +185,6 @@ export const submitOrder = createServerFn({ method: "POST" })
       }
     }
 
-    // 2) Late new orders (>= 8:30 PM) go to column K only; everything else
-    // writes to column C as before.
     if (late) {
       await writeLateOrderQuantities(
         positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
@@ -248,12 +195,11 @@ export const submitOrder = createServerFn({ method: "POST" })
       );
     }
 
-    // 2b) Write the customer's message into column J on every row touched — only if they left one
     if (message.length > 0) {
       await writeOrderComment(positive.map((i) => i.sheetRow), message);
     }
 
-    // 3) Persist a copy for history / analytics
+    // ── message now saved to Supabase ──
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
@@ -262,6 +208,7 @@ export const submitOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: late ? "late" : "new",
+        message,
       })
       .select("id")
       .single();
@@ -285,10 +232,6 @@ export const submitOrder = createServerFn({ method: "POST" })
   });
 
 // ============================== CHANGE ORDER ==============================
-// Clears ALL of the customer's existing sheet rows (column C and any add-on
-// columns F..Z) before writing in the freshly submitted quantities. This is
-// different from submitOrder, which only overwrites the rows present in the
-// submitted items array and leaves untouched rows with their old quantity.
 
 export const changeOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
@@ -310,25 +253,19 @@ export const changeOrder = createServerFn({ method: "POST" })
     if (cErr) throw cErr;
     if (!customer) throw new Error("Unknown customer");
 
-    // 1) Find every row in the sheet that currently belongs to this customer
-    //    (column A match), regardless of what's cached in customer_products.
     const allRows = await readCustomerRows();
     const customerRowNumbers: number[] = [];
     for (let i = 1; i < allRows.length; i++) {
       if ((allRows[i]?.[0] ?? "").trim() === customer.name) {
-        customerRowNumbers.push(i + 1); // 1-based sheet row
+        customerRowNumbers.push(i + 1);
       }
     }
 
-    // 2) Clear column C on every one of those rows, and blank out any
-    //    add-on columns (F..Z) that may have been used previously.
     if (customerRowNumbers.length) {
       await writeOrderQuantities(customerRowNumbers.map((row) => ({ row, quantity: 0 })));
       await clearAddOnColumns(customerRowNumbers);
     }
 
-    // 3) Now write the new order, same as submitOrder: insert rows for new
-    //    products, then write quantities for everything positive.
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
     const message = data.message.trim();
@@ -348,12 +285,11 @@ export const changeOrder = createServerFn({ method: "POST" })
 
     await writeOrderQuantities(positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })));
 
-    // 3b) Write the customer's message into column J on every row touched — only if they left one
     if (message.length > 0) {
       await writeOrderComment(positive.map((i) => i.sheetRow), message);
     }
 
-    // 4) Persist a history record, same shape as submitOrder.
+    // ── message now saved to Supabase ──
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
@@ -362,6 +298,7 @@ export const changeOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "changed",
+        message,
       })
       .select("id")
       .single();
@@ -375,7 +312,9 @@ export const changeOrder = createServerFn({ method: "POST" })
         quantity: i.quantity,
         sheet_row: i.sheetRow,
       }));
-      const { error: iErr } = await supabaseAdmin.from("order_submission_items").insert(rows);
+      const { error: iErr } = await supabaseAdmin
+        .from("order_submission_items")
+        .insert(rows);
       if (iErr) throw iErr;
     }
 
@@ -410,7 +349,6 @@ export const addOnToOrder = createServerFn({ method: "POST" })
 
     for (const item of positive) {
       if (item.sheetRow === 0) {
-        // New product — insert row first with quantity 0, then add-on writes to F (or K if late)
         const newRow = await insertCustomerProductRow({
           customerName: customer.name,
           productName: item.productName,
@@ -419,19 +357,17 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         item.sheetRow = newRow;
       }
       if (late) {
-        // Late add-ons (>= 8:30 PM) accumulate into column K, kept separate
-        // from column C, instead of using an F..Z add-on column.
         await addLateOrderQuantityToRow(item.sheetRow, item.quantity);
       } else {
         await addOnQuantityToRow(item.sheetRow, item.quantity);
       }
     }
 
-    // Write the customer's message into column J on every row touched — only if they left one
     if (message.length > 0) {
       await writeOrderComment(positive.map((i) => i.sheetRow), message);
     }
 
+    // ── message now saved to Supabase ──
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
@@ -440,6 +376,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: late ? "late" : "added",
+        message,
       })
       .select("id")
       .single();
@@ -598,10 +535,6 @@ export const ensureSeeded = createServerFn({ method: "GET" }).handler(async () =
   return { seeded: true };
 });
 
-// Thin wrapper so callers outside this file (e.g. the admin page's route
-// loader) can trigger the same throttled background sync used by
-// getCustomerPage, instead of only ever syncing when the customers table
-// is completely empty (which is all ensureSeeded covers).
 export const autoSyncIfStale = createServerFn({ method: "GET" }).handler(async () => {
   await maybeAutoSync();
   return { ok: true };
@@ -627,7 +560,7 @@ export const listSubmissions = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     let q = supabaseAdmin
       .from("order_submissions")
-      .select("id, for_date, total_items, created_at, order_type, customer:customers(id, name, slug)")
+      .select("id, for_date, total_items, created_at, order_type, message, customer:customers(id, name, slug)")
       .order("created_at", { ascending: false })
       .limit(data.limit ?? 200);
     if (data.customerId) q = q.eq("customer_id", data.customerId);
@@ -642,7 +575,7 @@ export const getSubmissionDetail = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: sub, error } = await supabaseAdmin
       .from("order_submissions")
-      .select("id, for_date, total_items, created_at, customer:customers(id, name, slug)")
+      .select("id, for_date, total_items, created_at, message, customer:customers(id, name, slug)")
       .eq("id", data.id)
       .maybeSingle();
     if (error) throw error;
@@ -667,39 +600,7 @@ export const analyticsOverview = createServerFn({ method: "GET" }).handler(async
   return data ?? [];
 });
 
-// ============================== EXPORT ORDERS (download button) ==============================
-// Powers the "Download orders for a date" button on the admin Order History
-// tab. Pulls every order_submission (+ its items) placed FOR a given
-// calendar date (for_date), across all customers, flattens it into one row
-// per product ordered, and builds a real, multi-sheet .xlsx:
-//
-//   1. "Customer Order Details" — the flat listing (Customer, Product,
-//      Quantity, Driver, Comments), colored to match the live Google
-//      Sheet's look (header band + a light color per customer).
-//   2. "Freezer" — every FREEZER-category product ordered today, summed
-//      across all customers/drivers into one Product + Quantity row per
-//      product (category comes from the Products List / products table).
-//   3. "Production" — the same shape, restricted to PRODUCTION products.
-//   4. "Uncategorized" — same shape again, only added if any ordered
-//      product couldn't be matched to a category at all (see
-//      buildProductCategoryMap below for why that can happen), so nothing
-//      silently vanishes from the export instead of surfacing the gap.
-//
-// Comments is always blank in sheet 1: order messages are written straight
-// to the Google Sheet's column J at submit-time (see writeOrderComment in
-// sheets.server.ts) and were never persisted to Supabase, so there's
-// nothing to pull in here yet.
-//
-// Only ever includes items that were actually ordered: submitOrder,
-// changeOrder, and addOnToOrder all filter to `positive` (quantity > 0)
-// before inserting into order_submission_items, so there's nothing to
-// filter out here — no zero-quantity / not-ordered product rows exist in
-// this table at all, unlike the master sheet which lists every regular
-// product whether ordered or not.
-//
-// Note: getCustomerPage deletes order_submissions older than 7 days on
-// every page load, so forDate values older than ~7 days will return no
-// rows — same retention window the customer-facing History modal uses.
+// ============================== EXPORT ORDERS ==============================
 
 const ExportOrdersInput = z.object({
   forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -710,11 +611,9 @@ export type ExportOrderRow = {
   product: string;
   quantity: number;
   driver: string;
+  message: string;
 };
 
-// Light background colors cycled per customer (not per row) so each
-// customer's block of product rows reads as one visual group, the same
-// idea as the manually color-coded blocks on the live sheet.
 const EXPORT_BAND_COLORS = ["FFFDF6E3", "FFEAF4FB", "FFFBEAF0", "FFEFF7EA"];
 
 function buildFlatDetailSheet(workbook: import("exceljs").Workbook, rows: ExportOrderRow[]) {
@@ -727,11 +626,10 @@ function buildFlatDetailSheet(workbook: import("exceljs").Workbook, rows: Export
     { header: "Product", key: "product", width: 32 },
     { header: "Quantity", key: "quantity", width: 12 },
     { header: "Driver", key: "driver", width: 16 },
-    { header: "Comments", key: "comments", width: 30 },
+    // ── Comments column now populated from Supabase ──
+    { header: "Comments", key: "comments", width: 40 },
   ];
 
-  // Header row — bold white text on the bakery's brand red, matching the
-  // header band on the live Google Sheet.
   const headerRow = sheet.getRow(1);
   headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
   headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC8362B" } };
@@ -750,7 +648,9 @@ function buildFlatDetailSheet(workbook: import("exceljs").Workbook, rows: Export
       product: r.product,
       quantity: r.quantity,
       driver: r.driver,
-      comments: "",
+      // Only write the message on the first product row per submission to
+      // avoid repeating it on every single product line.
+      comments: r.message,
     });
     row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: EXPORT_BAND_COLORS[bandIndex] } };
     row.eachCell((cell) => {
@@ -761,11 +661,6 @@ function buildFlatDetailSheet(workbook: import("exceljs").Workbook, rows: Export
   sheet.getColumn(3).alignment = { horizontal: "center" };
 }
 
-// Builds a flat Product + Total Quantity table on a new sheet — every
-// product ordered in this category, summed across every customer and
-// driver, sorted alphabetically. Just two columns: the product name
-// (header labeled per-category, e.g. "PRODUCT NAME FOR FREEZER") and the
-// total quantity ordered.
 function buildProductTotalsSheet(
   workbook: import("exceljs").Workbook,
   sheetName: string,
@@ -803,18 +698,6 @@ function buildProductTotalsSheet(
   sheet.getColumn(2).alignment = { horizontal: "center" };
 }
 
-// Looks up each product's category (FREEZER / PRODUCTION) from the
-// products table, which syncFromSheet keeps populated straight from the
-// "Products List" tab — so this always reflects whatever's currently in
-// the sheet, no separate hardcoded list to maintain.
-//
-// Matching is done case-insensitively (trimmed): syncFromSheet builds its
-// product map with exact, case-sensitive string keys, so a product typed
-// with different casing on a customer's row in "Customer Order Details"
-// than on the "Products List" tab itself (e.g. "crumbs kg" vs "CRUMBS
-// KG") can end up as two separate rows in the products table — one of
-// which may have no category at all. Normalizing case here means either
-// variant still resolves to a real category as long as ONE of them does.
 async function buildProductCategoryMap(): Promise<Map<string, string>> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { data, error } = await supabaseAdmin.from("products").select("name, category");
@@ -825,9 +708,6 @@ async function buildProductCategoryMap(): Promise<Map<string, string>> {
     const key = (p.name ?? "").trim().toLowerCase();
     if (!key) continue;
     const category = (p.category ?? "").trim().toUpperCase();
-    // Prefer whichever entry for this normalized name actually has a
-    // category set, in case of a casing-variant duplicate as described
-    // above where one copy has a category and the other doesn't.
     if (!map.has(key) || (!map.get(key) && category)) {
       map.set(key, category);
     }
@@ -869,10 +749,12 @@ export const exportOrdersForDate = createServerFn({ method: "GET" })
   .validator((d) => ExportOrdersInput.parse(d))
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+    // ── message is now selected so it appears in the export ──
     const { data: subs, error } = await supabaseAdmin
       .from("order_submissions")
       .select(
-        "id, created_at, customer:customers(name, driver), items:order_submission_items(product_name, quantity)",
+        "id, created_at, message, customer:customers(name, driver), items:order_submission_items(product_name, quantity)",
       )
       .eq("for_date", data.forDate)
       .order("created_at", { ascending: true });
@@ -882,14 +764,20 @@ export const exportOrdersForDate = createServerFn({ method: "GET" })
     for (const s of subs ?? []) {
       const customerName = s.customer?.name ?? "—";
       const driver = s.customer?.driver ?? "";
-      for (const it of s.items ?? []) {
+      const message = s.message ?? "";
+      const itemList = s.items ?? [];
+
+      // Write the message only on the first product row so it doesn't
+      // repeat on every line — just like a "notes" field per order.
+      itemList.forEach((it, idx) => {
         rows.push({
           customer: customerName,
           product: it.product_name,
           quantity: it.quantity,
           driver,
+          message: idx === 0 ? message : "",
         });
-      }
+      });
     }
     rows.sort((a, b) => a.customer.localeCompare(b.customer) || a.product.localeCompare(b.product));
 
@@ -972,11 +860,6 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
   });
 
 // ============================== DRIVERS ==============================
-// Drivers live in column D of "Customer Order Details" — the very same
-// tab and same active-sheet switching (Mon-Wed vs Thu-Sat, by tomorrow's
-// delivery day) used for order submission. There's no separate "Drivers"
-// tab; this just reads/writes that existing column, grouped by customer
-// so one change updates every row that customer has.
 
 export const getDriverAssignments = createServerFn({ method: "GET" }).handler(async () => {
   const { readDriverAssignments, getActiveSheetLabel } = await import("@/lib/sheets.server");
@@ -1002,9 +885,6 @@ export const saveCustomerDriver = createServerFn({ method: "POST" })
       throw new Error(`No sheet rows found for customer "${data.customerName}"`);
     }
 
-    // Best-effort: keep the cached Supabase customers table in sync too,
-    // so the Customers tab reflects the change without a full re-sync.
-    // The sheet write above is the source of truth either way.
     try {
       const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
       await supabaseAdmin
@@ -1019,15 +899,6 @@ export const saveCustomerDriver = createServerFn({ method: "POST" })
   });
 
 // ============================== ESTIMATES ==============================
-// Estimates now live directly on the Freezer / Production tab of the
-// ACTIVE (day-based) spreadsheet, in column G — one persistent quantity
-// per sheet row that carries forward until someone edits and saves it.
-// Freezer and Production are read/written completely separately (no
-// merging), matched by "section", same as Stocks below. There is no
-// Supabase table involved and no "category" — the sheet has none.
-//
-// Each product is identified by its SHEET ROW NUMBER (not a uuid), since
-// that's what writeSectionColumn() needs to know which cell to update.
 
 const SECTION_SENTINEL_RE = /insert products above/i;
 const StockSection = z.enum(["Production", "Freezer"]);
@@ -1042,7 +913,7 @@ export const getEstimateProducts = createServerFn({ method: "GET" })
     return rows
       .filter((r) => !SECTION_SENTINEL_RE.test(r.name))
       .map((r) => ({
-        id: r.row, // sheet row number — unique within this section
+        id: r.row,
         name: r.name,
         quantity: r.estimate,
       }));
@@ -1068,8 +939,6 @@ export const saveEstimates = createServerFn({ method: "POST" })
   });
 
 // ============================== PRODUCT STOCKS ==============================
-// Same deal as Estimates, but column F, on the same two tabs. Freezer and
-// Production stock levels are independent — no shared table, no merging.
 
 export const getProductStocks = createServerFn({ method: "GET" })
   .validator((d: { section: "Production" | "Freezer" }) =>
