@@ -151,7 +151,7 @@ function OrderPage() {
 
   const [showMessageModal, setShowMessageModal] = useState(false);
   const [message, setMessage] = useState("");
-  // ── NEW: sender name — compulsory before the order can be sent ──
+  // Sender name — persisted across the session so they only type it once
   const [senderName, setSenderName] = useState("");
   const [messageModalSkipped, setMessageModalSkipped] = useState(false);
 
@@ -254,15 +254,17 @@ function OrderPage() {
   }
 
   async function handleSubmit(msg: string) {
-    setSubmitting(true); setError(null);
+    setSubmitting(true);
+    setError(null);
     try {
       const items = buildItems();
       if (items.length > PRODUCT_LIMIT) {
-        setError(`You can only order up to ${PRODUCT_LIMIT} different products at once. Please remove some items and try again.`);
+        setError(`You can only order up to ${PRODUCT_LIMIT} different products at once.`);
         setSubmitting(false);
         return;
       }
-      // Prepend the sender's name to the message so it is always recorded.
+
+      // Build the full message: "Name: comment" or just "Name" if no comment
       const fullMessage = msg.trim()
         ? `${senderName.trim()}: ${msg.trim()}`
         : senderName.trim();
@@ -276,8 +278,6 @@ function OrderPage() {
       }
       setQty({});
       setMessage("");
-      // Keep senderName so they don't have to re-type it if they order again
-      // in the same session, but reset the modal-skipped flag.
       setMode("default");
       setShowChangeForm(false);
       setMessageModalSkipped(false);
@@ -290,24 +290,19 @@ function OrderPage() {
   }
 
   function handleSendMessage() {
-    // Name is validated inside the modal — this callback is only reachable
-    // when the name field is filled in.
     setShowMessageModal(false);
     void handleSubmit(message);
   }
 
   function handleSkipMessage() {
-    // "Skip" only skips the *comment* — the name is still required and was
-    // already validated before this can fire.
+    // Skip only skips the comment — name was already validated in the modal
     setShowMessageModal(false);
     setMessageModalSkipped(true);
     void handleSubmit("");
   }
 
   function handleSubmitClick() {
-    // Always show the modal so the customer can enter their name.
-    // Once they have submitted once (messageModalSkipped === true) and the
-    // name is already filled in we can skip straight through.
+    // If they've already filled their name in and skipped once, go straight through
     if (messageModalSkipped && senderName.trim()) {
       void handleSubmit(message);
     } else {
@@ -362,6 +357,11 @@ function OrderPage() {
           <p className="text-[#6b5544] mb-2">
             <strong>{customer.name}</strong> — {todayOrder.total_items} items for {tomorrowLabel()}.
           </p>
+          {todayOrder.message && (
+            <p className="text-xs text-[#8b6f4e] italic mb-3 border border-[#e8dcc8] rounded-xl px-3 py-2 bg-[#fdf8f1]">
+              💬 {todayOrder.message}
+            </p>
+          )}
           <div className="flex flex-col gap-2 mt-2">
             <button
               onClick={() => { setMode("addon"); setQty({}); }}
@@ -546,18 +546,14 @@ function OrderPage() {
 }
 
 // ---------------------------------------------------------------------------
-// History modal (unchanged)
+// History modal — now shows the message per order
 // ---------------------------------------------------------------------------
 function orderTypeTag(type?: string | null) {
   switch (type) {
-    case "changed":
-      return { label: "Changed Order", className: "bg-amber-100 text-amber-800" };
-    case "added":
-      return { label: "Added Order", className: "bg-blue-100 text-blue-800" };
-    case "late":
-      return { label: "Late Order", className: "bg-red-100 text-red-800" };
-    default:
-      return { label: "New Order", className: "bg-green-100 text-green-800" };
+    case "changed": return { label: "Changed Order", className: "bg-amber-100 text-amber-800" };
+    case "added":   return { label: "Added Order",   className: "bg-blue-100 text-blue-800" };
+    case "late":    return { label: "Late Order",    className: "bg-red-100 text-red-800" };
+    default:        return { label: "New Order",     className: "bg-green-100 text-green-800" };
   }
 }
 
@@ -571,6 +567,7 @@ function HistoryModal({
     total_items: number;
     created_at: string;
     order_type?: string | null;
+    message?: string | null;
     items: Array<{ product_name: string; quantity: number }>;
   }>;
   onClose: () => void;
@@ -624,6 +621,12 @@ function HistoryModal({
                           </li>
                         ))}
                       </ul>
+                      {/* ── Message now shown in history ── */}
+                      {s.message && (
+                        <p className="mt-2 text-xs text-[#8b6f4e] italic border-t border-[#e8dcc8] pt-2">
+                          💬 {s.message}
+                        </p>
+                      )}
                     </div>
                   );
                 })}
@@ -637,7 +640,7 @@ function HistoryModal({
 }
 
 // ---------------------------------------------------------------------------
-// MessageModal — now includes a compulsory Name field and blocks Tab-indent
+// MessageModal — compulsory name + optional comment, Tab key blocked
 // ---------------------------------------------------------------------------
 function MessageModal({
   value,
@@ -658,7 +661,6 @@ function MessageModal({
 }) {
   const nameEmpty = senderName.trim() === "";
 
-  // Prevent Tab from inserting whitespace / indentation in the textarea.
   function handleTextareaKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Tab") {
       e.preventDefault();
@@ -666,18 +668,15 @@ function MessageModal({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
-      // Clicking the backdrop does NOT dismiss — the customer must explicitly
-      // choose Skip (no comment) or Send.
-    >
+    // No onClick on backdrop — must explicitly choose Skip or Send
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl max-w-md w-full shadow-xl p-5">
         <h3 className="font-bold text-lg mb-1">Almost there!</h3>
         <p className="text-sm text-[#8b6f4e] mb-4">
-          Please enter your name before sending — it helps us know who placed the order.
+          Please enter your name — it helps us know who placed the order.
         </p>
 
-        {/* ── Compulsory name field ── */}
+        {/* Compulsory name field */}
         <label className="block mb-1">
           <span className="text-xs font-bold uppercase tracking-wide text-[#2a1810]">
             Your name <span className="text-[#c8362b]">*</span>
@@ -699,7 +698,7 @@ function MessageModal({
           )}
         </label>
 
-        {/* ── Optional comment ── */}
+        {/* Optional comment — Tab key blocked */}
         <label className="block mt-4 mb-1">
           <span className="text-xs font-bold uppercase tracking-wide text-[#2a1810]">
             Comment <span className="text-[#8b6f4e] font-normal">(optional)</span>
@@ -715,7 +714,6 @@ function MessageModal({
         </label>
 
         <div className="flex gap-2 mt-4">
-          {/* Skip = send with no comment but name is still required */}
           <button
             onClick={onSkip}
             disabled={sending || nameEmpty}
@@ -739,19 +737,14 @@ function MessageModal({
 }
 
 // ---------------------------------------------------------------------------
-// SubmittingOverlay / QtyControl — unchanged
+// SubmittingOverlay + QtyControl — unchanged
 // ---------------------------------------------------------------------------
 function SubmittingOverlay({ mode, showChangeForm }: { mode: Mode; showChangeForm: boolean }) {
   const label = mode === "addon" ? "Adding to your order" : showChangeForm ? "Saving changes" : "Sending your order";
   return (
     <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-6">
       <div className="bg-white rounded-3xl shadow-xl px-8 py-7 flex flex-col items-center gap-4 max-w-xs w-full text-center">
-        <svg
-          className="animate-spin w-9 h-9 text-[#c8362b]"
-          viewBox="0 0 24 24"
-          fill="none"
-          aria-hidden="true"
-        >
+        <svg className="animate-spin w-9 h-9 text-[#c8362b]" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
           <path className="opacity-90" fill="currentColor" d="M12 2a10 10 0 0 1 10 10h-4a6 6 0 0 0-6-6V2z" />
         </svg>
@@ -779,7 +772,13 @@ function QtyControl({
   const display = focused && value === 0 ? "" : String(value);
   return (
     <div className="flex items-center gap-1.5">
-      <button aria-label="−" onClick={() => onAdjust(-1)} className="w-9 h-9 rounded-full bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center text-lg font-bold active:scale-95">−</button>
+      <button
+        aria-label="−"
+        onClick={() => onAdjust(-1)}
+        className="w-9 h-9 rounded-full bg-[#fdf8f1] border border-[#e8dcc8] flex items-center justify-center text-lg font-bold active:scale-95"
+      >
+        −
+      </button>
       <input
         type="text"
         inputMode="numeric"
