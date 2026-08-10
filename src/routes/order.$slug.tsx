@@ -34,17 +34,10 @@ export const Route = createFileRoute("/order/$slug")({
   component: OrderPage,
 });
 
-// ---------------------------------------------------------------------------
-// Next delivery date
-//
-// Orders are always placed "for tomorrow" — except no deliveries go out on
-// Sunday. So an order placed on Saturday is for Monday (skip Sunday), not
-// Sunday. Every other day of the week behaves as before (tomorrow).
-// ---------------------------------------------------------------------------
 function getNextDeliveryDate(): Date {
   const d = new Date();
-  const dow = d.getDay(); // 0=Sunday … 6=Saturday
-  const addDays = dow === 6 ? 2 : 1; // Saturday -> skip Sunday, land on Monday
+  const dow = d.getDay();
+  const addDays = dow === 6 ? 2 : 1;
   d.setDate(d.getDate() + addDays);
   return d;
 }
@@ -64,13 +57,7 @@ type LineKey = string;
 type Mode = "default" | "addon";
 
 const KOTA_ONLY_PREFIXES = ["rolls kota", "kota"];
-
-// Products that should only be visible/orderable by Mediterranean or Rio
-// Douro customers (e.g. "ROLLS RIO/MED").
 const RIO_MED_ONLY_PREFIXES = ["rolls rio/med", "rio/med"];
-
-// Max number of distinct product lines (qty > 0) allowed in a single order.
-// Ordering a large quantity of ONE product only uses a single slot.
 const PRODUCT_LIMIT = 20;
 
 function isKotaOnlyProduct(name: string | undefined | null) {
@@ -85,36 +72,10 @@ function isRioMedOnlyProduct(name: string | undefined | null) {
   return RIO_MED_ONLY_PREFIXES.some((prefix) => n.startsWith(prefix)) || n.includes("rio/med");
 }
 
-// Customers allowed to see/order the Rio/Med-only products. Matching is a
-// case-insensitive substring check against the customer's name, so it
-// covers name variants automatically.
-//
-// FIXED: previously checked "mediteran" (single r) and "rio dourro"
-// (double r) — neither of which actually appears in "Mediterranean
-// Fisheries" or "Rio Douro", so the product was silently hidden from
-// EVERY customer, including the two it was meant for.
 function isRioMedCustomer(customerName: string) {
   const n = customerName.trim().toLowerCase();
   return n.includes("mediterranean") || n.includes("rio douro");
 }
-
-// ---------------------------------------------------------------------------
-// Delivery-day ordering restrictions
-//
-// A handful of customers are locked to specific delivery agreements — they
-// can only submit an order on the day *before* their delivery day (since
-// orders in this app are always placed "for tomorrow"). Matching is done by
-// a case-insensitive substring check against the customer's name so it
-// covers name variants automatically (e.g. "Rapido Nossa Cassa" matches the
-// same "nossa cassa" rule as "Nossa Cassa").
-//
-// DAY_NAMES / getDay(): 0=Sunday … 6=Saturday.
-// `days` below are the days it's OK to PLACE an order (i.e. the day before
-// the matching delivery day), not the delivery day itself:
-//   - Delivery Mon/Wed/Fri  -> order on Sun/Tue/Thu
-//   - Delivery Tue/Thu/Sat  -> order on Mon/Wed/Fri
-//   - Delivery Thu          -> order on Wed
-// ---------------------------------------------------------------------------
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
@@ -123,15 +84,15 @@ type OrderSchedule = { days: number[]; deliveryDays: string };
 const ORDER_SCHEDULES: Array<{ match: (name: string) => boolean; schedule: OrderSchedule }> = [
   {
     match: (n) => ["dalpark", "carnival", "lambton"].some((k) => n.includes(k)),
-    schedule: { days: [0, 2, 4], deliveryDays: "Mon/Wed/Fri" }, // order Sun/Tue/Thu
+    schedule: { days: [0, 2, 4], deliveryDays: "Mon/Wed/Fri" },
   },
   {
     match: (n) => n.includes("braza"),
-    schedule: { days: [1, 3, 5], deliveryDays: "Tue/Thu/Sat" }, // order Mon/Wed/Fri
+    schedule: { days: [1, 3, 5], deliveryDays: "Tue/Thu/Sat" },
   },
   {
     match: (n) => n.includes("nossa cassa"),
-    schedule: { days: [3], deliveryDays: "Thu" }, // order Wed
+    schedule: { days: [3], deliveryDays: "Thu" },
   },
 ];
 
@@ -161,7 +122,6 @@ function OrderPage() {
   const hasPriorOrders = page!.hasPriorOrders;
   const history = page!.history;
 
-  // Save this customer's slug so the homepage can redirect them back here
   useEffect(() => {
     try {
       localStorage.setItem("pb-customer-slug", slug);
@@ -189,16 +149,14 @@ function OrderPage() {
   const [showChangeForm, setShowChangeForm] = useState(false);
   const [mode, setMode] = useState<Mode>("default");
 
-  // Message popup — the first time in a fresh order, pressing Submit opens
-  // this modal. If the customer taps "Skip", we remember that for the rest
-  // of this order session and skip straight to submitting next time.
   const [showMessageModal, setShowMessageModal] = useState(false);
   const [message, setMessage] = useState("");
+  // ── NEW: sender name — compulsory before the order can be sent ──
+  const [senderName, setSenderName] = useState("");
   const [messageModalSkipped, setMessageModalSkipped] = useState(false);
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
-  // Delivery-day restriction check for this customer.
   const orderSchedule = useMemo(() => getOrderSchedule(customer.name), [customer.name]);
   const todayDow = new Date().getDay();
   const orderingBlocked = !!orderSchedule && !orderSchedule.days.includes(todayDow);
@@ -239,8 +197,6 @@ function OrderPage() {
 
   const totalItems = Object.values(qty).reduce((a, b) => a + b, 0);
 
-  // Distinct product lines with qty > 0 — this is what counts against the limit,
-  // not the total quantity. Ordering 50 of one product still uses just 1 slot.
   const usedProductCount = useMemo(
     () => Object.values(qty).filter((v) => v > 0).length,
     [qty],
@@ -257,7 +213,6 @@ function OrderPage() {
   const adjust = (k: LineKey, delta: number) =>
     setQty((s) => {
       const current = s[k] || 0;
-      // Block adding a NEW product line once the limit is reached.
       if (delta > 0 && current === 0) {
         const usedNow = Object.values(s).filter((v) => v > 0).length;
         if (usedNow >= PRODUCT_LIMIT) return s;
@@ -269,7 +224,6 @@ function OrderPage() {
     setQty((s) => {
       const current = s[k] || 0;
       const newVal = Math.max(0, n || 0);
-      // Block turning a zero-qty row into a new product line once at the limit.
       if (current === 0 && newVal > 0) {
         const usedNow = Object.values(s).filter((v) => v > 0).length;
         if (usedNow >= PRODUCT_LIMIT) return s;
@@ -308,17 +262,22 @@ function OrderPage() {
         setSubmitting(false);
         return;
       }
-      // Message is optional — the backend accepts an empty string and simply
-      // skips writing a sheet comment / history note when there isn't one.
+      // Prepend the sender's name to the message so it is always recorded.
+      const fullMessage = msg.trim()
+        ? `${senderName.trim()}: ${msg.trim()}`
+        : senderName.trim();
+
       if (mode === "addon") {
-        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
+        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       } else if (showChangeForm) {
-        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
+        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       } else {
-        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
+        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       }
       setQty({});
       setMessage("");
+      // Keep senderName so they don't have to re-type it if they order again
+      // in the same session, but reset the modal-skipped flag.
       setMode("default");
       setShowChangeForm(false);
       setMessageModalSkipped(false);
@@ -331,19 +290,25 @@ function OrderPage() {
   }
 
   function handleSendMessage() {
+    // Name is validated inside the modal — this callback is only reachable
+    // when the name field is filled in.
     setShowMessageModal(false);
     void handleSubmit(message);
   }
 
   function handleSkipMessage() {
+    // "Skip" only skips the *comment* — the name is still required and was
+    // already validated before this can fire.
     setShowMessageModal(false);
     setMessageModalSkipped(true);
+    void handleSubmit("");
   }
 
-  // Pressing "Submit Order" — if the customer already skipped the message
-  // prompt once this order, go straight through. Otherwise show the modal.
   function handleSubmitClick() {
-    if (messageModalSkipped) {
+    // Always show the modal so the customer can enter their name.
+    // Once they have submitted once (messageModalSkipped === true) and the
+    // name is already filled in we can skip straight through.
+    if (messageModalSkipped && senderName.trim()) {
       void handleSubmit(message);
     } else {
       setShowMessageModal(true);
@@ -351,9 +316,6 @@ function OrderPage() {
   }
 
   // ===== Delivery-day blocked screen =====
-  // Takes priority over everything else (received-today, add-on, change
-  // order) — this customer's delivery agreement simply doesn't allow
-  // ordering today, regardless of what else is going on with their order.
   if (orderingBlocked && orderSchedule) {
     const nextDay = nextAllowedOrderDay(orderSchedule.days, todayDow);
     return (
@@ -407,20 +369,6 @@ function OrderPage() {
             >
               + Add onto Prev Order
             </button>
-            {/* {hasPriorOrders && (
-              <button
-                onClick={() => {
-                  const prefill = buildPrefillFromTodayOrder();
-                  setShowChangeForm(true);
-                  setQty(prefill);
-                  if (Object.keys(prefill).some((k) => k.startsWith("x:"))) setShowMore(true);
-                }}
-                className="border-2 border-[#c8362b] text-[#c8362b] font-bold py-3 rounded-xl hover:bg-[#c8362b]/5"
-                title="Overwrite today's quantities in column C"
-              >
-                Change Order
-              </button>
-            )} */}
             <button
               onClick={() => setShowHistory(true)}
               className="border border-[#e8dcc8] hover:bg-[#fdf8f1] font-semibold py-3 rounded-xl"
@@ -435,7 +383,7 @@ function OrderPage() {
     );
   }
 
-  // ===== Order form (default or add-on) =====
+  // ===== Order form =====
   return (
     <div className="min-h-screen bg-[#fdf8f1] pb-40">
       <header className="bg-white border-b border-[#e8dcc8] sticky top-0 z-10">
@@ -585,6 +533,8 @@ function OrderPage() {
         <MessageModal
           value={message}
           onChange={setMessage}
+          senderName={senderName}
+          onSenderNameChange={setSenderName}
           onSkip={handleSkipMessage}
           onSend={handleSendMessage}
           sending={submitting}
@@ -595,6 +545,9 @@ function OrderPage() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// History modal (unchanged)
+// ---------------------------------------------------------------------------
 function orderTypeTag(type?: string | null) {
   switch (type) {
     case "changed":
@@ -683,50 +636,99 @@ function HistoryModal({
   );
 }
 
+// ---------------------------------------------------------------------------
+// MessageModal — now includes a compulsory Name field and blocks Tab-indent
+// ---------------------------------------------------------------------------
 function MessageModal({
   value,
   onChange,
+  senderName,
+  onSenderNameChange,
   onSkip,
   onSend,
   sending,
 }: {
   value: string;
   onChange: (v: string) => void;
+  senderName: string;
+  onSenderNameChange: (v: string) => void;
   onSkip: () => void;
   onSend: () => void;
   sending: boolean;
 }) {
-  const canSend = !sending;
+  const nameEmpty = senderName.trim() === "";
+
+  // Prevent Tab from inserting whitespace / indentation in the textarea.
+  function handleTextareaKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Tab") {
+      e.preventDefault();
+    }
+  }
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onSkip}>
-      <div
-        className="bg-white rounded-2xl max-w-md w-full shadow-xl p-5"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 className="font-bold text-lg mb-1">Add a message (optional)</h3>
-        <p className="text-sm text-[#8b6f4e] mb-3">
-          Add a quick note before sending your order (e.g. delivery time, special instructions) — or skip this and send without one.
+    <div
+      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
+      // Clicking the backdrop does NOT dismiss — the customer must explicitly
+      // choose Skip (no comment) or Send.
+    >
+      <div className="bg-white rounded-2xl max-w-md w-full shadow-xl p-5">
+        <h3 className="font-bold text-lg mb-1">Almost there!</h3>
+        <p className="text-sm text-[#8b6f4e] mb-4">
+          Please enter your name before sending — it helps us know who placed the order.
         </p>
-        <textarea
-          autoFocus
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder="Type your message… (optional)"
-          rows={4}
-          className="w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b] resize-none"
-        />
+
+        {/* ── Compulsory name field ── */}
+        <label className="block mb-1">
+          <span className="text-xs font-bold uppercase tracking-wide text-[#2a1810]">
+            Your name <span className="text-[#c8362b]">*</span>
+          </span>
+          <input
+            autoFocus
+            type="text"
+            value={senderName}
+            onChange={(e) => onSenderNameChange(e.target.value)}
+            placeholder="e.g. John"
+            className={`mt-1 w-full bg-[#fdf8f1] border rounded-xl px-4 py-3 text-sm focus:outline-none transition ${
+              nameEmpty
+                ? "border-[#c8362b] focus:border-[#c8362b]"
+                : "border-[#e8dcc8] focus:border-[#c8362b]"
+            }`}
+          />
+          {nameEmpty && (
+            <p className="text-xs text-[#c8362b] mt-1">Name is required to send your order.</p>
+          )}
+        </label>
+
+        {/* ── Optional comment ── */}
+        <label className="block mt-4 mb-1">
+          <span className="text-xs font-bold uppercase tracking-wide text-[#2a1810]">
+            Comment <span className="text-[#8b6f4e] font-normal">(optional)</span>
+          </span>
+          <textarea
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onKeyDown={handleTextareaKeyDown}
+            placeholder="e.g. delivery time, special instructions…"
+            rows={3}
+            className="mt-1 w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b] resize-none"
+          />
+        </label>
+
         <div className="flex gap-2 mt-4">
+          {/* Skip = send with no comment but name is still required */}
           <button
             onClick={onSkip}
-            disabled={sending}
-            className="flex-1 border border-[#e8dcc8] font-semibold py-3 rounded-xl hover:bg-[#fdf8f1] disabled:opacity-50"
+            disabled={sending || nameEmpty}
+            title={nameEmpty ? "Please enter your name first" : "Send without a comment"}
+            className="flex-1 border border-[#e8dcc8] font-semibold py-3 rounded-xl hover:bg-[#fdf8f1] disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Skip
+            Skip comment
           </button>
           <button
             onClick={onSend}
-            disabled={!canSend}
-            className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl"
+            disabled={sending || nameEmpty}
+            title={nameEmpty ? "Please enter your name first" : "Send order"}
+            className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl disabled:cursor-not-allowed"
           >
             {sending ? "Sending…" : "Send"}
           </button>
@@ -736,6 +738,9 @@ function MessageModal({
   );
 }
 
+// ---------------------------------------------------------------------------
+// SubmittingOverlay / QtyControl — unchanged
+// ---------------------------------------------------------------------------
 function SubmittingOverlay({ mode, showChangeForm }: { mode: Mode; showChangeForm: boolean }) {
   const label = mode === "addon" ? "Adding to your order" : showChangeForm ? "Saving changes" : "Sending your order";
   return (
