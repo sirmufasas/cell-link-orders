@@ -8,6 +8,7 @@ import {
 } from "@/lib/push";
 import { subscribeToOrderReminders, unsubscribeFromOrderReminders } from "@/lib/pushReminders.functions";
 import { OrdersClosingAlertModal } from "@/components/OrdersClosingAlertModal";
+import { NotificationsPrompt } from "@/components/NotificationsPrompt";
 
 const SNOOZE_MS = 5 * 60 * 1000;
 
@@ -304,6 +305,20 @@ function OrderPage() {
     return () => navigator.serviceWorker.removeEventListener("message", onMessage);
   }, []);
 
+  // Shared by both the manual button and the auto-popup nudge below.
+  async function enableReminders(): Promise<boolean> {
+    try {
+      const sub = await subscribeToPush();
+      if (!sub) return false;
+      await subscribeToOrderReminders({ data: { slug, ...subscriptionToKeys(sub) } });
+      setRemindersEnabled(true);
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't enable reminders.");
+      return false;
+    }
+  }
+
   async function toggleReminders() {
     if (remindersBusy) return;
     setRemindersBusy(true);
@@ -316,13 +331,8 @@ function OrderPage() {
         }
         setRemindersEnabled(false);
       } else {
-        const sub = await subscribeToPush();
-        if (!sub) {
-          setError("Couldn't enable reminders — check that notifications are allowed for this site.");
-          return;
-        }
-        await subscribeToOrderReminders({ data: { slug, ...subscriptionToKeys(sub) } });
-        setRemindersEnabled(true);
+        const ok = await enableReminders();
+        if (!ok) setError("Couldn't enable reminders — check that notifications are allowed for this site.");
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't update reminders.");
@@ -752,6 +762,7 @@ function OrderPage() {
           onCancel={handleCancelAlert}
         />
       )}
+      <NotificationsPrompt alreadyEnabled={remindersEnabled} onEnable={enableReminders} />
     </div>
   );
 }
