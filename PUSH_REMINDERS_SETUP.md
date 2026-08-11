@@ -1,7 +1,7 @@
 # "Orders closing soon" push reminders — setup
 
-This adds real push notifications sent at **7:00, 7:30 and 7:45 PM**
-reminding customers that orders close at **8:30 PM**, using the same siren +
+This adds real push notifications sent at **6:00, 6:30 and 6:45 PM**
+reminding customers that orders close at **7:00 PM**, using the same siren +
 shouted-voice alert as the admin "new order" sound (shared code in
 `src/lib/alertSound.ts`).
 
@@ -78,19 +78,19 @@ time (UTC+2, no DST) — adjust if that's wrong:
 
 | Local time | Cron (UTC)     | Body                          |
 |-----------|-----------------|--------------------------------|
-| 7:00 PM   | `0 17 * * *`    | `{"minutesBeforeClose": 90}`  |
-| 7:30 PM   | `30 17 * * *`   | `{"minutesBeforeClose": 60}`  |
-| 7:45 PM   | `45 17 * * *`   | `{"minutesBeforeClose": 15}`  |
+| 6:00 PM   | `0 16 * * *`    | `{"minutesBeforeClose": 60}`  |
+| 6:30 PM   | `30 16 * * *`   | `{"minutesBeforeClose": 30}`  |
+| 6:45 PM   | `45 16 * * *`   | `{"minutesBeforeClose": 15}`  |
 
 Or, via SQL (`pg_cron` + `pg_net` extensions), if you'd rather manage it in
 the database — replace `<project-ref>` and `<service-role-key>`:
 
 ```sql
-select cron.schedule('order-reminder-700pm', '0 17 * * *', $$
+select cron.schedule('order-reminder-600pm', '0 16 * * *', $$
   select net.http_post(
     url := 'https://<project-ref>.supabase.co/functions/v1/send-order-reminders',
     headers := jsonb_build_object('Authorization', 'Bearer <service-role-key>', 'Content-Type', 'application/json'),
-    body := '{"minutesBeforeClose": 90}'::jsonb
+    body := '{"minutesBeforeClose": 60}'::jsonb
   );
 $$);
 -- repeat for '30 17 * * *' (60 min) and '45 17 * * *' (15 min)

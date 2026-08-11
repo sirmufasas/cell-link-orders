@@ -278,7 +278,7 @@ function OrderPage() {
     setClosingAlert(null);
     clearSnoozeTimer();
     snoozeTimerRef.current = setTimeout(() => {
-      fireClosingAlert({ title: "Still open — orders closing soon", body: "Snooze's up! Orders close at 8:30 PM." });
+      fireClosingAlert({ title: "Still open — orders closing soon", body: "Snooze's up! Orders close at 7:00 PM." });
     }, SNOOZE_MS);
   }
 
@@ -627,8 +627,8 @@ function OrderPage() {
             }`}
             title={
               remindersEnabled
-                ? "You'll get an alert at 7:00, 7:30 and 7:45 PM that orders close at 8:30 — tap to turn off"
-                : "Get an alert at 7:00, 7:30 and 7:45 PM that orders close at 8:30 PM"
+                ? "You'll get an alert at 6:00, 6:30 and 6:45 PM that orders close at 7:00 PM — tap to turn off"
+                : "Get an alert at 6:00, 6:30 and 6:45 PM that orders close at 7:00 PM"
             }
           >
             {remindersEnabled ? "🔔 Closing reminders ON" : "🔕 Get closing-time reminders"}

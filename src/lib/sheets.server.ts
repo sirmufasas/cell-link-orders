@@ -19,7 +19,7 @@ import { resolve } from "node:path";
 // TZ env var set. Using `new Date().getDay()` / `getHours()` directly (as
 // this file used to) reads the SERVER's clock, not the bakery's — a ~2hr
 // gap that caused two bugs:
-//   1. The 8:30 PM late-order cutoff effectively fired 2 hours later than
+//   1. The late-order cutoff effectively fired 2 hours later than
 //      intended in real local time.
 //   2. Right after local midnight (00:00–01:59 SAST, which is still
 //      22:00–23:59 the PREVIOUS day in UTC), "tomorrow" was computed a
@@ -400,7 +400,7 @@ export async function clearOrderQuantities(rows: number[]) {
 /**
  * Write quantity values into column K ("Late Orders") of "Customer Order
  * Details" for the given sheet rows. Used for new orders submitted at/after
- * the 8:30 PM cutoff — kept separate from column C on purpose so the main
+ * the late cutoff — kept separate from column C on purpose so the main
  * order total isn't affected by late submissions. The "LATE" tab reads this
  * column live via SUMIF formulas, so no extra write is needed to keep
  * per-product totals current.

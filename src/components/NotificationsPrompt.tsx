@@ -130,7 +130,7 @@ export function NotificationsPrompt({ alreadyEnabled, onEnable }: Props) {
         <p className="text-sm text-[#6b5544] mb-6 leading-relaxed">
           {blocked
             ? "Notifications were blocked for this site earlier, so we can't ask again automatically. Turn them back on in your browser's site settings for this page."
-            : "Get an alert with a loud siren if orders are about to close at 8:30 PM and you haven't ordered yet."}
+            : "Get an alert with a loud siren if orders are about to close at 7:00 PM and you haven't ordered yet."}
         </p>
 
         <div className="flex flex-col gap-2.5">

@@ -14,8 +14,8 @@ function tomorrowISO(): string {
   return tomorrowISOInBakeryTimezone();
 }
 
-const LATE_CUTOFF_HOUR = 20;
-const LATE_CUTOFF_MINUTE = 30;
+const LATE_CUTOFF_HOUR = 19;
+const LATE_CUTOFF_MINUTE = 0;
 
 function isLateOrder(): boolean {
   const cutoff = LATE_CUTOFF_HOUR * 60 + LATE_CUTOFF_MINUTE;

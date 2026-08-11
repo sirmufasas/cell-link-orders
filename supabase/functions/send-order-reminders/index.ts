@@ -18,13 +18,13 @@ const SITE_URL = Deno.env.get("SITE_URL") ?? "https://example.com";
 webpush.setVapidDetails(VAPID_CONTACT_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
 function messageFor(minutesBeforeClose: number): { title: string; body: string } {
-  if (minutesBeforeClose >= 75) {
-    return { title: "Orders closing soon", body: "Heads up — orders close at 8:30 PM tonight." };
-  }
   if (minutesBeforeClose >= 45) {
-    return { title: "Orders closing soon", body: "30 minutes left — orders close at 8:30 PM." };
+    return { title: "Orders closing soon", body: "Heads up — orders close at 7:00 PM tonight." };
   }
-  return { title: "Last call — orders closing", body: "15 minutes left! Orders close at 8:30 PM." };
+  if (minutesBeforeClose >= 20) {
+    return { title: "Orders closing soon", body: "30 minutes left — orders close at 7:00 PM." };
+  }
+  return { title: "Last call — orders closing", body: "15 minutes left! Orders close at 7:00 PM." };
 }
 
 // Same "which delivery date is this order for" logic as the customer order
@@ -45,7 +45,7 @@ Deno.serve(async (req) => {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  let minutesBeforeClose = 90;
+  let minutesBeforeClose = 60;
   try {
     const body = await req.json();
     if (typeof body?.minutesBeforeClose === "number") minutesBeforeClose = body.minutesBeforeClose;
