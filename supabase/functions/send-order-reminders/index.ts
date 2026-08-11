@@ -27,6 +27,19 @@ function messageFor(minutesBeforeClose: number): { title: string; body: string }
   return { title: "Last call — orders closing", body: "15 minutes left! Orders close at 8:30 PM." };
 }
 
+// Same "which delivery date is this order for" logic as the customer order
+// page (src/routes/order.$slug.tsx getNextDeliveryDate) — orders are for
+// tomorrow, except Saturday orders skip Sunday and land on Monday. Needs to
+// match exactly, since this is what decides whether someone already
+// ordered and should be skipped.
+function nextDeliveryDateISO(): string {
+  const d = new Date();
+  const dow = d.getDay(); // 0=Sunday … 6=Saturday
+  const addDays = dow === 6 ? 2 : 1;
+  d.setDate(d.getDate() + addDays);
+  return d.toISOString().slice(0, 10);
+}
+
 Deno.serve(async (req) => {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
@@ -51,12 +64,32 @@ Deno.serve(async (req) => {
     return new Response(JSON.stringify({ error: error.message }), { status: 500 });
   }
 
+  // Anyone who's already submitted an order for the next delivery date
+  // doesn't get the reminder at all — this is the actual enforcement of
+  // "don't let the alarm go off if they've already ordered." (The order
+  // page also re-checks this client-side as a second safety net, in case
+  // an order was placed on a different device right as this runs.)
+  const forDate = nextDeliveryDateISO();
+  const customerIds = [...new Set((subs ?? []).map((r: any) => r.customer_id))];
+  const { data: existingOrders, error: ordersErr } = await supabase
+    .from("order_submissions")
+    .select("customer_id")
+    .eq("for_date", forDate)
+    .in("customer_id", customerIds.length ? customerIds : ["00000000-0000-0000-0000-000000000000"]);
+  if (ordersErr) {
+    return new Response(JSON.stringify({ error: ordersErr.message }), { status: 500 });
+  }
+  const alreadyOrderedCustomerIds = new Set((existingOrders ?? []).map((o: any) => o.customer_id));
+
+  const pendingSubs = (subs ?? []).filter((row: any) => !alreadyOrderedCustomerIds.has(row.customer_id));
+  let skippedAlreadyOrdered = (subs ?? []).length - pendingSubs.length;
+
   let sent = 0;
   let removed = 0;
   const failures: string[] = [];
 
   await Promise.all(
-    (subs ?? []).map(async (row: any) => {
+    pendingSubs.map(async (row: any) => {
       const slug = row.customers?.slug;
       const payload = JSON.stringify({
         title,
@@ -90,7 +123,8 @@ Deno.serve(async (req) => {
     }),
   );
 
-  return new Response(JSON.stringify({ sent, removed, failed: failures.length, failures }), {
-    headers: { "Content-Type": "application/json" },
-  });
+  return new Response(
+    JSON.stringify({ sent, removed, skippedAlreadyOrdered, failed: failures.length, failures }),
+    { headers: { "Content-Type": "application/json" } },
+  );
 });

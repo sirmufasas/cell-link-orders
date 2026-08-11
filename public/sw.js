@@ -44,14 +44,24 @@ self.addEventListener("push", (event) => {
         (c) => c.focused && c.visibilityState === "visible",
       );
       if (!hasFocusedVisibleClient) {
+        // Action buttons are a best-effort convenience here (mainly
+        // Android Chrome renders them) — the reliable "Order now / Snooze
+        // / Cancel" experience is the in-page popup, which only shows once
+        // a tab is actually open. "Snooze" on a background notification
+        // just dismisses it; there's no way to reschedule a notification
+        // from a suspended service worker.
         await self.registration.showNotification(data.title || "Orders closing soon", {
           body: data.body || "Get your order in before the cutoff.",
           icon: "/icons/icon-192.png",
           badge: "/icons/icon-192.png",
           tag: "orders-closing",
           renotify: true,
-          requireInteraction: false,
+          requireInteraction: true,
           vibrate: [300, 150, 300, 150, 300],
+          actions: [
+            { action: "order", title: "Order now" },
+            { action: "snooze", title: "Snooze" },
+          ],
           data,
         });
       }
@@ -62,6 +72,10 @@ self.addEventListener("push", (event) => {
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const data = event.notification.data || {};
+
+  // "Snooze" on a background notification: just dismiss it (see note
+  // above on showNotification — no reliable way to reschedule from here).
+  if (event.action === "snooze") return;
 
   event.waitUntil(
     (async () => {

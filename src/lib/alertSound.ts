@@ -39,6 +39,11 @@ function getPreferredMaleVoice(): SpeechSynthesisVoice | null {
   return male ?? null;
 }
 
+// Oscillators currently scheduled/playing for the alert that's in progress,
+// so stopAlert() can silence them immediately instead of waiting for their
+// pre-scheduled stop time.
+let activeOscillators: OscillatorNode[] = [];
+
 /**
  * One harsh siren "whoop": two oscillators stacked together (a rising
  * sawtooth plus a lower square wave underneath), both at max gain. Layering
@@ -61,6 +66,7 @@ function playSirenWhoop(ctx: AudioContext, startTime: number): number {
   gain1.connect(ctx.destination);
   osc1.start(startTime);
   osc1.stop(startTime + duration + 0.02);
+  activeOscillators.push(osc1);
 
   const osc2 = ctx.createOscillator();
   const gain2 = ctx.createGain();
@@ -74,6 +80,7 @@ function playSirenWhoop(ctx: AudioContext, startTime: number): number {
   gain2.connect(ctx.destination);
   osc2.start(startTime);
   osc2.stop(startTime + duration + 0.02);
+  activeOscillators.push(osc2);
 
   return duration;
 }
@@ -88,6 +95,25 @@ function playSirenLayer(ctx: AudioContext, totalDuration: number) {
     const dur = playSirenWhoop(ctx, t);
     t += dur + 0.05;
   }
+}
+
+/**
+ * Immediately silences whatever alert is currently playing — both the
+ * siren tone and any queued/speaking voice lines. Used by the "Snooze" and
+ * "Cancel" buttons on the on-screen closing-alert popup so the sound stops
+ * the instant someone taps a button, rather than finishing its ~15s cycle.
+ */
+export function stopAlert() {
+  if (typeof window === "undefined") return;
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  for (const osc of activeOscillators) {
+    try {
+      osc.stop();
+    } catch {
+      // Already stopped/finished — fine to ignore.
+    }
+  }
+  activeOscillators = [];
 }
 
 /**
@@ -109,6 +135,11 @@ export function primeAlertAudio(audioCtxRef: { current: AudioContext | null }) {
 
 export function shoutAlert(phrase: string, audioCtx?: AudioContext | null) {
   if (typeof window === "undefined") return;
+
+  // Starting a fresh alert — drop any stale oscillator references from a
+  // previous alert that already finished naturally (stopAlert() clears
+  // this too, but a completed alert never called it).
+  activeOscillators = [];
 
   // Layer 1: siren whoops running continuously for the whole alert, not
   // just an intro — the voice shouts on top of it the entire time, so

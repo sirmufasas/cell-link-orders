@@ -2,11 +2,14 @@ import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useState, useMemo, useEffect, useRef } from "react";
 import { useSuspenseQuery, queryOptions, useQueryClient } from "@tanstack/react-query";
 import { getCustomerPage, listProducts, submitOrder, addOnToOrder, changeOrder } from "@/lib/bakery.functions";
-import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
+import { primeAlertAudio, shoutAlert, stopAlert } from "@/lib/alertSound";
 import {
   pushSupported, getExistingSubscription, subscribeToPush, unsubscribeFromPush, subscriptionToKeys,
 } from "@/lib/push";
 import { subscribeToOrderReminders, unsubscribeFromOrderReminders } from "@/lib/pushReminders.functions";
+import { OrdersClosingAlertModal } from "@/components/OrdersClosingAlertModal";
+
+const SNOOZE_MS = 5 * 60 * 1000;
 
 const customerPageQuery = (slug: string) =>
   queryOptions({
@@ -230,6 +233,62 @@ function OrderPage() {
     getExistingSubscription().then((sub) => setRemindersEnabled(!!sub));
   }, []);
 
+  // On-screen popup shown alongside the siren + voice alert (Order now /
+  // Snooze / Cancel). null = not currently showing.
+  const [closingAlert, setClosingAlert] = useState<{ title: string; body: string } | null>(null);
+  const snoozeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Kept in a ref (not state) so the message-listener effect below always
+  // sees the latest value without needing to re-subscribe on every change.
+  const alreadyOrderedRef = useRef(false);
+  useEffect(() => {
+    alreadyOrderedRef.current = !!todayOrder;
+  }, [todayOrder]);
+
+  function fireClosingAlert(payload: { title?: string; body?: string }) {
+    // Already ordered — the reminder shouldn't have been sent in the first
+    // place (the server filters this out too), but double-check here as
+    // well in case this device's push arrived just before an order that
+    // was placed on a different device, or during a snooze window.
+    if (alreadyOrderedRef.current) return;
+    setClosingAlert({
+      title: payload.title || "Orders closing soon",
+      body: payload.body || "Get your order in before the cutoff.",
+    });
+    shoutAlert("ORDERS CLOSING", audioCtxRef.current);
+  }
+
+  function clearSnoozeTimer() {
+    if (snoozeTimerRef.current) {
+      clearTimeout(snoozeTimerRef.current);
+      snoozeTimerRef.current = null;
+    }
+  }
+
+  function handleOrderNow() {
+    stopAlert();
+    clearSnoozeTimer();
+    setClosingAlert(null);
+    // Already on this customer's order form — just scroll them to it.
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function handleSnooze() {
+    stopAlert();
+    setClosingAlert(null);
+    clearSnoozeTimer();
+    snoozeTimerRef.current = setTimeout(() => {
+      fireClosingAlert({ title: "Still open — orders closing soon", body: "Snooze's up! Orders close at 8:30 PM." });
+    }, SNOOZE_MS);
+  }
+
+  function handleCancelAlert() {
+    stopAlert();
+    clearSnoozeTimer();
+    setClosingAlert(null);
+  }
+
+  useEffect(() => clearSnoozeTimer, []);
+
   // If a tab is open (foreground or background), the service worker wakes
   // it with this message instead of only showing a system notification —
   // that's what lets us play the *real* siren + shouted voice here rather
@@ -238,7 +297,7 @@ function OrderPage() {
     if (!pushSupported()) return;
     function onMessage(event: MessageEvent) {
       if (event.data?.type === "ORDERS_CLOSING_ALERT") {
-        shoutAlert("ORDERS CLOSING", audioCtxRef.current);
+        fireClosingAlert(event.data.payload ?? {});
       }
     }
     navigator.serviceWorker.addEventListener("message", onMessage);
@@ -684,6 +743,15 @@ function OrderPage() {
         />
       )}
       {submitting && <SubmittingOverlay mode={mode} showChangeForm={showChangeForm} />}
+      {closingAlert && (
+        <OrdersClosingAlertModal
+          title={closingAlert.title}
+          body={closingAlert.body}
+          onOrderNow={handleOrderNow}
+          onSnooze={handleSnooze}
+          onCancel={handleCancelAlert}
+        />
+      )}
     </div>
   );
 }
