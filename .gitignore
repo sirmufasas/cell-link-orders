@@ -38,3 +38,6 @@ secrets/
 *.sw?
 # Local Netlify folder
 .netlify
+
+# Local Supabase CLI state (created by "supabase link") — not needed in git
+supabase/.temp/
