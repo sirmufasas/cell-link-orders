@@ -122,7 +122,8 @@ function isRioMedCustomer(customerName: string) {
 // the matching delivery day), not the delivery day itself:
 //   - Delivery Mon/Wed/Fri  -> order on Sun/Tue/Thu
 //   - Delivery Tue/Thu/Sat  -> order on Mon/Wed/Fri
-//   - Delivery Thu          -> order on Wed
+//   - Delivery Mon/Thu      -> order on Sat/Sun/Wed (Sat and Sun both land
+//     on Monday delivery — same "skip Sunday" rule every customer gets)
 // ---------------------------------------------------------------------------
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -139,8 +140,11 @@ const ORDER_SCHEDULES: Array<{ match: (name: string) => boolean; schedule: Order
     schedule: { days: [1, 3, 5], deliveryDays: "Tue/Thu/Sat" }, // order Mon/Wed/Fri
   },
   {
-    match: (n) => n.includes("nossa cassa"),
-    schedule: { days: [3], deliveryDays: "Thu" }, // order Wed
+    // Excludes "... FOUR WAYS" — that's a different customer that happens
+    // to share the "Nossa Cassa" name but should order normally, with no
+    // day restriction.
+    match: (n) => (n.includes("rapido") || n.includes("nossa cassa")) && !n.includes("four ways"),
+    schedule: { days: [0, 3, 6], deliveryDays: "Mon/Thu" }, // order Sun/Wed/Sat
   },
 ];
 
