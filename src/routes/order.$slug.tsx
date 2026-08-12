@@ -416,7 +416,9 @@ function OrderPage() {
       }
 
       if (!cancelled && !lockFinishedRef.current) {
-        timer = setTimeout(checkLock, ownsOrderLockRef.current ? 15_000 : 5_000);
+        // Keep the active 10-second lease alive, while waiting browsers check
+        // twice per second so handover after submission feels immediate.
+        timer = setTimeout(checkLock, ownsOrderLockRef.current ? 2_500 : 500);
       }
     }
 
