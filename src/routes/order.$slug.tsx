@@ -208,6 +208,8 @@ function OrderPage() {
   const [showMessageModal, setShowMessageModal] = useState(false);
   const [message, setMessage] = useState("");
   const [messageModalSkipped, setMessageModalSkipped] = useState(false);
+  // Sender name — persisted across the session so they only type it once
+  const [senderName, setSenderName] = useState("");
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
@@ -455,14 +457,17 @@ function OrderPage() {
         setSubmitting(false);
         return;
       }
-      // Message is optional — the backend accepts an empty string and simply
-      // skips writing a sheet comment / history note when there isn't one.
+      // Build the full message: "Name: comment" or just "Name" if no comment
+      const fullMessage = msg.trim()
+        ? `${senderName.trim()}: ${msg.trim()}`
+        : senderName.trim();
+
       if (mode === "addon") {
-        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
+        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       } else if (showChangeForm) {
-        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
+        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       } else {
-        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: msg } });
+        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       }
       setQty({});
       setMessage("");
@@ -483,14 +488,17 @@ function OrderPage() {
   }
 
   function handleSkipMessage() {
+    // Skip only skips the comment — name was already validated in the modal
     setShowMessageModal(false);
     setMessageModalSkipped(true);
+    void handleSubmit("");
   }
 
   // Pressing "Submit Order" — if the customer already skipped the message
-  // prompt once this order, go straight through. Otherwise show the modal.
+  // prompt once this order (and already gave their name), go straight
+  // through. Otherwise show the modal.
   function handleSubmitClick() {
-    if (messageModalSkipped) {
+    if (messageModalSkipped && senderName.trim()) {
       void handleSubmit(message);
     } else {
       setShowMessageModal(true);
@@ -751,6 +759,8 @@ function OrderPage() {
         <MessageModal
           value={message}
           onChange={setMessage}
+          senderName={senderName}
+          onSenderNameChange={setSenderName}
           onSkip={handleSkipMessage}
           onSend={handleSendMessage}
           sending={submitting}
@@ -859,50 +869,94 @@ function HistoryModal({
   );
 }
 
+// ---------------------------------------------------------------------------
+// MessageModal — compulsory name + optional comment, Tab key blocked
+// ---------------------------------------------------------------------------
 function MessageModal({
   value,
   onChange,
+  senderName,
+  onSenderNameChange,
   onSkip,
   onSend,
   sending,
 }: {
   value: string;
   onChange: (v: string) => void;
+  senderName: string;
+  onSenderNameChange: (v: string) => void;
   onSkip: () => void;
   onSend: () => void;
   sending: boolean;
 }) {
-  const canSend = !sending;
+  const nameEmpty = senderName.trim() === "";
+
+  function handleTextareaKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Tab") {
+      e.preventDefault();
+    }
+  }
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onSkip}>
-      <div
-        className="bg-white rounded-2xl max-w-md w-full shadow-xl p-5"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 className="font-bold text-lg mb-1">Add a message (optional)</h3>
-        <p className="text-sm text-[#8b6f4e] mb-3">
-          Add a quick note before sending your order (e.g. delivery time, special instructions) — or skip this and send without one.
+    // No onClick on backdrop — must explicitly choose Skip or Send
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl max-w-md w-full shadow-xl p-5">
+        <h3 className="font-bold text-lg mb-1">Almost there!</h3>
+        <p className="text-sm text-[#8b6f4e] mb-4">
+          Please enter your name — it helps us know who placed the order.
         </p>
-        <textarea
-          autoFocus
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder="Type your message… (optional)"
-          rows={4}
-          className="w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b] resize-none"
-        />
+
+        {/* Compulsory name field */}
+        <label className="block mb-1">
+          <span className="text-xs font-bold uppercase tracking-wide text-[#2a1810]">
+            Your name <span className="text-[#c8362b]">*</span>
+          </span>
+          <input
+            autoFocus
+            type="text"
+            value={senderName}
+            onChange={(e) => onSenderNameChange(e.target.value)}
+            placeholder="e.g. John"
+            className={`mt-1 w-full bg-[#fdf8f1] border rounded-xl px-4 py-3 text-sm focus:outline-none transition ${
+              nameEmpty
+                ? "border-[#c8362b] focus:border-[#c8362b]"
+                : "border-[#e8dcc8] focus:border-[#c8362b]"
+            }`}
+          />
+          {nameEmpty && (
+            <p className="text-xs text-[#c8362b] mt-1">Name is required to send your order.</p>
+          )}
+        </label>
+
+        {/* Optional comment — Tab key blocked */}
+        <label className="block mt-4 mb-1">
+          <span className="text-xs font-bold uppercase tracking-wide text-[#2a1810]">
+            Comment <span className="text-[#8b6f4e] font-normal">(optional)</span>
+          </span>
+          <textarea
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            onKeyDown={handleTextareaKeyDown}
+            placeholder="e.g. delivery time, special instructions…"
+            rows={3}
+            className="mt-1 w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b] resize-none"
+          />
+        </label>
+
         <div className="flex gap-2 mt-4">
           <button
             onClick={onSkip}
-            disabled={sending}
-            className="flex-1 border border-[#e8dcc8] font-semibold py-3 rounded-xl hover:bg-[#fdf8f1] disabled:opacity-50"
+            disabled={sending || nameEmpty}
+            title={nameEmpty ? "Please enter your name first" : "Send without a comment"}
+            className="flex-1 border border-[#e8dcc8] font-semibold py-3 rounded-xl hover:bg-[#fdf8f1] disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Skip
+            Skip comment
           </button>
           <button
             onClick={onSend}
-            disabled={!canSend}
-            className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl"
+            disabled={sending || nameEmpty}
+            title={nameEmpty ? "Please enter your name first" : "Send order"}
+            className="flex-1 bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold py-3 rounded-xl disabled:cursor-not-allowed"
           >
             {sending ? "Sending…" : "Send"}
           </button>
