@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { tomorrowISOInBakeryTimezone, bakeryMinutesNow } from "@/lib/sheets.server";
+import { assertActiveOrderLock, releaseActiveOrderLock } from "@/lib/orderLock.functions";
 
 function slugify(s: string) {
   const base = s
@@ -146,11 +147,13 @@ const SubmitOrderInput = z.object({
   forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   items: z.array(SubmitItem),
   message: z.string().optional().default(""),
+  lockToken: z.string().uuid(),
 });
 
 export const submitOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
+    await assertActiveOrderLock(data.slug, data.lockToken);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const {
       writeOrderQuantities,
@@ -167,6 +170,21 @@ export const submitOrder = createServerFn({ method: "POST" })
       .maybeSingle();
     if (cErr) throw cErr;
     if (!customer) throw new Error("Unknown customer");
+
+    // A waiting browser may still have loaded the page before the first person
+    // submitted. Never let that stale page overwrite column C as a second
+    // "new" order; it must refresh and submit through the add-on flow instead.
+    const { data: existingSubmission, error: existingErr } = await supabaseAdmin
+      .from("order_submissions")
+      .select("id")
+      .eq("customer_id", customer.id)
+      .eq("for_date", data.forDate)
+      .limit(1)
+      .maybeSingle();
+    if (existingErr) throw existingErr;
+    if (existingSubmission) {
+      throw new Error("An order has already been placed for this customer. Please refresh and use Add onto Prev Order.");
+    }
 
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
@@ -235,6 +253,7 @@ export const submitOrder = createServerFn({ method: "POST" })
       if (iErr) throw iErr;
     }
 
+    await releaseActiveOrderLock(data.slug, data.lockToken);
     return { ok: true, submissionId: submission.id, totalItems, insertedAny };
   });
 
@@ -243,6 +262,7 @@ export const submitOrder = createServerFn({ method: "POST" })
 export const changeOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
+    await assertActiveOrderLock(data.slug, data.lockToken);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const {
       readCustomerRows,
@@ -325,6 +345,7 @@ export const changeOrder = createServerFn({ method: "POST" })
       if (iErr) throw iErr;
     }
 
+    await releaseActiveOrderLock(data.slug, data.lockToken);
     return { ok: true, submissionId: submission.id, totalItems, insertedAny };
   });
 
@@ -333,6 +354,7 @@ export const changeOrder = createServerFn({ method: "POST" })
 export const addOnToOrder = createServerFn({ method: "POST" })
   .validator((d) => SubmitOrderInput.parse(d))
   .handler(async ({ data }) => {
+    await assertActiveOrderLock(data.slug, data.lockToken);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const {
       addOnQuantityToRow,
@@ -407,6 +429,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
       );
     }
 
+    await releaseActiveOrderLock(data.slug, data.lockToken);
     return { ok: true, submissionId: submission.id, totalItems };
   });
 
