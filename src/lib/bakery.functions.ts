@@ -155,6 +155,7 @@ export const submitOrder = createServerFn({ method: "POST" })
     const {
       writeOrderQuantities,
       writeLateOrderQuantities,
+      writeLateOrderQuantitiesToColumnC,
       insertCustomerProductRow,
       writeOrderComment,
     } = await import("@/lib/sheets.server");
@@ -186,7 +187,13 @@ export const submitOrder = createServerFn({ method: "POST" })
     }
 
     if (late) {
+      // K keeps the separate late-order tracking the LATE tab reads from;
+      // C now also gets the same quantity (highlighted red) so the
+      // kitchen's main total reflects it without checking a second tab.
       await writeLateOrderQuantities(
+        positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+      );
+      await writeLateOrderQuantitiesToColumnC(
         positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
       );
     } else {
@@ -330,6 +337,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
     const {
       addOnQuantityToRow,
       addLateOrderQuantityToRow,
+      addLateQuantityToColumnC,
       insertCustomerProductRow,
       writeOrderComment,
     } = await import("@/lib/sheets.server");
@@ -357,7 +365,12 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         item.sheetRow = newRow;
       }
       if (late) {
+        // Same split as the new-order path: K keeps the running late
+        // total for the LATE tab, C also gets it added (via the same
+        // F..Z add-on-column mechanism as a normal add-on, so it doesn't
+        // clobber any existing quantity), highlighted red.
         await addLateOrderQuantityToRow(item.sheetRow, item.quantity);
+        await addLateQuantityToColumnC(item.sheetRow, item.quantity);
       } else {
         await addOnQuantityToRow(item.sheetRow, item.quantity);
       }

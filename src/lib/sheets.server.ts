@@ -446,6 +446,82 @@ export async function addLateOrderQuantityToRow(
   ]);
 }
 
+// A clearly-red, still-legible-with-black-text fill (close to Material Red
+// 500 / #F44336) used to flag column C cells that include a late quantity.
+const LATE_ORDER_RED = { red: 0.96, green: 0.26, blue: 0.21 };
+
+/**
+ * Sets (or clears, passing color: null) the background fill on a batch of
+ * individual cells in one request. Only touches formatting — the `fields`
+ * mask is scoped to backgroundColor alone, so this never overwrites a
+ * cell's value or formula (important for column C, which is often a live
+ * SUM formula, not a plain number).
+ */
+async function setCellBackgroundColors(
+  cells: Array<{ row: number; col: string }>,
+  color: { red: number; green: number; blue: number } | null,
+) {
+  if (!cells.length) return;
+  const sheetId = await getCustomerSheetId();
+  const sheets = await getSheetsClient();
+  const requests = cells.map(({ row, col }) => {
+    const colIndex = col.toUpperCase().charCodeAt(0) - "A".charCodeAt(0);
+    return {
+      updateCells: {
+        range: {
+          sheetId,
+          startRowIndex: row - 1,
+          endRowIndex: row,
+          startColumnIndex: colIndex,
+          endColumnIndex: colIndex + 1,
+        },
+        rows: [{ values: [{ userEnteredFormat: { backgroundColor: color ?? { red: 1, green: 1, blue: 1 } } }] }],
+        fields: "userEnteredFormat.backgroundColor",
+      },
+    };
+  });
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: getActiveSheetId(),
+    requestBody: { requests },
+  });
+}
+
+/**
+ * Late orders now also land in column C (the main quantity total), in
+ * addition to column K — so the kitchen sees the real total to prepare
+ * without needing to separately check the LATE tab — but the C cell is
+ * highlighted red so it's still obvious at a glance which totals include
+ * a late addition. Used for brand-new late orders (submitOrder), where C
+ * hasn't been written yet today, so this is a plain overwrite exactly
+ * like writeOrderQuantities.
+ */
+export async function writeLateOrderQuantitiesToColumnC(
+  entries: Array<{ row: number; quantity: number }>,
+) {
+  if (!entries.length) return;
+  await writeOrderQuantities(entries);
+  await setCellBackgroundColors(
+    entries.filter((e) => e.quantity > 0).map((e) => ({ row: e.row, col: "C" })),
+    LATE_ORDER_RED,
+  );
+}
+
+/**
+ * Late ADD-ON quantity into column C: reuses the same F..Z add-on-column
+ * mechanism as addOnQuantityToRow (so it correctly adds on top of
+ * whatever's already in C via formula, rather than clobbering an existing
+ * on-time order or an earlier add-on that day), then highlights the C cell
+ * red the same way writeLateOrderQuantitiesToColumnC does.
+ */
+export async function addLateQuantityToColumnC(
+  row: number,
+  quantity: number,
+): Promise<void> {
+  if (quantity <= 0) return;
+  await addOnQuantityToRow(row, quantity);
+  await setCellBackgroundColors([{ row, col: "C" }], LATE_ORDER_RED);
+}
+
 /** Write arbitrary single-cell values. */
 export async function writeCells(
   entries: Array<{ range: string; value: string }>,
