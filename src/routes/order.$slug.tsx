@@ -2,7 +2,6 @@ import { createFileRoute, Link, notFound } from "@tanstack/react-router";
 import { useState, useMemo, useEffect, useRef } from "react";
 import { useSuspenseQuery, queryOptions, useQueryClient } from "@tanstack/react-query";
 import { getCustomerPage, listProducts, submitOrder, addOnToOrder, changeOrder } from "@/lib/bakery.functions";
-import { acquireOrderLock, releaseOrderLock } from "@/lib/orderLock.functions";
 import { primeAlertAudio, shoutAlert, stopAlert } from "@/lib/alertSound";
 import {
   pushSupported, getExistingSubscription, subscribeToPush, unsubscribeFromPush, subscriptionToKeys,
@@ -212,15 +211,6 @@ function OrderPage() {
   // Sender name — persisted across the session so they only type it once
   const [senderName, setSenderName] = useState("");
 
-  // Each open browser tab gets its own token. Postgres uses it to decide
-  // which tab owns the short-lived order-entry lease.
-  const lockTokenRef = useRef<string>("");
-  const ownsOrderLockRef = useRef(false);
-  const lockFinishedRef = useRef(false);
-  const waitedForLockRef = useRef(false);
-  const [orderLockState, setOrderLockState] = useState<"idle" | "checking" | "held" | "waiting" | "error">("checking");
-  const [orderLockError, setOrderLockError] = useState<string | null>(null);
-
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
   // --- "Orders closing soon" push reminders ---------------------------
@@ -362,86 +352,6 @@ function OrderPage() {
   const todayDow = new Date().getDay();
   const orderingBlocked = !!orderSchedule && !orderSchedule.days.includes(todayDow);
 
-  // A fresh order form needs the lock immediately. Once an order exists, the
-  // read-only "received" screen stays open to everyone and a lock is only
-  // requested when somebody chooses Add onto Prev Order.
-  const needsOrderLock = !orderingBlocked && (!todayOrder || mode === "addon" || showChangeForm);
-
-  useEffect(() => {
-    if (!needsOrderLock || lockFinishedRef.current) {
-      setOrderLockState("idle");
-      return;
-    }
-
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    // A new effect receives a new token, so a stale cleanup can never release
-    // a newer effect's lock (important under React Strict Mode).
-    const token = globalThis.crypto.randomUUID();
-    lockTokenRef.current = token;
-
-    async function checkLock() {
-      if (cancelled || lockFinishedRef.current) return;
-      try {
-        const result = await acquireOrderLock({ data: { slug, lockToken: token } });
-        if (cancelled) {
-          if (result.acquired) void releaseOrderLock({ data: { slug, lockToken: token } });
-          return;
-        }
-
-        if (result.acquired) {
-          ownsOrderLockRef.current = true;
-          setOrderLockError(null);
-
-          // If this tab had to wait, the previous person may have submitted a
-          // new order. Keep the waiting screen up while refreshing, then
-          // continue as an add-on instead of overwriting that order.
-          if (waitedForLockRef.current) {
-            waitedForLockRef.current = false;
-            setOrderLockState("checking");
-            await qc.invalidateQueries({ queryKey: ["customer-page", slug] });
-            const fresh = qc.getQueryData<NonNullable<typeof page>>(["customer-page", slug]);
-            if (fresh?.todayOrder) setMode("addon");
-          }
-          setOrderLockState("held");
-        } else {
-          ownsOrderLockRef.current = false;
-          waitedForLockRef.current = true;
-          setOrderLockState("waiting");
-        }
-      } catch (e) {
-        ownsOrderLockRef.current = false;
-        setOrderLockError(e instanceof Error ? e.message : "Could not check the order link.");
-        setOrderLockState("error");
-      }
-
-      if (!cancelled && !lockFinishedRef.current) {
-        timer = setTimeout(checkLock, ownsOrderLockRef.current ? 15_000 : 5_000);
-      }
-    }
-
-    setOrderLockState("checking");
-    void checkLock();
-
-    function checkWhenVisible() {
-      if (document.visibilityState === "visible") {
-        if (timer) clearTimeout(timer);
-        void checkLock();
-      }
-    }
-    document.addEventListener("visibilitychange", checkWhenVisible);
-
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-      document.removeEventListener("visibilitychange", checkWhenVisible);
-      if (ownsOrderLockRef.current) {
-        ownsOrderLockRef.current = false;
-        void releaseOrderLock({ data: { slug, lockToken: token } });
-      }
-    };
-  }, [needsOrderLock, qc, slug]);
-
   const regularProductIds = useMemo(
     () => new Set(regulars.map((r) => r.product?.id).filter(Boolean) as string[]),
     [regulars],
@@ -539,11 +449,6 @@ function OrderPage() {
   }
 
   async function handleSubmit(msg: string) {
-    if (!ownsOrderLockRef.current || orderLockState !== "held") {
-      setError("Someone else is currently using this order link. Please wait until it becomes available.");
-      return;
-    }
-
     setSubmitting(true); setError(null);
     try {
       const items = buildItems();
@@ -552,32 +457,18 @@ function OrderPage() {
         setSubmitting(false);
         return;
       }
-      // Build the full message: "Name: comment" or just "Name" if no comment.
+      // Build the full message: "Name: comment" or just "Name" if no comment
       const fullMessage = msg.trim()
         ? `${senderName.trim()}: ${msg.trim()}`
         : senderName.trim();
-      const lockToken = lockTokenRef.current;
 
       if (mode === "addon") {
-        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage, lockToken } });
+        await addOnToOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       } else if (showChangeForm) {
-        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage, lockToken } });
+        await changeOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       } else {
-        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage, lockToken } });
+        await submitOrder({ data: { slug, forDate: tomorrowISO(), items, message: fullMessage } });
       }
-
-      // Release immediately after a successful write so the next waiting
-      // person can refresh and submit an add-on.
-      lockFinishedRef.current = true;
-      ownsOrderLockRef.current = false;
-      try {
-        await releaseOrderLock({ data: { slug, lockToken } });
-      } catch (releaseError) {
-        // The order server function already releases the lock after a
-        // successful write. This second release is only a best-effort backup.
-        console.warn("Could not confirm order-lock release:", releaseError);
-      }
-      setOrderLockState("idle");
       setQty({});
       setMessage("");
       setMode("default");
@@ -585,12 +476,7 @@ function OrderPage() {
       setMessageModalSkipped(false);
       await qc.invalidateQueries({ queryKey: ["customer-page", slug] });
     } catch (e) {
-      const message = e instanceof Error ? e.message : "Could not submit the order.";
-      setError(message);
-      if (message.includes("already been placed")) {
-        await qc.invalidateQueries({ queryKey: ["customer-page", slug] });
-        setMode("addon");
-      }
+      setError((e as Error).message);
     } finally {
       setSubmitting(false);
     }
@@ -654,50 +540,6 @@ function OrderPage() {
     );
   }
 
-  // ===== Another person is currently using this link =====
-  if (needsOrderLock && orderLockState !== "held") {
-    const isChecking = orderLockState === "checking";
-    return (
-      <div className="min-h-screen bg-[#fdf8f1] flex items-center justify-center p-6">
-        <div className="bg-white rounded-3xl shadow-lg border border-[#e8dcc8] p-8 max-w-md w-full text-center">
-          <div className="w-16 h-16 rounded-full bg-amber-100 flex items-center justify-center mx-auto mb-4">
-            <svg className={`w-8 h-8 text-amber-600 ${isChecking ? "animate-spin" : ""}`} fill="none" stroke="currentColor" strokeWidth="2.5" viewBox="0 0 24 24">
-              {isChecking ? (
-                <path strokeLinecap="round" d="M12 3a9 9 0 109 9" />
-              ) : (
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-              )}
-            </svg>
-          </div>
-          <h1 className="text-2xl font-bold mb-2">
-            {isChecking ? "Checking order link…" : "Someone is busy ordering"}
-          </h1>
-          <p className="text-[#6b5544] mb-2">
-            Another person is currently using the order link for <strong>{customer.name}</strong>.
-          </p>
-          <p className="text-sm text-[#8b6f4e] mb-5">
-            Please wait for them to finish. This page checks automatically and will let you continue when the link is available.
-          </p>
-          <div className="flex items-center justify-center gap-2 text-sm font-semibold text-amber-700 bg-amber-50 rounded-xl py-3 px-4">
-            <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse" />
-            Waiting for the current order to finish…
-          </div>
-          {orderLockError && (
-            <div className="mt-4">
-              <p className="text-xs text-red-700 mb-2">{orderLockError}</p>
-              <button
-                onClick={() => window.location.reload()}
-                className="border border-[#e8dcc8] hover:bg-[#fdf8f1] font-semibold px-5 py-2.5 rounded-xl"
-              >
-                Try again
-              </button>
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
   // ===== Received-today screen =====
   if (todayOrder && mode === "default" && !showChangeForm) {
     return (
@@ -715,12 +557,7 @@ function OrderPage() {
           </p>
           <div className="flex flex-col gap-2 mt-2">
             <button
-              onClick={() => {
-                lockFinishedRef.current = false;
-                setOrderLockState("checking");
-                setMode("addon");
-                setQty({});
-              }}
+              onClick={() => { setMode("addon"); setQty({}); }}
               className="bg-[#c8362b] hover:bg-[#a82a22] text-white font-bold py-3 rounded-xl"
             >
               + Add onto Prev Order
