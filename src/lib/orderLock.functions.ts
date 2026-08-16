@@ -6,7 +6,7 @@ const LockInput = z.object({
   lockToken: z.string().uuid(),
 });
 
-const LEASE_SECONDS = 10;
+const LEASE_SECONDS = 60;
 
 function lockMigrationMissing(error: any) {
   const message = String(error?.message ?? "");
