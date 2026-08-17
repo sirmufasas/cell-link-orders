@@ -891,10 +891,16 @@ function MessageModal({
 }) {
   const nameEmpty = senderName.trim() === "";
 
-  function handleTextareaKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Tab") {
+  // Comment must always be a single line — block Tab (no indenting) and
+  // Enter (no newlines), and strip any \n/\t that sneak in via paste.
+  function handleCommentKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Tab" || e.key === "Enter") {
       e.preventDefault();
     }
+  }
+
+  function handleCommentChange(e: React.ChangeEvent<HTMLInputElement>) {
+    onChange(e.target.value.replace(/[\r\n\t]+/g, " "));
   }
 
   return (
@@ -928,18 +934,18 @@ function MessageModal({
           )}
         </label>
 
-        {/* Optional comment — Tab key blocked */}
+        {/* Optional comment — single line only, Tab and Enter blocked */}
         <label className="block mt-4 mb-1">
           <span className="text-xs font-bold uppercase tracking-wide text-[#2a1810]">
             Comment <span className="text-[#8b6f4e] font-normal">(optional)</span>
           </span>
-          <textarea
+          <input
+            type="text"
             value={value}
-            onChange={(e) => onChange(e.target.value)}
-            onKeyDown={handleTextareaKeyDown}
+            onChange={handleCommentChange}
+            onKeyDown={handleCommentKeyDown}
             placeholder="e.g. delivery time, special instructions…"
-            rows={3}
-            className="mt-1 w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b] resize-none"
+            className="mt-1 w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#c8362b]"
           />
         </label>
 

@@ -145,7 +145,14 @@ const SubmitOrderInput = z.object({
   slug: z.string().min(1),
   forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   items: z.array(SubmitItem),
-  message: z.string().optional().default(""),
+  // Comments must always come through as a single line — strip any
+  // newlines/tabs (e.g. from a paste) and collapse the resulting
+  // whitespace so nothing can indent or wrap in the sheet/admin view.
+  message: z
+    .string()
+    .optional()
+    .default("")
+    .transform((v) => v.replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim()),
 });
 
 export const submitOrder = createServerFn({ method: "POST" })
