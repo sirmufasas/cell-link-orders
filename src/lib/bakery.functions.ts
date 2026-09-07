@@ -218,7 +218,18 @@ export const submitOrder = createServerFn({ method: "POST" })
       .from("order_submissions")
       .insert({
         customer_id: customer.id,
-        for_date: data.forDate,
+        // Always the server's own "tomorrow" (bakery-timezone), never the
+        // client-supplied data.forDate. The client's own notion of
+        // "tomorrow" can drift from this — its clock/timezone isn't
+        // guaranteed to match the bakery's, and its UI-facing delivery
+        // label logic skips Sunday (Sat -> shows "Monday") for display
+        // purposes only. If the client's value were trusted here, an
+        // order could get saved under a different date than the one
+        // getCustomerPage looks it up with above, and the "you've already
+        // ordered" screen would silently never show up. Keeping one
+        // source of truth for this date on the server fixes that for
+        // good, regardless of what the client sends.
+        for_date: tomorrowISO(),
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: late ? "late" : "new",
@@ -308,7 +319,8 @@ export const changeOrder = createServerFn({ method: "POST" })
       .from("order_submissions")
       .insert({
         customer_id: customer.id,
-        for_date: data.forDate,
+        // Server-computed, not client-supplied — see submitOrder above.
+        for_date: tomorrowISO(),
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: "changed",
@@ -392,7 +404,8 @@ export const addOnToOrder = createServerFn({ method: "POST" })
       .from("order_submissions")
       .insert({
         customer_id: customer.id,
-        for_date: data.forDate,
+        // Server-computed, not client-supplied — see submitOrder above.
+        for_date: tomorrowISO(),
         total_items: totalItems,
         synced_to_sheet: true,
         order_type: late ? "late" : "added",
