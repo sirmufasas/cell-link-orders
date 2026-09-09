@@ -928,8 +928,10 @@ function EstimatesTab() {
     return items
       .filter((p) => {
         if (s && !p.name.toLowerCase().includes(s)) return false;
-        const current = valueFor(p.id, p.quantity);
-        if (anyHasValue && !showAll && current <= 0) return false;
+        // Visibility is based on the SAVED value, not the live edit —
+        // clearing a field to 0 shouldn't make the row disappear until
+        // Save is actually clicked (and the data is refetched).
+        if (anyHasValue && !showAll && p.quantity <= 0) return false;
         return true;
       })
       .sort((a, b) => {
@@ -1111,8 +1113,10 @@ function StocksTab() {
     return items
       .filter((p) => {
         if (s && !p.name.toLowerCase().includes(s)) return false;
-        const current = valueFor(p.id, p.quantity);
-        if (anyHasValue && !showAll && current <= 0) return false;
+        // Visibility is based on the SAVED value, not the live edit —
+        // clearing a field to 0 shouldn't make the row disappear until
+        // Save is actually clicked (and the data is refetched).
+        if (anyHasValue && !showAll && p.quantity <= 0) return false;
         return true;
       })
       .sort((a, b) => {
