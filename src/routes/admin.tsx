@@ -919,28 +919,25 @@ function EstimatesTab() {
 
   const valueFor = (id: number, original: number) => edits[id] ?? original;
 
-  // Filled-in products (using the LIVE value, so it reacts as you type) sort
-  // to the top and stay there — alphabetical within each group — so you
-  // never have to scroll to find something you just filled in, even with
-  // "Show all products" on.
+  // Position and visibility are both based on the SAVED value only — not
+  // the live edit — so nothing jumps or disappears while you're typing or
+  // clearing a field. Everything settles into its new spot only after Save
+  // actually completes and the data is refetched.
   const filtered = useMemo(() => {
     const s = search.trim().toLowerCase();
     return items
       .filter((p) => {
         if (s && !p.name.toLowerCase().includes(s)) return false;
-        // Visibility is based on the SAVED value, not the live edit —
-        // clearing a field to 0 shouldn't make the row disappear until
-        // Save is actually clicked (and the data is refetched).
         if (anyHasValue && !showAll && p.quantity <= 0) return false;
         return true;
       })
       .sort((a, b) => {
-        const aFilled = valueFor(a.id, a.quantity) > 0 ? 0 : 1;
-        const bFilled = valueFor(b.id, b.quantity) > 0 ? 0 : 1;
+        const aFilled = a.quantity > 0 ? 0 : 1;
+        const bFilled = b.quantity > 0 ? 0 : 1;
         if (aFilled !== bFilled) return aFilled - bFilled;
         return a.name.localeCompare(b.name);
       });
-  }, [items, search, showAll, anyHasValue, edits]);
+  }, [items, search, showAll, anyHasValue]);
 
   const changedCount = Object.keys(edits).length;
 
@@ -1104,28 +1101,25 @@ function StocksTab() {
 
   const valueFor = (id: number, original: number) => edits[id] ?? original;
 
-  // Filled-in products (using the LIVE value, so it reacts as you type) sort
-  // to the top and stay there — alphabetical within each group — so you
-  // never have to scroll to find something you just filled in, even with
-  // "Show all products" on.
+  // Position and visibility are both based on the SAVED value only — not
+  // the live edit — so nothing jumps or disappears while you're typing or
+  // clearing a field. Everything settles into its new spot only after Save
+  // actually completes and the data is refetched.
   const filtered = useMemo(() => {
     const s = search.trim().toLowerCase();
     return items
       .filter((p) => {
         if (s && !p.name.toLowerCase().includes(s)) return false;
-        // Visibility is based on the SAVED value, not the live edit —
-        // clearing a field to 0 shouldn't make the row disappear until
-        // Save is actually clicked (and the data is refetched).
         if (anyHasValue && !showAll && p.quantity <= 0) return false;
         return true;
       })
       .sort((a, b) => {
-        const aFilled = valueFor(a.id, a.quantity) > 0 ? 0 : 1;
-        const bFilled = valueFor(b.id, b.quantity) > 0 ? 0 : 1;
+        const aFilled = a.quantity > 0 ? 0 : 1;
+        const bFilled = b.quantity > 0 ? 0 : 1;
         if (aFilled !== bFilled) return aFilled - bFilled;
         return a.name.localeCompare(b.name);
       });
-  }, [items, search, showAll, anyHasValue, edits]);
+  }, [items, search, showAll, anyHasValue]);
 
   const changedCount = Object.keys(edits).length;
 
