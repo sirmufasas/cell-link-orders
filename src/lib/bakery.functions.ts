@@ -93,8 +93,10 @@ export const getCustomerPage = createServerFn({ method: "GET" })
       .order("sort_order", { ascending: true });
     if (cpErr) throw cpErr;
 
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    await supabaseAdmin.from("order_submissions").delete().lt("created_at", sevenDaysAgo);
+    const historyCutoffDate = new Date();
+    historyCutoffDate.setMonth(historyCutoffDate.getMonth() - 4);
+    const historyCutoff = historyCutoffDate.toISOString();
+    await supabaseAdmin.from("order_submissions").delete().lt("created_at", historyCutoff);
 
     const todayKey = tomorrowISO();
     const { data: todaySubs } = await supabaseAdmin
@@ -120,7 +122,7 @@ export const getCustomerPage = createServerFn({ method: "GET" })
         "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_name, quantity)",
       )
       .eq("customer_id", customer.id)
-      .gte("created_at", sevenDaysAgo)
+      .gte("created_at", historyCutoff)
       .order("created_at", { ascending: false });
 
     return {
