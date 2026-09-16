@@ -526,8 +526,13 @@ export const syncAllSheets = createServerFn({ method: "POST" }).handler(async ()
  * sheet's group, and customer_products rows are delete+reinserted scoped to
  * that group — so a sync from one sheet can never touch the other sheet's
  * data for shared customers.
+ *
+ * NOTE: keep this a PRIVATE function (no `export`). .functions.ts files
+ * are expected to only export server functions — a plain exported function
+ * makes the client build pull this whole module (and its server-only
+ * imports) into the browser bundle and the production build fails.
  */
-export async function runSheetSync(sheetId: string): Promise<{
+async function runSheetSync(sheetId: string): Promise<{
   customers: number;
   products: number;
   mappings: number;
