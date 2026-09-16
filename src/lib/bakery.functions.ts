@@ -584,10 +584,34 @@ async function runSheetSync(sheetId: string): Promise<{
     for (const p of ins ?? []) existingByName.set(p.name, p);
   }
   if (categoryUpdates.length) {
-    const { error: uErr } = await supabaseAdmin
-      .from("products")
-      .upsert(categoryUpdates, { onConflict: "id" });
-    if (uErr) throw uErr;
+    // Grouped batched UPDATE — deliberately NOT upsert: upsert's default
+    // (defaultToNull=true) re-sets every non-payload column (name,
+    // created_at, …) to NULL on conflict, which crashes on NOT NULL.
+    const nullIds: string[] = [];
+    const catIds = new Map<string, string[]>();
+    for (const u of categoryUpdates) {
+      if (u.category == null) {
+        nullIds.push(u.id);
+      } else {
+        const arr = catIds.get(u.category) ?? [];
+        arr.push(u.id);
+        catIds.set(u.category, arr);
+      }
+    }
+    if (nullIds.length) {
+      const { error } = await supabaseAdmin
+        .from("products")
+        .update({ category: null })
+        .in("id", nullIds);
+      if (error) throw error;
+    }
+    for (const [cat, ids] of catIds) {
+      const { error } = await supabaseAdmin
+        .from("products")
+        .update({ category: cat })
+        .in("id", ids);
+      if (error) throw error;
+    }
   }
 
   const seen = new Map<string, { driver: string | null; order: number }>();
@@ -648,10 +672,13 @@ async function runSheetSync(sheetId: string): Promise<{
     }));
     const batchSize = 500;
     for (let i = 0; i < assignmentRows.length; i += batchSize) {
+      // defaultToNull: false — otherwise the conflict-UPDATE would reset
+      // created_at (and any other non-payload column) to NULL.
       const { error: aErr } = await supabaseAdmin
         .from("customer_sheet_assignments")
         .upsert(assignmentRows.slice(i, i + batchSize), {
           onConflict: "customer_id,sheet_group_id",
+          defaultToNull: false,
         });
       if (aErr) throw aErr;
     }
@@ -661,9 +688,11 @@ async function runSheetSync(sheetId: string): Promise<{
       driver: seen.get(name)!.driver,
       sort_order: seen.get(name)!.order,
     }));
+    // defaultToNull: false — otherwise the conflict-UPDATE would reset
+    // name/slug/created_at to NULL on every existing row.
     const { error: gErr } = await supabaseAdmin
       .from("customers")
-      .upsert(globalRows, { onConflict: "id" });
+      .upsert(globalRows, { onConflict: "id", defaultToNull: false });
     if (gErr) throw gErr;
   }
 
