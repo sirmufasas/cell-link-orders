@@ -563,20 +563,31 @@ async function runSheetSync(sheetId: string): Promise<{
     .select("id, name, category, image_url");
   const existingByName = new Map((existingProducts ?? []).map((p) => [p.name, p]));
 
+  // Batched product writes (per-row inserts/updates made full-sheet syncs
+  // too slow for the 30s serverless request timeout).
+  const newProductRows: Array<{ name: string; category: string | null }> = [];
+  const categoryUpdates: Array<{ id: string; category: string | null }> = [];
   for (const [name, category] of productMap) {
     const ex = existingByName.get(name);
     if (ex) {
-      if ((ex.category ?? null) !== category) {
-        await supabaseAdmin.from("products").update({ category }).eq("id", ex.id);
-      }
+      if ((ex.category ?? null) !== category) categoryUpdates.push({ id: ex.id, category });
     } else {
-      const { data: ins } = await supabaseAdmin
-        .from("products")
-        .insert({ name, category })
-        .select("id, name, category, image_url")
-        .single();
-      if (ins) existingByName.set(name, ins);
+      newProductRows.push({ name, category });
     }
+  }
+  if (newProductRows.length) {
+    const { data: ins, error: insErr } = await supabaseAdmin
+      .from("products")
+      .insert(newProductRows)
+      .select("id, name, category, image_url");
+    if (insErr) throw insErr;
+    for (const p of ins ?? []) existingByName.set(p.name, p);
+  }
+  if (categoryUpdates.length) {
+    const { error: uErr } = await supabaseAdmin
+      .from("products")
+      .upsert(categoryUpdates, { onConflict: "id" });
+    if (uErr) throw uErr;
   }
 
   const seen = new Map<string, { driver: string | null; order: number }>();
@@ -594,72 +605,69 @@ async function runSheetSync(sheetId: string): Promise<{
   const existingByCName = new Map((existingCustomers ?? []).map((c) => [c.name, c]));
   const slugUsed = new Set<string>((existingCustomers ?? []).map((c) => c.slug));
 
-  // Existing per-sheet assignments for THIS group (customer name → row id).
-  let assignmentByCName = new Map<string, string>();
+  // New customers are inserted in ONE batch (per-row inserts made this too
+  // slow for the 30s serverless request timeout).
+  const newCustomerRows: Array<{ name: string; slug: string }> = [];
+  for (const [name] of seen) {
+    if (existingByCName.has(name)) continue;
+    let s = slugify(name);
+    const base = s;
+    let i = 2;
+    while (slugUsed.has(s)) s = `${base}-${i++}`;
+    slugUsed.add(s);
+    newCustomerRows.push({ name, slug: s });
+  }
+  if (newCustomerRows.length) {
+    const { data: ins, error: insErr } = await supabaseAdmin
+      .from("customers")
+      .insert(newCustomerRows)
+      .select("id, name, slug");
+    if (insErr) throw insErr;
+    for (const c of ins ?? []) existingByCName.set(c.name, c);
+  }
+
+  const seenNames = Array.from(seen.keys());
+  const missing = seenNames.filter((n) => !existingByCName.has(n));
+  if (missing.length) {
+    throw new Error(
+      `Sync could not create new customers: ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? "…" : ""}`,
+    );
+  }
+
+  // ── driver + sort_order, batched ──
+  // Per-sheet (customer_sheet_assignments) when the sheet-groups migration
+  // is applied; legacy global columns otherwise. Per-row UPDATEs here used
+  // to take ~30s for a full sheet and timed the serverless request out —
+  // which is what left customer_products wiped from a half-finished sync.
   if (groupId) {
-    const { data: existingAssignments } = await supabaseAdmin
-      .from("customer_sheet_assignments")
-      .select("id, customer:customers(name)")
-      .eq("sheet_group_id", groupId);
-    for (const a of existingAssignments ?? []) {
-      const n = (a as { customer?: { name?: string } }).customer?.name;
-      if (n) assignmentByCName.set(n, (a as { id: string }).id);
+    const assignmentRows = seenNames.map((name) => ({
+      customer_id: (existingByCName.get(name) as { id: string }).id,
+      sheet_group_id: groupId,
+      driver: seen.get(name)!.driver,
+      sort_order: seen.get(name)!.order,
+    }));
+    const batchSize = 500;
+    for (let i = 0; i < assignmentRows.length; i += batchSize) {
+      const { error: aErr } = await supabaseAdmin
+        .from("customer_sheet_assignments")
+        .upsert(assignmentRows.slice(i, i + batchSize), {
+          onConflict: "customer_id,sheet_group_id",
+        });
+      if (aErr) throw aErr;
     }
+  } else {
+    const globalRows = seenNames.map((name) => ({
+      id: (existingByCName.get(name) as { id: string }).id,
+      driver: seen.get(name)!.driver,
+      sort_order: seen.get(name)!.order,
+    }));
+    const { error: gErr } = await supabaseAdmin
+      .from("customers")
+      .upsert(globalRows, { onConflict: "id" });
+    if (gErr) throw gErr;
   }
 
-  let customersTouched = 0;
-  for (const [name, info] of seen) {
-    let customerId: string;
-    const ex = existingByCName.get(name);
-    if (ex) {
-      customerId = ex.id;
-    } else {
-      let s = slugify(name);
-      const base = s;
-      let i = 2;
-      while (slugUsed.has(s)) s = `${base}-${i++}`;
-      slugUsed.add(s);
-      const { data: ins } = await supabaseAdmin
-        .from("customers")
-        .insert({ name, slug: s })
-        .select("id, name, slug")
-        .single();
-      if (!ins) continue;
-      existingByCName.set(name, ins);
-      customerId = ins.id;
-    }
-
-    if (groupId) {
-      // Per-sheet driver + sort_order, for THIS sheet's group only.
-      // (The global customers.driver / customers.sort_order columns are
-      // deprecated — no longer written — but left in place for now.)
-      const assignId = assignmentByCName.get(name);
-      if (assignId) {
-        await supabaseAdmin
-          .from("customer_sheet_assignments")
-          .update({ driver: info.driver, sort_order: info.order })
-          .eq("id", assignId);
-      } else {
-        const { error: aErr } = await supabaseAdmin
-          .from("customer_sheet_assignments")
-          .insert({
-            customer_id: customerId,
-            sheet_group_id: groupId,
-            driver: info.driver,
-            sort_order: info.order,
-          });
-        if (aErr) console.error("customer_sheet_assignments insert failed:", aErr.message);
-      }
-    } else {
-      // Migration not applied yet — keep the old behavior (global columns)
-      // so nothing regresses before the SQL is run.
-      await supabaseAdmin
-        .from("customers")
-        .update({ driver: info.driver, sort_order: info.order })
-        .eq("id", customerId);
-    }
-    customersTouched += 1;
-  }
+  const customersTouched = seenNames.length;
 
   const cId = new Map(Array.from(existingByCName.entries()).map(([n, c]) => [n, c.id]));
   const pId = new Map(Array.from(existingByName.entries()).map(([n, p]) => [n, p.id]));
