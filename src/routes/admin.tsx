@@ -6,7 +6,7 @@ import {
   LineChart, Line,
 } from "recharts";
 import {
-  listCustomers, listSubmissions, syncFromSheet, analyticsOverview, ensureSeeded,
+  listCustomers, listSubmissions, syncAllSheets, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
   autoSyncIfStale,
@@ -527,8 +527,12 @@ function AdminPage() {
   async function handleSync() {
     setSyncing(true); setSyncMsg(null);
     try {
-      const r = await syncFromSheet();
-      setSyncMsg(`Synced ${r.customers} customers, ${r.products} products, ${r.mappings} rows from ${sheetInfo?.label ?? "sheet"}.`);
+      // Sync BOTH spreadsheets — the button isn't tied to an edit on one
+      // specific sheet, and each sync only touches its own sheet's data.
+      const r = await syncAllSheets();
+      setSyncMsg(
+        `Synced ${r.monWed.customers} customers / ${r.monWed.mappings} rows (Mon–Wed) and ${r.thuSat.customers} customers / ${r.thuSat.mappings} rows (Thu–Sat).`,
+      );
       qc.invalidateQueries({ queryKey: ["customers"] });
       qc.invalidateQueries({ queryKey: ["products"] });
     } catch (e) {

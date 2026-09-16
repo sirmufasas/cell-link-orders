@@ -22,6 +22,28 @@ function isLateOrder(): boolean {
   return bakeryMinutesNow() >= cutoff;
 }
 
+/**
+ * Returns the id of a sheet group row, or null if the sheet-groups
+ * migration hasn't been applied to the DB yet. Every code path that uses
+ * the new tables/columns checks this and degrades to the old behavior when
+ * it's null — so this code can be deployed before OR after the migration,
+ * in either order, without breaking.
+ */
+async function groupIdBySlug(slug: string): Promise<string | null> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data, error } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("id")
+      .eq("slug", slug)
+      .maybeSingle();
+    if (error) return null;
+    return data?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 const AUTO_SYNC_INTERVAL_MS = 2 * 60 * 1000;
 let lastAutoSyncAt = 0;
 let autoSyncInFlight: Promise<void> | null = null;
@@ -36,7 +58,8 @@ async function maybeAutoSync(): Promise<void> {
   }
 
   lastAutoSyncAt = now;
-  autoSyncInFlight = syncFromSheet()
+  const { getActiveSheetId } = await import("@/lib/sheets.server");
+  autoSyncInFlight = runSheetSync(getActiveSheetId())
     .then(() => undefined)
     .catch((err) => {
       lastAutoSyncAt = 0;
@@ -53,12 +76,23 @@ async function maybeAutoSync(): Promise<void> {
 
 export const listCustomers = createServerFn({ method: "GET" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { activeSheetGroupSlug } = await import("@/lib/sheets.server");
+  const activeGroupId = await groupIdBySlug(activeSheetGroupSlug());
+
   const { data, error } = await supabaseAdmin
     .from("customers")
-    .select("id, slug, name, driver, sort_order")
+    .select("id, slug, name, driver, sort_order, assignments:customer_sheet_assignments(sheet_group_id, driver)")
     .order("sort_order", { ascending: true });
   if (error) throw error;
-  return data ?? [];
+  if (!activeGroupId) return data ?? [];
+
+  // Show each customer's driver FOR THE ACTIVE SHEET (drivers are
+  // per-sheet now; the global customers.driver column is a deprecated
+  // fallback for any customer without an assignment yet).
+  return (data ?? []).map((c: any) => {
+    const active = (c.assignments ?? []).find((a: any) => a.sheet_group_id === activeGroupId);
+    return { ...c, driver: active?.driver ?? c.driver };
+  });
 });
 
 export const listProducts = createServerFn({ method: "GET" }).handler(async () => {
@@ -86,11 +120,18 @@ export const getCustomerPage = createServerFn({ method: "GET" })
     if (cErr) throw cErr;
     if (!customer) return null;
 
-    const { data: cps, error: cpErr } = await supabaseAdmin
+    // Scope the regulars to the sheet active for TOMORROW's delivery —
+    // otherwise a customer would see products from BOTH sheets (with the
+    // other sheet's row numbers) and order quantities could get written to
+    // the wrong physical rows.
+    const { activeSheetGroupSlug } = await import("@/lib/sheets.server");
+    const activeGroupId = await groupIdBySlug(activeSheetGroupSlug());
+    let cpQuery = supabaseAdmin
       .from("customer_products")
       .select("id, sheet_row, sort_order, product:products(id, name, category, image_url, ingredients)")
-      .eq("customer_id", customer.id)
-      .order("sort_order", { ascending: true });
+      .eq("customer_id", customer.id);
+    if (activeGroupId) cpQuery = cpQuery.eq("sheet_group_id", activeGroupId);
+    const { data: cps, error: cpErr } = await cpQuery.order("sort_order", { ascending: true });
     if (cpErr) throw cpErr;
 
     const historyCutoffDate = new Date();
@@ -216,10 +257,15 @@ export const submitOrder = createServerFn({ method: "POST" })
     }
 
     // ── message now saved to Supabase ──
+    // Tag the order with the sheet it came from (null until the
+    // sheet-groups migration is applied — history stays untouched either way).
+    const { activeSheetGroupSlug: activeSlug } = await import("@/lib/sheets.server");
+    const activeGroupId = await groupIdBySlug(activeSlug());
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
         customer_id: customer.id,
+        ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
         // Always the server's own "tomorrow" (bakery-timezone), never the
         // client-supplied data.forDate. The client's own notion of
         // "tomorrow" can drift from this — its clock/timezone isn't
@@ -317,10 +363,13 @@ export const changeOrder = createServerFn({ method: "POST" })
     }
 
     // ── message now saved to Supabase ──
+    const { activeSheetGroupSlug: activeSlug } = await import("@/lib/sheets.server");
+    const activeGroupId = await groupIdBySlug(activeSlug());
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
         customer_id: customer.id,
+        ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
         // Server-computed, not client-supplied — see submitOrder above.
         for_date: tomorrowISO(),
         total_items: totalItems,
@@ -402,10 +451,13 @@ export const addOnToOrder = createServerFn({ method: "POST" })
     }
 
     // ── message now saved to Supabase ──
+    const { activeSheetGroupSlug: activeSlug } = await import("@/lib/sheets.server");
+    const activeGroupId = await groupIdBySlug(activeSlug());
     const { data: submission, error: sErr } = await supabaseAdmin
       .from("order_submissions")
       .insert({
         customer_id: customer.id,
+        ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
         // Server-computed, not client-supplied — see submitOrder above.
         for_date: tomorrowISO(),
         total_items: totalItems,
@@ -434,12 +486,60 @@ export const addOnToOrder = createServerFn({ method: "POST" })
 
 // ============================== SYNC FROM SHEET ==============================
 
-export const syncFromSheet = createServerFn({ method: "POST" }).handler(async () => {
-  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { readCustomerRows, readProductRows } = await import("@/lib/sheets.server");
+export const syncFromSheet = createServerFn({ method: "POST" })
+  .validator((d) => {
+    // The Apps Script trigger now sends { spreadsheetId } — the sheet that
+    // was ACTUALLY edited. Older triggers sent 'null' (or nothing). Accept
+    // all of it and let resolveSyncSheet decide.
+    let parsed: unknown = d;
+    if (typeof d === "string") {
+      try { parsed = JSON.parse(d); } catch { parsed = null; }
+    }
+    return z
+      .object({ spreadsheetId: z.string().min(1).optional() })
+      .parse(parsed && typeof parsed === "object" ? parsed : {});
+  })
+  .handler(async ({ data }) => {
+    const { resolveSyncSheet } = await import("@/lib/sheets.server");
+    const { sheetId } = resolveSyncSheet(data.spreadsheetId);
+    return runSheetSync(sheetId);
+  });
 
-  const productRows = await readProductRows();
-  const customerRows = await readCustomerRows();
+/**
+ * Manual "Re-sync" (admin dashboard): syncs BOTH spreadsheets. The button
+ * isn't tied to an edit on a specific sheet, and each sync only touches its
+ * own sheet's data, so the two can't clash.
+ */
+export const syncAllSheets = createServerFn({ method: "POST" }).handler(async () => {
+  const { MON_WED_SHEET_ID, THU_SAT_SHEET_ID } = await import("@/lib/sheets.server");
+  const monWed = await runSheetSync(MON_WED_SHEET_ID);
+  const thuSat = await runSheetSync(THU_SAT_SHEET_ID);
+  return { monWed, thuSat };
+});
+
+/**
+ * The actual sync, shared by syncFromSheet (Apps Script trigger / explicit
+ * sheet) and syncAllSheets (admin button).
+ *
+ * Reads `sheetId` (one of the two physical spreadsheets). driver +
+ * sort_order are written to customer_sheet_assignments scoped to that
+ * sheet's group, and customer_products rows are delete+reinserted scoped to
+ * that group — so a sync from one sheet can never touch the other sheet's
+ * data for shared customers.
+ */
+export async function runSheetSync(sheetId: string): Promise<{
+  customers: number;
+  products: number;
+  mappings: number;
+}> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const { readCustomerRows, readProductRows, sheetGroupSlugFor } = await import("@/lib/sheets.server");
+
+  const groupSlug = sheetGroupSlugFor(sheetId) ?? "mon_tue_wed"; // only known IDs reach here
+  const groupId = await groupIdBySlug(groupSlug); // null until the migration is applied
+
+  const productRows = await readProductRows(sheetId);
+  const customerRows = await readCustomerRows(sheetId);
 
   const isSentinel = (s: string) => /insert products above/i.test(s);
   const productMap = new Map<string, string | null>();
@@ -485,18 +585,29 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
 
   const { data: existingCustomers } = await supabaseAdmin
     .from("customers")
-    .select("id, name, slug, driver");
+    .select("id, name, slug");
   const existingByCName = new Map((existingCustomers ?? []).map((c) => [c.name, c]));
   const slugUsed = new Set<string>((existingCustomers ?? []).map((c) => c.slug));
 
+  // Existing per-sheet assignments for THIS group (customer name → row id).
+  let assignmentByCName = new Map<string, string>();
+  if (groupId) {
+    const { data: existingAssignments } = await supabaseAdmin
+      .from("customer_sheet_assignments")
+      .select("id, customer:customers(name)")
+      .eq("sheet_group_id", groupId);
+    for (const a of existingAssignments ?? []) {
+      const n = (a as { customer?: { name?: string } }).customer?.name;
+      if (n) assignmentByCName.set(n, (a as { id: string }).id);
+    }
+  }
+
   let customersTouched = 0;
   for (const [name, info] of seen) {
+    let customerId: string;
     const ex = existingByCName.get(name);
     if (ex) {
-      await supabaseAdmin
-        .from("customers")
-        .update({ driver: info.driver, sort_order: info.order })
-        .eq("id", ex.id);
+      customerId = ex.id;
     } else {
       let s = slugify(name);
       const base = s;
@@ -505,10 +616,42 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
       slugUsed.add(s);
       const { data: ins } = await supabaseAdmin
         .from("customers")
-        .insert({ name, slug: s, driver: info.driver, sort_order: info.order })
-        .select("id, name, slug, driver")
+        .insert({ name, slug: s })
+        .select("id, name, slug")
         .single();
-      if (ins) existingByCName.set(name, ins);
+      if (!ins) continue;
+      existingByCName.set(name, ins);
+      customerId = ins.id;
+    }
+
+    if (groupId) {
+      // Per-sheet driver + sort_order, for THIS sheet's group only.
+      // (The global customers.driver / customers.sort_order columns are
+      // deprecated — no longer written — but left in place for now.)
+      const assignId = assignmentByCName.get(name);
+      if (assignId) {
+        await supabaseAdmin
+          .from("customer_sheet_assignments")
+          .update({ driver: info.driver, sort_order: info.order })
+          .eq("id", assignId);
+      } else {
+        const { error: aErr } = await supabaseAdmin
+          .from("customer_sheet_assignments")
+          .insert({
+            customer_id: customerId,
+            sheet_group_id: groupId,
+            driver: info.driver,
+            sort_order: info.order,
+          });
+        if (aErr) console.error("customer_sheet_assignments insert failed:", aErr.message);
+      }
+    } else {
+      // Migration not applied yet — keep the old behavior (global columns)
+      // so nothing regresses before the SQL is run.
+      await supabaseAdmin
+        .from("customers")
+        .update({ driver: info.driver, sort_order: info.order })
+        .eq("id", customerId);
     }
     customersTouched += 1;
   }
@@ -543,12 +686,23 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
 
   if (cpPayload.length) {
     const customerIds = Array.from(new Set(cpPayload.map((x) => x.customer_id)));
-    await supabaseAdmin.from("customer_products").delete().in("customer_id", customerIds);
+    let del = supabaseAdmin
+      .from("customer_products")
+      .delete()
+      .in("customer_id", customerIds);
+    // Scope the wipe to THIS sheet's group, so the other sheet's row
+    // mappings for shared customers stay intact.
+    if (groupId) del = del.eq("sheet_group_id", groupId);
+    await del;
+
+    const rows = groupId
+      ? cpPayload.map((x) => ({ ...x, sheet_group_id: groupId }))
+      : cpPayload;
     const batchSize = 500;
-    for (let i = 0; i < cpPayload.length; i += batchSize) {
+    for (let i = 0; i < rows.length; i += batchSize) {
       const { error } = await supabaseAdmin
         .from("customer_products")
-        .insert(cpPayload.slice(i, i + batchSize));
+        .insert(rows.slice(i, i + batchSize));
       if (error) throw error;
     }
   }
@@ -558,7 +712,7 @@ export const syncFromSheet = createServerFn({ method: "POST" }).handler(async ()
     products: productMap.size,
     mappings: cpPayload.length,
   };
-});
+}
 
 export const ensureSeeded = createServerFn({ method: "GET" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -566,7 +720,11 @@ export const ensureSeeded = createServerFn({ method: "GET" }).handler(async () =
     .from("customers")
     .select("id", { count: "exact", head: true });
   if ((count ?? 0) > 0) return { seeded: false };
-  await syncFromSheet();
+  // Seed from BOTH spreadsheets — customers that only order on one side of
+  // the week exist on only one of the sheets.
+  const { MON_WED_SHEET_ID, THU_SAT_SHEET_ID } = await import("@/lib/sheets.server");
+  await runSheetSync(MON_WED_SHEET_ID);
+  await runSheetSync(THU_SAT_SHEET_ID);
   return { seeded: true };
 });
 
@@ -795,10 +953,33 @@ export const exportOrdersForDate = createServerFn({ method: "GET" })
       .order("created_at", { ascending: true });
     if (error) throw error;
 
+    // Which sheet does this DELIVERY day belong to? Same rule as
+    // getActiveSheetId: delivery on Thu/Fri/Sat → Thu–Sat sheet.
+    const dow = new Date(`${data.forDate}T00:00:00Z`).getUTCDay(); // 0=Sun..6=Sat
+    const groupSlug = dow === 4 || dow === 5 || dow === 6 ? "thu_fri_sat" : "mon_tue_wed";
+    const groupId = await groupIdBySlug(groupSlug);
+
+    // Driver for each customer ON THAT SHEET (drivers are per-sheet now;
+    // falls back to the deprecated global customers.driver when there's no
+    // per-sheet assignment for the customer).
+    const driverByCustomer = new Map<string, string>();
+    if (groupId) {
+      const { data: assigns } = await supabaseAdmin
+        .from("customer_sheet_assignments")
+        .select("driver, customer:customers(id, name)")
+        .eq("sheet_group_id", groupId);
+      for (const a of assigns ?? []) {
+        const n = (a as any).customer?.name;
+        if (n) driverByCustomer.set(n, (a as any).driver ?? "");
+      }
+    }
+
     const rows: ExportOrderRow[] = [];
     for (const s of subs ?? []) {
       const customerName = s.customer?.name ?? "—";
-      const driver = s.customer?.driver ?? "";
+      const driver = driverByCustomer.has(customerName)
+        ? driverByCustomer.get(customerName)!
+        : s.customer?.driver ?? "";
       const message = s.message ?? "";
       const itemList = s.items ?? [];
 
@@ -882,11 +1063,27 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
       .single();
     if (cErr) throw cErr;
 
+    // The rows were appended to the ACTIVE sheet — tag the mapping with
+    // that sheet's group and record the per-sheet driver assignment.
+    const { activeSheetGroupSlug } = await import("@/lib/sheets.server");
+    const activeGroupId = await groupIdBySlug(activeSheetGroupSlug());
+    if (activeGroupId) {
+      await supabaseAdmin
+        .from("customer_sheet_assignments")
+        .insert({
+          customer_id: newCustomer.id,
+          sheet_group_id: activeGroupId,
+          driver: data.driver,
+          sort_order: 9999,
+        });
+    }
+
     const cpRows = products.map((p, idx) => ({
       customer_id: newCustomer.id,
       product_id: p.id,
       sheet_row: startRow + idx,
       sort_order: idx + 1,
+      ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
     }));
     const { error: cpErr } = await supabaseAdmin.from("customer_products").insert(cpRows);
     if (cpErr) throw cpErr;
@@ -914,7 +1111,7 @@ const SaveDriverInput = z.object({
 export const saveCustomerDriver = createServerFn({ method: "POST" })
   .validator((d) => SaveDriverInput.parse(d))
   .handler(async ({ data }) => {
-    const { writeCustomerDriver } = await import("@/lib/sheets.server");
+    const { writeCustomerDriver, activeSheetGroupSlug } = await import("@/lib/sheets.server");
     const rowsUpdated = await writeCustomerDriver(data.customerName, data.driver);
     if (rowsUpdated === 0) {
       throw new Error(`No sheet rows found for customer "${data.customerName}"`);
@@ -926,6 +1123,35 @@ export const saveCustomerDriver = createServerFn({ method: "POST" })
         .from("customers")
         .update({ driver: data.driver })
         .eq("name", data.customerName);
+
+      // Also update the per-sheet assignment for the ACTIVE sheet (the
+      // sheet writeCustomerDriver just wrote to).
+      const groupId = await groupIdBySlug(activeSheetGroupSlug());
+      if (groupId) {
+        const { data: cRow } = await supabaseAdmin
+          .from("customers")
+          .select("id")
+          .eq("name", data.customerName)
+          .maybeSingle();
+        if (cRow) {
+          const { data: existing } = await supabaseAdmin
+            .from("customer_sheet_assignments")
+            .select("id")
+            .eq("customer_id", cRow.id)
+            .eq("sheet_group_id", groupId)
+            .maybeSingle();
+          if (existing) {
+            await supabaseAdmin
+              .from("customer_sheet_assignments")
+              .update({ driver: data.driver })
+              .eq("id", existing.id);
+          } else {
+            await supabaseAdmin
+              .from("customer_sheet_assignments")
+              .insert({ customer_id: cRow.id, sheet_group_id: groupId, driver: data.driver });
+          }
+        }
+      }
     } catch {
       // non-fatal
     }

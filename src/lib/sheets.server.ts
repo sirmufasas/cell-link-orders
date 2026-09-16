@@ -134,6 +134,48 @@ export function getActiveSheetUrl(): string {
   return `https://docs.google.com/spreadsheets/d/${getActiveSheetId()}/edit`;
 }
 
+// ============================== SHEET GROUPS ==============================
+// The two physical spreadsheets have their OWN row layouts, drivers and
+// sort orders. Supabase stores those facts per "sheet group" (see the
+// sheet_groups / customer_sheet_assignments migration), so a sync from one
+// sheet can never overwrite the other sheet's data.
+
+export type SheetGroupSlug = "mon_tue_wed" | "thu_fri_sat";
+
+/** Map a spreadsheet ID to its sheet group. Unknown IDs return null. */
+export function sheetGroupSlugFor(spreadsheetId: string): SheetGroupSlug | null {
+  if (spreadsheetId === MON_WED_SHEET_ID) return "mon_tue_wed";
+  if (spreadsheetId === THU_SAT_SHEET_ID) return "thu_fri_sat";
+  return null;
+}
+
+/** The sheet group active for TOMORROW's delivery day (date-based). */
+export function activeSheetGroupSlug(): SheetGroupSlug {
+  return sheetGroupSlugFor(getActiveSheetId())!;
+}
+
+/**
+ * Resolve which spreadsheet a sync should read from.
+ *
+ * `inboundId` is the spreadsheet ID sent by the Apps Script trigger — the
+ * sheet that was ACTUALLY edited. Unknown or missing IDs fall back to the
+ * date-based active sheet (what the app used to do).
+ */
+export function resolveSyncSheet(
+  inboundId?: string | null,
+): { sheetId: string; groupSlug: SheetGroupSlug } {
+  if (inboundId) {
+    const id = inboundId.trim();
+    const slug = sheetGroupSlugFor(id);
+    if (slug) return { sheetId: id, groupSlug: slug };
+    console.warn(
+      `[bakery] Unknown spreadsheetId "${inboundId}" — falling back to the date-based active sheet.`,
+    );
+  }
+  const sheetId = getActiveSheetId();
+  return { sheetId, groupSlug: sheetGroupSlugFor(sheetId)! };
+}
+
 // ============================== TAB NAMES ==============================
 
 const TAB_CUSTOMERS = "Customer Order Details";
@@ -210,19 +252,23 @@ async function getSheetsClient() {
 
 // ============================== READS ==============================
 
-export async function readCustomerRows(): Promise<string[][]> {
+export async function readCustomerRows(
+  sheetId: string = getActiveSheetId(),
+): Promise<string[][]> {
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: getActiveSheetId(),
+    spreadsheetId: sheetId,
     range: `${TAB_CUSTOMERS}!A1:E2000`,
   });
   return (res.data.values as string[][]) ?? [];
 }
 
-export async function readProductRows(): Promise<string[][]> {
+export async function readProductRows(
+  sheetId: string = getActiveSheetId(),
+): Promise<string[][]> {
   const sheets = await getSheetsClient();
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: getActiveSheetId(),
+    spreadsheetId: sheetId,
     range: `${TAB_PRODUCTS}!A1:B2000`,
   });
   return (res.data.values as string[][]) ?? [];
