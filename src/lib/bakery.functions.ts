@@ -870,11 +870,18 @@ async function runSheetSync(sheetId: string): Promise<{
 
   // Always keep customers.driver and customers.sort_order in sync too so
   // no customer is left with sort_order=0 floating to the top of Admin.
-  const globalRows = seenKeys.map((key) => ({
-    id: (existingByKey.get(key) as { id: string }).id,
-    driver: seen.get(key)!.driver,
-    sort_order: seen.get(key)!.order,
-  }));
+  // Include name + slug because Postgres evaluates NOT NULL constraints on
+  // the INSERT tuple before ON CONFLICT (id) DO UPDATE runs.
+  const globalRows = seenKeys.map((key) => {
+    const ex = existingByKey.get(key) as { id: string; name: string; slug: string };
+    return {
+      id: ex.id,
+      name: ex.name,
+      slug: ex.slug,
+      driver: seen.get(key)!.driver,
+      sort_order: seen.get(key)!.order,
+    };
+  });
   if (globalRows.length) {
     const { error: gErr } = await supabaseAdmin
       .from("customers")
