@@ -616,6 +616,10 @@ export async function writeSectionColumn(
   );
 }
 
+function normCustomerKey(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 /**
  * Write a new driver name into column D of "Customer Order Details" for
  * EVERY row belonging to this customer on the active (day-based) sheet.
@@ -626,9 +630,10 @@ export async function writeCustomerDriver(
   driver: string,
 ): Promise<number> {
   const all = await readCustomerRows();
+  const target = normCustomerKey(customerName);
   const rows: number[] = [];
   for (let i = 1; i < all.length; i++) {
-    if ((all[i]?.[0] ?? "").trim() === customerName) rows.push(i + 1);
+    if (normCustomerKey(all[i]?.[0] ?? "") === target) rows.push(i + 1);
   }
   if (!rows.length) return 0;
 
@@ -702,9 +707,10 @@ export async function insertCustomerProductRow(opts: {
   quantity: number;
 }): Promise<number> {
   const all = await readCustomerRows();
+  const target = normCustomerKey(opts.customerName);
   let lastRow1 = -1; // 1-based
   for (let i = 1; i < all.length; i++) {
-    if ((all[i]?.[0] ?? "").trim() === opts.customerName) lastRow1 = i + 1;
+    if (normCustomerKey(all[i]?.[0] ?? "") === target) lastRow1 = i + 1;
   }
   if (lastRow1 < 0) {
     // Customer doesn't exist yet — append at bottom

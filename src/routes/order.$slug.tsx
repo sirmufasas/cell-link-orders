@@ -16,6 +16,10 @@ const customerPageQuery = (slug: string) =>
   queryOptions({
     queryKey: ["customer-page", slug],
     queryFn: () => getCustomerPage({ data: { slug } }),
+    staleTime: 0,
+    refetchOnMount: "always",
+    refetchOnWindowFocus: "always",
+    refetchOnReconnect: "always",
   });
 
 const allProductsQuery = queryOptions({
@@ -57,8 +61,24 @@ function getNextDeliveryDate(): Date {
   d.setDate(d.getDate() + addDays);
   return d;
 }
-function tomorrowISO() {
-  return getNextDeliveryDate().toISOString().slice(0, 10);
+
+/**
+ * Tomorrow's YYYY-MM-DD in Africa/Johannesburg timezone, matching
+ * tomorrowISOInBakeryTimezone() on the server (used for order_submissions.for_date).
+ */
+function tomorrowISO(): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Africa/Johannesburg",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "0";
+  const year = parseInt(get("year"), 10);
+  const month = parseInt(get("month"), 10);
+  const day = parseInt(get("day"), 10);
+  const tomorrow = new Date(Date.UTC(year, month - 1, day + 1));
+  return tomorrow.toISOString().slice(0, 10);
 }
 function tomorrowLabel() {
   return getNextDeliveryDate().toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
@@ -170,9 +190,59 @@ function OrderPage() {
   const { data: page } = useSuspenseQuery(customerPageQuery(slug));
   const customer = page!.customer;
   const regularsAll = page!.regulars;
-  const todayOrder = page!.todayOrder;
+  const rawTodayOrder = page!.todayOrder;
   const hasPriorOrders = page!.hasPriorOrders;
   const history = page!.history;
+
+  // Track the current target delivery date in state so if a customer leaves
+  // their tab or installed Home Screen PWA open overnight, the component
+  // immediately detects that rawTodayOrder.for_date is from yesterday,
+  // drops the stale "Your order has been received!" screen, and refetches.
+  const [currentDeliveryISO, setCurrentDeliveryISO] = useState(() => tomorrowISO());
+
+  useEffect(() => {
+    function refreshPageData() {
+      const latestISO = tomorrowISO();
+      setCurrentDeliveryISO((prev) => (prev !== latestISO ? latestISO : prev));
+      void qc.invalidateQueries({ queryKey: ["customer-page", slug] });
+    }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        refreshPageData();
+      }
+    }
+
+    window.addEventListener("focus", refreshPageData);
+    window.addEventListener("pageshow", refreshPageData);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    // Also check every 60s in case the tab stays open across midnight
+    const interval = setInterval(() => {
+      const latestISO = tomorrowISO();
+      setCurrentDeliveryISO((prev) => {
+        if (prev !== latestISO) {
+          void qc.invalidateQueries({ queryKey: ["customer-page", slug] });
+          return latestISO;
+        }
+        return prev;
+      });
+    }, 60_000);
+
+    return () => {
+      window.removeEventListener("focus", refreshPageData);
+      window.removeEventListener("pageshow", refreshPageData);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clearInterval(interval);
+    };
+  }, [qc, slug]);
+
+  // Only treat todayOrder as active if its for_date matches the current
+  // delivery date (never lock the screen on a leftover order from yesterday).
+  const todayOrder =
+    rawTodayOrder && rawTodayOrder.for_date === currentDeliveryISO
+      ? rawTodayOrder
+      : null;
 
   // Save this customer's slug so the homepage can redirect them back here
   useEffect(() => {
@@ -581,6 +651,15 @@ function OrderPage() {
               className="border border-[#e8dcc8] hover:bg-[#fdf8f1] font-semibold py-3 rounded-xl"
             >
               History
+            </button>
+            <button
+              onClick={() => {
+                setCurrentDeliveryISO(tomorrowISO());
+                void qc.invalidateQueries({ queryKey: ["customer-page", slug] });
+              }}
+              className="text-xs text-[#8b6f4e] hover:text-[#2a1810] underline pt-1"
+            >
+              ↻ Refresh page
             </button>
           </div>
         </div>

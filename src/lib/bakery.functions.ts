@@ -10,6 +10,16 @@ function slugify(s: string) {
   return base || "x";
 }
 
+/**
+ * Case-, whitespace-, and punctuation-insensitive customer key so minor
+ * differences between sheets (e.g. "HOLY  FAMILY" vs "HOLY FAMILY",
+ * "FOOD MANIA" vs "FOODMANIA", "MICHELLE CHURCH" vs "Michelle Church",
+ * "CHIP World" vs "Chip World") always resolve to a single customer.
+ */
+function normCustomerKey(s: string) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 function tomorrowISO(): string {
   return tomorrowISOInBakeryTimezone();
 }
@@ -81,18 +91,26 @@ export const listCustomers = createServerFn({ method: "GET" }).handler(async () 
 
   const { data, error } = await supabaseAdmin
     .from("customers")
-    .select("id, slug, name, driver, sort_order, assignments:customer_sheet_assignments(sheet_group_id, driver)")
+    .select("id, slug, name, driver, sort_order, assignments:customer_sheet_assignments(sheet_group_id, driver, sort_order)")
     .order("sort_order", { ascending: true });
   if (error) throw error;
   if (!activeGroupId) return data ?? [];
 
-  // Show each customer's driver FOR THE ACTIVE SHEET (drivers are
-  // per-sheet now; the global customers.driver column is a deprecated
-  // fallback for any customer without an assignment yet).
-  return (data ?? []).map((c: any) => {
-    const active = (c.assignments ?? []).find((a: any) => a.sheet_group_id === activeGroupId);
-    return { ...c, driver: active?.driver ?? c.driver };
-  });
+  // Show each customer's driver and sort_order FOR THE ACTIVE SHEET (drivers
+  // and sort_order are per-sheet now; if a customer only exists on the other
+  // sheet, fall back to that sheet's assignment so they stay in their natural
+  // sheet position instead of floating to the top at sort_order=0).
+  return (data ?? [])
+    .map((c: any) => {
+      const active = (c.assignments ?? []).find((a: any) => a.sheet_group_id === activeGroupId);
+      const other = (c.assignments ?? []).find((a: any) => a.sheet_group_id !== activeGroupId);
+      return {
+        ...c,
+        driver: active?.driver ?? other?.driver ?? c.driver,
+        sort_order: active?.sort_order ?? other?.sort_order ?? (c.sort_order || 9999),
+      };
+    })
+    .sort((a: any, b: any) => (a.sort_order ?? 9999) - (b.sort_order ?? 9999) || a.name.localeCompare(b.name));
 });
 
 export const listProducts = createServerFn({ method: "GET" }).handler(async () => {
@@ -124,14 +142,31 @@ export const getCustomerPage = createServerFn({ method: "GET" })
     // otherwise a customer would see products from BOTH sheets (with the
     // other sheet's row numbers) and order quantities could get written to
     // the wrong physical rows.
+    // Also include any duplicate customer records whose name normalizes to
+    // the same key (e.g. "HOLY  FAMILY" vs "HOLY FAMILY", "CHIP World" vs
+    // "Chip World") so bookmarked links never show an empty product list.
     const { activeSheetGroupSlug } = await import("@/lib/sheets.server");
     const activeGroupId = await groupIdBySlug(activeSheetGroupSlug());
+    const baseSlug = slugify(customer.name);
+    const { data: siblingCustomers } = await supabaseAdmin
+      .from("customers")
+      .select("id, name")
+      .ilike("slug", `${baseSlug}%`);
+    const customerIds = Array.from(
+      new Set([
+        customer.id,
+        ...(siblingCustomers ?? [])
+          .filter((c) => normCustomerKey(c.name) === normCustomerKey(customer.name))
+          .map((c) => c.id),
+      ]),
+    );
+
     let cpQuery = supabaseAdmin
       .from("customer_products")
       .select("id, sheet_row, sort_order, product:products(id, name, category, image_url, ingredients)")
-      .eq("customer_id", customer.id);
+      .in("customer_id", customerIds);
     if (activeGroupId) cpQuery = cpQuery.eq("sheet_group_id", activeGroupId);
-    const { data: cps, error: cpErr } = await cpQuery.order("sort_order", { ascending: true });
+    const { data: cps, error: cpErr } = await cpQuery.order("sheet_row", { ascending: true });
     if (cpErr) throw cpErr;
 
     const historyCutoffDate = new Date();
@@ -327,9 +362,10 @@ export const changeOrder = createServerFn({ method: "POST" })
     if (!customer) throw new Error("Unknown customer");
 
     const allRows = await readCustomerRows();
+    const targetKey = normCustomerKey(customer.name);
     const customerRowNumbers: number[] = [];
     for (let i = 1; i < allRows.length; i++) {
-      if ((allRows[i]?.[0] ?? "").trim() === customer.name) {
+      if (normCustomerKey(allRows[i]?.[0] ?? "") === targetKey) {
         customerRowNumbers.push(i + 1);
       }
     }
@@ -405,6 +441,9 @@ export const addOnToOrder = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const {
+      writeOrderQuantities,
+      writeLateOrderQuantities,
+      writeLateOrderQuantitiesToColumnC,
       addOnQuantityToRow,
       addLateOrderQuantityToRow,
       addLateQuantityToColumnC,
@@ -424,25 +463,63 @@ export const addOnToOrder = createServerFn({ method: "POST" })
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
     const message = data.message.trim();
     const late = isLateOrder();
+    const targetDate = tomorrowISO();
 
-    for (const item of positive) {
-      if (item.sheetRow === 0) {
-        const newRow = await insertCustomerProductRow({
-          customerName: customer.name,
-          productName: item.productName,
-          quantity: 0,
-        });
-        item.sheetRow = newRow;
+    // Guard against stale client tabs: if the customer tapped "+ Add onto
+    // Prev Order" from a cached screen left open from yesterday, and they
+    // don't actually have an order for `targetDate` yet, treat this as a
+    // brand-new order for today so we overwrite Column C cleanly instead of
+    // adding onto yesterday's leftover sheet quantities.
+    const { count: existingTodayCount } = await supabaseAdmin
+      .from("order_submissions")
+      .select("id", { count: "exact", head: true })
+      .eq("customer_id", customer.id)
+      .eq("for_date", targetDate);
+    const hasOrderForToday = (existingTodayCount ?? 0) > 0;
+
+    if (!hasOrderForToday) {
+      for (const item of positive) {
+        if (item.sheetRow === 0) {
+          const newRow = await insertCustomerProductRow({
+            customerName: customer.name,
+            productName: item.productName,
+            quantity: late ? 0 : item.quantity,
+          });
+          item.sheetRow = newRow;
+        }
       }
       if (late) {
-        // Same split as the new-order path: K keeps the running late
-        // total for the LATE tab, C also gets it added (via the same
-        // F..Z add-on-column mechanism as a normal add-on, so it doesn't
-        // clobber any existing quantity), highlighted red.
-        await addLateOrderQuantityToRow(item.sheetRow, item.quantity);
-        await addLateQuantityToColumnC(item.sheetRow, item.quantity);
+        await writeLateOrderQuantities(
+          positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+        );
+        await writeLateOrderQuantitiesToColumnC(
+          positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+        );
       } else {
-        await addOnQuantityToRow(item.sheetRow, item.quantity);
+        await writeOrderQuantities(
+          positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+        );
+      }
+    } else {
+      for (const item of positive) {
+        if (item.sheetRow === 0) {
+          const newRow = await insertCustomerProductRow({
+            customerName: customer.name,
+            productName: item.productName,
+            quantity: 0,
+          });
+          item.sheetRow = newRow;
+        }
+        if (late) {
+          // Same split as the new-order path: K keeps the running late
+          // total for the LATE tab, C also gets it added (via the same
+          // F..Z add-on-column mechanism as a normal add-on, so it doesn't
+          // clobber any existing quantity), highlighted red.
+          await addLateOrderQuantityToRow(item.sheetRow, item.quantity);
+          await addLateQuantityToColumnC(item.sheetRow, item.quantity);
+        } else {
+          await addOnQuantityToRow(item.sheetRow, item.quantity);
+        }
       }
     }
 
@@ -459,10 +536,10 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         customer_id: customer.id,
         ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
         // Server-computed, not client-supplied — see submitOrder above.
-        for_date: tomorrowISO(),
+        for_date: targetDate,
         total_items: totalItems,
         synced_to_sheet: true,
-        order_type: late ? "late" : "added",
+        order_type: late ? "late" : hasOrderForToday ? "added" : "new",
         message,
       })
       .select("id")
@@ -508,14 +585,78 @@ export const syncFromSheet = createServerFn({ method: "POST" })
 /**
  * Manual "Re-sync" (admin dashboard): syncs BOTH spreadsheets. The button
  * isn't tied to an edit on a specific sheet, and each sync only touches its
- * own sheet's data, so the two can't clash.
+ * own sheet's data, so the two can't clash. Also deduplicates and removes
+ * any stale customer records that are no longer present on either sheet.
  */
 export const syncAllSheets = createServerFn({ method: "POST" }).handler(async () => {
-  const { MON_WED_SHEET_ID, THU_SAT_SHEET_ID } = await import("@/lib/sheets.server");
-  const monWed = await runSheetSync(MON_WED_SHEET_ID);
-  const thuSat = await runSheetSync(THU_SAT_SHEET_ID);
-  return { monWed, thuSat };
+  const { MON_WED_SHEET_ID, THU_SAT_SHEET_ID, getActiveSheetId } = await import("@/lib/sheets.server");
+  const activeId = getActiveSheetId();
+  let monWed: Awaited<ReturnType<typeof runSheetSync>>;
+  let thuSat: Awaited<ReturnType<typeof runSheetSync>>;
+  if (activeId === MON_WED_SHEET_ID) {
+    thuSat = await runSheetSync(THU_SAT_SHEET_ID);
+    monWed = await runSheetSync(MON_WED_SHEET_ID);
+  } else {
+    monWed = await runSheetSync(MON_WED_SHEET_ID);
+    thuSat = await runSheetSync(THU_SAT_SHEET_ID);
+  }
+  await cleanupDuplicateAndOrphanCustomers([
+    ...monWed.activeCustomerIds,
+    ...thuSat.activeCustomerIds,
+  ]);
+  return {
+    monWed: { customers: monWed.customers, products: monWed.products, mappings: monWed.mappings },
+    thuSat: { customers: thuSat.customers, products: thuSat.products, mappings: thuSat.mappings },
+  };
 });
+
+/**
+ * Merges duplicate customer rows (same normalized key) into the canonical
+ * customer row and deletes any customer records not present on either sheet.
+ */
+async function cleanupDuplicateAndOrphanCustomers(activeIds: string[]): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const activeSet = new Set(activeIds);
+  const { data: allCustomers } = await supabaseAdmin
+    .from("customers")
+    .select("id, name, slug");
+  if (!allCustomers?.length) return;
+
+  const canonicalByKey = new Map<string, { id: string; name: string; slug: string }>();
+  for (const c of allCustomers) {
+    if (activeSet.has(c.id)) {
+      canonicalByKey.set(normCustomerKey(c.name), c);
+    }
+  }
+
+  const obsoleteIds: string[] = [];
+  for (const c of allCustomers) {
+    if (activeSet.has(c.id)) continue;
+    const canonical = canonicalByKey.get(normCustomerKey(c.name));
+    if (canonical && canonical.id !== c.id) {
+      // Reassign any past order_submissions to the canonical customer before deleting
+      await supabaseAdmin
+        .from("order_submissions")
+        .update({ customer_id: canonical.id })
+        .eq("customer_id", c.id);
+      obsoleteIds.push(c.id);
+    } else {
+      // Check if this orphan has any order history; if none, remove it so the
+      // Admin customer list matches the sheets cleanly.
+      const { count } = await supabaseAdmin
+        .from("order_submissions")
+        .select("id", { count: "exact", head: true })
+        .eq("customer_id", c.id);
+      if ((count ?? 0) === 0) {
+        obsoleteIds.push(c.id);
+      }
+    }
+  }
+
+  if (obsoleteIds.length) {
+    await supabaseAdmin.from("customers").delete().in("id", obsoleteIds);
+  }
+}
 
 /**
  * The actual sync, shared by syncFromSheet (Apps Script trigger / explicit
@@ -536,6 +677,7 @@ async function runSheetSync(sheetId: string): Promise<{
   customers: number;
   products: number;
   mappings: number;
+  activeCustomerIds: string[];
 }> {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const { readCustomerRows, readProductRows, sheetGroupSlugFor } = await import("@/lib/sheets.server");
@@ -614,32 +756,58 @@ async function runSheetSync(sheetId: string): Promise<{
     }
   }
 
-  const seen = new Map<string, { driver: string | null; order: number }>();
+  // Key by normalized customer name (case-insensitive, collapsed spaces) so
+  // minor spelling differences between Mon–Wed and Thu–Sat (e.g. "EXCEL" vs
+  // "Excel", "HOLY  FAMILY" vs "HOLY FAMILY", "CHIP World" vs "Chip World")
+  // don't split a customer into duplicate "-2" links.
+  const seen = new Map<string, { displayName: string; driver: string | null; order: number }>();
   let order = 0;
   for (const r of customerRows.slice(1)) {
-    const name = (r?.[0] ?? "").trim();
-    if (!name || seen.has(name)) continue;
+    const rawName = (r?.[0] ?? "").trim().replace(/\s+/g, " ");
+    if (!rawName) continue;
+    const key = normCustomerKey(rawName);
+    if (seen.has(key)) continue;
     order += 1;
-    seen.set(name, { driver: (r?.[3] ?? "").trim() || null, order });
+    seen.set(key, { displayName: rawName, driver: (r?.[3] ?? "").trim() || null, order });
   }
 
   const { data: existingCustomers } = await supabaseAdmin
     .from("customers")
     .select("id, name, slug");
-  const existingByCName = new Map((existingCustomers ?? []).map((c) => [c.name, c]));
+  // Prefer the canonical customer row (not a "-2" duplicate, and preferring
+  // "foodmania" over "food-mania") when two existing DB rows normalize to the same key.
+  const isPreferredCustomerRow = (
+    candidate: { id: string; name: string; slug: string },
+    current: { id: string; name: string; slug: string },
+  ) => {
+    const candIsDup = /-\d+$/.test(candidate.slug) && !/\d+$/.test(candidate.name.trim());
+    const currIsDup = /-\d+$/.test(current.slug) && !/\d+$/.test(current.name.trim());
+    if (candIsDup !== currIsDup) return !candIsDup;
+    if (candidate.slug === "foodmania" && current.slug === "food-mania") return true;
+    if (current.slug === "foodmania" && candidate.slug === "food-mania") return false;
+    return false;
+  };
+  const existingByKey = new Map<string, { id: string; name: string; slug: string }>();
+  for (const c of existingCustomers ?? []) {
+    const k = normCustomerKey(c.name);
+    const prev = existingByKey.get(k);
+    if (!prev || isPreferredCustomerRow(c, prev)) {
+      existingByKey.set(k, c);
+    }
+  }
   const slugUsed = new Set<string>((existingCustomers ?? []).map((c) => c.slug));
 
   // New customers are inserted in ONE batch (per-row inserts made this too
   // slow for the 30s serverless request timeout).
   const newCustomerRows: Array<{ name: string; slug: string }> = [];
-  for (const [name] of seen) {
-    if (existingByCName.has(name)) continue;
-    let s = slugify(name);
+  for (const [key, info] of seen) {
+    if (existingByKey.has(key)) continue;
+    let s = slugify(info.displayName);
     const base = s;
     let i = 2;
     while (slugUsed.has(s)) s = `${base}-${i++}`;
     slugUsed.add(s);
-    newCustomerRows.push({ name, slug: s });
+    newCustomerRows.push({ name: info.displayName, slug: s });
   }
   if (newCustomerRows.length) {
     const { data: ins, error: insErr } = await supabaseAdmin
@@ -647,11 +815,11 @@ async function runSheetSync(sheetId: string): Promise<{
       .insert(newCustomerRows)
       .select("id, name, slug");
     if (insErr) throw insErr;
-    for (const c of ins ?? []) existingByCName.set(c.name, c);
+    for (const c of ins ?? []) existingByKey.set(normCustomerKey(c.name), c);
   }
 
-  const seenNames = Array.from(seen.keys());
-  const missing = seenNames.filter((n) => !existingByCName.has(n));
+  const seenKeys = Array.from(seen.keys());
+  const missing = seenKeys.filter((k) => !existingByKey.has(k));
   if (missing.length) {
     throw new Error(
       `Sync could not create new customers: ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? "…" : ""}`,
@@ -664,11 +832,11 @@ async function runSheetSync(sheetId: string): Promise<{
   // to take ~30s for a full sheet and timed the serverless request out —
   // which is what left customer_products wiped from a half-finished sync.
   if (groupId) {
-    const assignmentRows = seenNames.map((name) => ({
-      customer_id: (existingByCName.get(name) as { id: string }).id,
+    const assignmentRows = seenKeys.map((key) => ({
+      customer_id: (existingByKey.get(key) as { id: string }).id,
       sheet_group_id: groupId,
-      driver: seen.get(name)!.driver,
-      sort_order: seen.get(name)!.order,
+      driver: seen.get(key)!.driver,
+      sort_order: seen.get(key)!.order,
     }));
     const batchSize = 500;
     for (let i = 0; i < assignmentRows.length; i += batchSize) {
@@ -682,23 +850,41 @@ async function runSheetSync(sheetId: string): Promise<{
         });
       if (aErr) throw aErr;
     }
-  } else {
-    const globalRows = seenNames.map((name) => ({
-      id: (existingByCName.get(name) as { id: string }).id,
-      driver: seen.get(name)!.driver,
-      sort_order: seen.get(name)!.order,
-    }));
-    // defaultToNull: false — otherwise the conflict-UPDATE would reset
-    // name/slug/created_at to NULL on every existing row.
+    // Remove stale assignments for this sheet group that are no longer on this sheet
+    const activeIdsForSheet = seenKeys.map((k) => (existingByKey.get(k) as { id: string }).id);
+    const { data: currentGroupAssigns } = await supabaseAdmin
+      .from("customer_sheet_assignments")
+      .select("id, customer_id")
+      .eq("sheet_group_id", groupId);
+    const activeSetForSheet = new Set(activeIdsForSheet);
+    const staleAssignIds = (currentGroupAssigns ?? [])
+      .filter((a) => !activeSetForSheet.has(a.customer_id))
+      .map((a) => a.id);
+    if (staleAssignIds.length) {
+      await supabaseAdmin
+        .from("customer_sheet_assignments")
+        .delete()
+        .in("id", staleAssignIds);
+    }
+  }
+
+  // Always keep customers.driver and customers.sort_order in sync too so
+  // no customer is left with sort_order=0 floating to the top of Admin.
+  const globalRows = seenKeys.map((key) => ({
+    id: (existingByKey.get(key) as { id: string }).id,
+    driver: seen.get(key)!.driver,
+    sort_order: seen.get(key)!.order,
+  }));
+  if (globalRows.length) {
     const { error: gErr } = await supabaseAdmin
       .from("customers")
       .upsert(globalRows, { onConflict: "id", defaultToNull: false });
     if (gErr) throw gErr;
   }
 
-  const customersTouched = seenNames.length;
+  const customersTouched = seenKeys.length;
 
-  const cId = new Map(Array.from(existingByCName.entries()).map(([n, c]) => [n, c.id]));
+  const cId = new Map(Array.from(existingByKey.entries()).map(([k, c]) => [k, c.id]));
   const pId = new Map(Array.from(existingByName.entries()).map(([n, p]) => [n, p.id]));
 
   const cpPayload: Array<{
@@ -713,11 +899,12 @@ async function runSheetSync(sheetId: string): Promise<{
     const cname = (r?.[0] ?? "").trim();
     const pname = (r?.[1] ?? "").trim();
     if (!cname || !pname) continue;
-    const customer_id = cId.get(cname);
+    const ckey = normCustomerKey(cname);
+    const customer_id = cId.get(ckey);
     const product_id = pId.get(pname);
     if (!customer_id || !product_id) continue;
-    const next = (counters.get(cname) ?? 0) + 1;
-    counters.set(cname, next);
+    const next = (counters.get(ckey) ?? 0) + 1;
+    counters.set(ckey, next);
     cpPayload.push({
       customer_id,
       product_id,
@@ -727,15 +914,23 @@ async function runSheetSync(sheetId: string): Promise<{
   }
 
   if (cpPayload.length) {
-    const customerIds = Array.from(new Set(cpPayload.map((x) => x.customer_id)));
-    let del = supabaseAdmin
-      .from("customer_products")
-      .delete()
-      .in("customer_id", customerIds);
-    // Scope the wipe to THIS sheet's group, so the other sheet's row
-    // mappings for shared customers stay intact.
-    if (groupId) del = del.eq("sheet_group_id", groupId);
-    await del;
+    if (groupId) {
+      // Wipe all existing mappings for THIS sheet group so removed/renamed
+      // customers on this sheet don't leave stale rows behind, while leaving
+      // the other sheet group's mappings completely untouched.
+      const { error: delErr } = await supabaseAdmin
+        .from("customer_products")
+        .delete()
+        .eq("sheet_group_id", groupId);
+      if (delErr) throw delErr;
+    } else {
+      const customerIds = Array.from(new Set(cpPayload.map((x) => x.customer_id)));
+      const { error: delErr } = await supabaseAdmin
+        .from("customer_products")
+        .delete()
+        .in("customer_id", customerIds);
+      if (delErr) throw delErr;
+    }
 
     const rows = groupId
       ? cpPayload.map((x) => ({ ...x, sheet_group_id: groupId }))
@@ -753,6 +948,7 @@ async function runSheetSync(sheetId: string): Promise<{
     customers: customersTouched,
     products: productMap.size,
     mappings: cpPayload.length,
+    activeCustomerIds: seenKeys.map((k) => (existingByKey.get(k) as { id: string }).id),
   };
 }
 
