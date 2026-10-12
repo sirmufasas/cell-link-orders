@@ -169,6 +169,20 @@ export const getCustomerPage = createServerFn({ method: "GET" })
     const { data: cps, error: cpErr } = await cpQuery.order("sheet_row", { ascending: true });
     if (cpErr) throw cpErr;
 
+    // Deduplicate regulars by product ID (or product name) so concurrent syncs
+    // can never cause duplicate rows on the customer's order form.
+    const dedupedRegularsMap = new Map<string, NonNullable<typeof cps>[number]>();
+    for (const r of cps ?? []) {
+      const pKey =
+        (r.product as { id?: string; name?: string } | null)?.id ??
+        (r.product as { name?: string } | null)?.name?.trim().toLowerCase() ??
+        String(r.sheet_row);
+      dedupedRegularsMap.set(pKey, r);
+    }
+    const dedupedRegulars = Array.from(dedupedRegularsMap.values()).sort(
+      (a, b) => a.sheet_row - b.sheet_row,
+    );
+
     const historyCutoffDate = new Date();
     historyCutoffDate.setMonth(historyCutoffDate.getMonth() - 4);
     const historyCutoff = historyCutoffDate.toISOString();
@@ -182,6 +196,7 @@ export const getCustomerPage = createServerFn({ method: "GET" })
       )
       .eq("customer_id", customer.id)
       .eq("for_date", todayKey)
+      .gt("total_items", 0)
       .order("created_at", { ascending: false })
       .limit(1);
     const todayOrder = todaySubs?.[0] ?? null;
@@ -189,7 +204,8 @@ export const getCustomerPage = createServerFn({ method: "GET" })
     const { count: priorCount } = await supabaseAdmin
       .from("order_submissions")
       .select("id", { count: "exact", head: true })
-      .eq("customer_id", customer.id);
+      .eq("customer_id", customer.id)
+      .gt("total_items", 0);
 
     // ── message is now included in history ──
     const { data: history } = await supabaseAdmin
@@ -198,12 +214,13 @@ export const getCustomerPage = createServerFn({ method: "GET" })
         "id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_name, quantity)",
       )
       .eq("customer_id", customer.id)
+      .gt("total_items", 0)
       .gte("created_at", historyCutoff)
       .order("created_at", { ascending: false });
 
     return {
       customer,
-      regulars: cps ?? [],
+      regulars: dedupedRegulars,
       todayOrder,
       hasPriorOrders: (priorCount ?? 0) > 0,
       history: history ?? [],
@@ -211,6 +228,47 @@ export const getCustomerPage = createServerFn({ method: "GET" })
   });
 
 // ============================== ORDER SUBMIT ==============================
+
+/**
+ * Resolves each submitted item's `sheetRow` against the LIVE active Google
+ * Sheet right before writing. If rows were inserted/deleted above this
+ * customer on the sheet (or the client had cached row numbers from an earlier
+ * day/sheet), this guarantees we always write to the customer's actual current
+ * row for that product — or set `sheetRow = 0` so `insertCustomerProductRow`
+ * inserts it cleanly under this customer.
+ */
+function resolveItemsSheetRows(
+  customerName: string,
+  items: Array<{ sheetRow: number; productName: string }>,
+  allRows: string[][],
+) {
+  const targetCustomerKey = normCustomerKey(customerName);
+  const productRowMap = new Map<string, number>();
+  for (let i = 1; i < allRows.length; i++) {
+    const rCustomer = (allRows[i]?.[0] ?? "").trim();
+    const rProduct = (allRows[i]?.[1] ?? "").trim();
+    if (!rCustomer || !rProduct) continue;
+    if (normCustomerKey(rCustomer) === targetCustomerKey) {
+      productRowMap.set(rProduct.toLowerCase(), i + 1);
+    }
+  }
+
+  for (const item of items) {
+    const pKey = item.productName.trim().toLowerCase();
+    const liveRow = productRowMap.get(pKey);
+    if (liveRow) {
+      item.sheetRow = liveRow;
+    } else if (item.sheetRow > 0) {
+      // Verify the client-supplied row actually belongs to this customer + product
+      const rowData = allRows[item.sheetRow - 1];
+      const rowCust = (rowData?.[0] ?? "").trim();
+      const rowProd = (rowData?.[1] ?? "").trim().toLowerCase();
+      if (normCustomerKey(rowCust) !== targetCustomerKey || rowProd !== pKey) {
+        item.sheetRow = 0;
+      }
+    }
+  }
+}
 
 const SubmitItem = z.object({
   sheetRow: z.number().int().min(0),
@@ -238,6 +296,7 @@ export const submitOrder = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const {
+      readCustomerRows,
       writeOrderQuantities,
       writeLateOrderQuantities,
       writeLateOrderQuantitiesToColumnC,
@@ -255,8 +314,14 @@ export const submitOrder = createServerFn({ method: "POST" })
 
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    if (positive.length === 0 || totalItems <= 0) {
+      throw new Error("Please enter a quantity for at least 1 product before submitting your order.");
+    }
     const message = data.message.trim();
     const late = isLateOrder();
+
+    const allRows = await readCustomerRows();
+    resolveItemsSheetRows(customer.name, positive, allRows);
 
     let insertedAny = false;
     for (const item of positive) {
@@ -361,6 +426,13 @@ export const changeOrder = createServerFn({ method: "POST" })
     if (cErr) throw cErr;
     if (!customer) throw new Error("Unknown customer");
 
+    const positive = data.items.filter((i) => i.quantity > 0);
+    const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    if (positive.length === 0 || totalItems <= 0) {
+      throw new Error("Please enter a quantity for at least 1 product before saving your order.");
+    }
+    const message = data.message.trim();
+
     const allRows = await readCustomerRows();
     const targetKey = normCustomerKey(customer.name);
     const customerRowNumbers: number[] = [];
@@ -375,9 +447,7 @@ export const changeOrder = createServerFn({ method: "POST" })
       await clearAddOnColumns(customerRowNumbers);
     }
 
-    const positive = data.items.filter((i) => i.quantity > 0);
-    const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
-    const message = data.message.trim();
+    resolveItemsSheetRows(customer.name, positive, allRows);
 
     let insertedAny = false;
     for (const item of positive) {
@@ -441,6 +511,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const {
+      readCustomerRows,
       writeOrderQuantities,
       writeLateOrderQuantities,
       writeLateOrderQuantitiesToColumnC,
@@ -461,20 +532,27 @@ export const addOnToOrder = createServerFn({ method: "POST" })
 
     const positive = data.items.filter((i) => i.quantity > 0);
     const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    if (positive.length === 0 || totalItems <= 0) {
+      throw new Error("Please enter a quantity for at least 1 product before submitting your add-on order.");
+    }
     const message = data.message.trim();
     const late = isLateOrder();
     const targetDate = tomorrowISO();
 
+    const allRows = await readCustomerRows();
+    resolveItemsSheetRows(customer.name, positive, allRows);
+
     // Guard against stale client tabs: if the customer tapped "+ Add onto
     // Prev Order" from a cached screen left open from yesterday, and they
-    // don't actually have an order for `targetDate` yet, treat this as a
-    // brand-new order for today so we overwrite Column C cleanly instead of
-    // adding onto yesterday's leftover sheet quantities.
+    // don't actually have a non-empty order for `targetDate` yet, treat this
+    // as a brand-new order for today so we overwrite Column C cleanly instead
+    // of adding onto yesterday's leftover sheet quantities.
     const { count: existingTodayCount } = await supabaseAdmin
       .from("order_submissions")
       .select("id", { count: "exact", head: true })
       .eq("customer_id", customer.id)
-      .eq("for_date", targetDate);
+      .eq("for_date", targetDate)
+      .gt("total_items", 0);
     const hasOrderForToday = (existingTodayCount ?? 0) > 0;
 
     if (!hasOrderForToday) {
@@ -921,22 +999,25 @@ async function runSheetSync(sheetId: string): Promise<{
   }
 
   if (cpPayload.length) {
+    // Capture existing customer_products IDs for this sheet group FIRST, then
+    // insert the new rows, and only delete the old IDs AFTER the insert
+    // completes. That way, if a customer opens their link (or refetches) while
+    // a background sync is running, customer_products is NEVER momentarily
+    // empty between DELETE and Batch 2 INSERT.
+    let oldIds: string[] = [];
     if (groupId) {
-      // Wipe all existing mappings for THIS sheet group so removed/renamed
-      // customers on this sheet don't leave stale rows behind, while leaving
-      // the other sheet group's mappings completely untouched.
-      const { error: delErr } = await supabaseAdmin
+      const { data: oldRows } = await supabaseAdmin
         .from("customer_products")
-        .delete()
+        .select("id")
         .eq("sheet_group_id", groupId);
-      if (delErr) throw delErr;
+      oldIds = (oldRows ?? []).map((r) => r.id);
     } else {
       const customerIds = Array.from(new Set(cpPayload.map((x) => x.customer_id)));
-      const { error: delErr } = await supabaseAdmin
+      const { data: oldRows } = await supabaseAdmin
         .from("customer_products")
-        .delete()
+        .select("id")
         .in("customer_id", customerIds);
-      if (delErr) throw delErr;
+      oldIds = (oldRows ?? []).map((r) => r.id);
     }
 
     const rows = groupId
@@ -948,6 +1029,14 @@ async function runSheetSync(sheetId: string): Promise<{
         .from("customer_products")
         .insert(rows.slice(i, i + batchSize));
       if (error) throw error;
+    }
+
+    for (let i = 0; i < oldIds.length; i += batchSize) {
+      const { error: delErr } = await supabaseAdmin
+        .from("customer_products")
+        .delete()
+        .in("id", oldIds.slice(i, i + batchSize));
+      if (delErr) throw delErr;
     }
   }
 

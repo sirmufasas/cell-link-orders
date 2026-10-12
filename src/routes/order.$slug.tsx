@@ -92,6 +92,15 @@ function dateLabel(iso: string) {
 type LineKey = string;
 type Mode = "default" | "addon";
 
+function lineKeyForRegular(r: {
+  sheet_row: number;
+  product?: { id?: string | null; name?: string | null } | null;
+}): LineKey {
+  if (r.product?.id) return `p:${r.product.id}`;
+  if (r.product?.name) return `n:${r.product.name.trim().toLowerCase()}`;
+  return `r:${r.sheet_row}`;
+}
+
 const KOTA_ONLY_PREFIXES = ["rolls kota", "kota"];
 
 // Products that should only be visible/orderable by Mediterranean or Rio
@@ -200,47 +209,13 @@ function OrderPage() {
   // drops the stale "Your order has been received!" screen, and refetches.
   const [currentDeliveryISO, setCurrentDeliveryISO] = useState(() => tomorrowISO());
 
-  useEffect(() => {
-    function refreshPageData() {
-      const latestISO = tomorrowISO();
-      setCurrentDeliveryISO((prev) => (prev !== latestISO ? latestISO : prev));
-      void qc.invalidateQueries({ queryKey: ["customer-page", slug] });
-    }
-
-    function onVisibilityChange() {
-      if (document.visibilityState === "visible") {
-        refreshPageData();
-      }
-    }
-
-    window.addEventListener("focus", refreshPageData);
-    window.addEventListener("pageshow", refreshPageData);
-    document.addEventListener("visibilitychange", onVisibilityChange);
-
-    // Also check every 60s in case the tab stays open across midnight
-    const interval = setInterval(() => {
-      const latestISO = tomorrowISO();
-      setCurrentDeliveryISO((prev) => {
-        if (prev !== latestISO) {
-          void qc.invalidateQueries({ queryKey: ["customer-page", slug] });
-          return latestISO;
-        }
-        return prev;
-      });
-    }, 60_000);
-
-    return () => {
-      window.removeEventListener("focus", refreshPageData);
-      window.removeEventListener("pageshow", refreshPageData);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-      clearInterval(interval);
-    };
-  }, [qc, slug]);
-
   // Only treat todayOrder as active if its for_date matches the current
-  // delivery date (never lock the screen on a leftover order from yesterday).
+  // delivery date AND it has > 0 items (never lock the screen on a leftover
+  // order from yesterday or an empty 0-item glitch order).
   const todayOrder =
-    rawTodayOrder && rawTodayOrder.for_date === currentDeliveryISO
+    rawTodayOrder &&
+    rawTodayOrder.for_date === currentDeliveryISO &&
+    (rawTodayOrder.total_items ?? 0) > 0
       ? rawTodayOrder
       : null;
 
@@ -280,6 +255,59 @@ function OrderPage() {
   const [messageModalSkipped, setMessageModalSkipped] = useState(false);
   // Sender name — persisted across the session so they only type it once
   const [senderName, setSenderName] = useState("");
+
+  // Keep a ref of whether the user is currently in the submit modal or
+  // mid-submission so mobile keyboard focus events don't trigger a background
+  // query invalidation right as they tap "Send".
+  const busySubmittingRef = useRef(false);
+  useEffect(() => {
+    busySubmittingRef.current = showMessageModal || submitting;
+  }, [showMessageModal, submitting]);
+
+  useEffect(() => {
+    function refreshPageData() {
+      const latestISO = tomorrowISO();
+      let dateChanged = false;
+      setCurrentDeliveryISO((prev) => {
+        if (prev !== latestISO) {
+          dateChanged = true;
+          return latestISO;
+        }
+        return prev;
+      });
+      if (!dateChanged && busySubmittingRef.current) return;
+      void qc.invalidateQueries({ queryKey: ["customer-page", slug] });
+    }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        refreshPageData();
+      }
+    }
+
+    window.addEventListener("focus", refreshPageData);
+    window.addEventListener("pageshow", refreshPageData);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    // Also check every 60s in case the tab stays open across midnight
+    const interval = setInterval(() => {
+      const latestISO = tomorrowISO();
+      setCurrentDeliveryISO((prev) => {
+        if (prev !== latestISO) {
+          void qc.invalidateQueries({ queryKey: ["customer-page", slug] });
+          return latestISO;
+        }
+        return prev;
+      });
+    }, 60_000);
+
+    return () => {
+      window.removeEventListener("focus", refreshPageData);
+      window.removeEventListener("pageshow", refreshPageData);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clearInterval(interval);
+    };
+  }, [qc, slug]);
 
   const { data: allProducts } = useSuspenseQuery(allProductsQuery);
 
@@ -435,10 +463,18 @@ function OrderPage() {
   function buildPrefillFromTodayOrder(): Record<LineKey, number> {
     const next: Record<LineKey, number> = {};
     for (const item of todayOrder?.items ?? []) {
-      if (item.sheet_row && regularSheetRows.has(item.sheet_row)) {
-        next[`r:${item.sheet_row}`] = item.quantity;
-      } else if (item.product_id) {
-        next[`x:${item.product_id}`] = item.quantity;
+      if (item.product_id) {
+        next[`p:${item.product_id}`] = item.quantity;
+      } else {
+        const matchedRegular = regulars.find(
+          (r) =>
+            (item.sheet_row && r.sheet_row === item.sheet_row) ||
+            (r.product?.name &&
+              r.product.name.trim().toLowerCase() === item.product_name.trim().toLowerCase()),
+        );
+        if (matchedRegular) {
+          next[lineKeyForRegular(matchedRegular)] = item.quantity;
+        }
       }
     }
     return next;
@@ -456,14 +492,49 @@ function OrderPage() {
     });
   }, [allProducts, regularProductIds, productSearch, showMore, isKotaJoe, canSeeRioMed]);
 
-  const totalItems = Object.values(qty).reduce((a, b) => a + b, 0);
+  function buildItems() {
+    const items: Array<{ sheetRow: number; productName: string; productId: string | null; quantity: number }> = [];
+    const includedKeys = new Set<string>();
+    for (const r of regulars) {
+      const k = lineKeyForRegular(r);
+      const q = qty[k] ?? qty[`r:${r.sheet_row}`] ?? 0;
+      if (q > 0) {
+        includedKeys.add(k);
+        includedKeys.add(`r:${r.sheet_row}`);
+        items.push({
+          sheetRow: r.sheet_row,
+          productName: r.product?.name ?? "",
+          productId: r.product?.id ?? null,
+          quantity: q,
+        });
+      }
+    }
+    for (const [k, v] of Object.entries(qty)) {
+      if (v <= 0 || includedKeys.has(k)) continue;
+      if (k.startsWith("p:") || k.startsWith("x:")) {
+        const pid = k.slice(2);
+        const p = allProducts?.find((x) => x.id === pid);
+        if (!p) continue;
+        items.push({ sheetRow: 0, productName: p.name, productId: p.id, quantity: v });
+      }
+    }
+    return items;
+  }
+
+  const builtItems = useMemo(
+    () => buildItems(),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [qty, regulars, allProducts],
+  );
+
+  const totalItems = useMemo(
+    () => builtItems.reduce((a, b) => a + b.quantity, 0),
+    [builtItems],
+  );
 
   // Distinct product lines with qty > 0 — this is what counts against the limit,
   // not the total quantity. Ordering 50 of one product still uses just 1 slot.
-  const usedProductCount = useMemo(
-    () => Object.values(qty).filter((v) => v > 0).length,
-    [qty],
-  );
+  const usedProductCount = builtItems.length;
   const remainingProductSlots = PRODUCT_LIMIT - usedProductCount;
   const atProductLimit = usedProductCount >= PRODUCT_LIMIT;
 
@@ -496,32 +567,16 @@ function OrderPage() {
       return { ...s, [k]: newVal };
     });
 
-  function buildItems() {
-    const items: Array<{ sheetRow: number; productName: string; productId: string | null; quantity: number }> = [];
-    for (const r of regulars) {
-      const q = qty[`r:${r.sheet_row}`] ?? 0;
-      if (q > 0)
-        items.push({
-          sheetRow: r.sheet_row,
-          productName: r.product?.name ?? "",
-          productId: r.product?.id ?? null,
-          quantity: q,
-        });
-    }
-    for (const [k, v] of Object.entries(qty)) {
-      if (!k.startsWith("x:") || v <= 0) continue;
-      const pid = k.slice(2);
-      const p = allProducts?.find((x) => x.id === pid);
-      if (!p) continue;
-      items.push({ sheetRow: 0, productName: p.name, productId: p.id, quantity: v });
-    }
-    return items;
-  }
-
   async function handleSubmit(msg: string) {
     setSubmitting(true); setError(null);
     try {
       const items = buildItems();
+      const itemsTotal = items.reduce((a, b) => a + b.quantity, 0);
+      if (items.length === 0 || itemsTotal <= 0) {
+        setError("Please enter a quantity for at least 1 product before submitting your order.");
+        setSubmitting(false);
+        return;
+      }
       if (items.length > PRODUCT_LIMIT) {
         setError(`You can only order up to ${PRODUCT_LIMIT} different products at once. Please remove some items and try again.`);
         setSubmitting(false);
@@ -568,6 +623,13 @@ function OrderPage() {
   // prompt once this order (and already gave their name), go straight
   // through. Otherwise show the modal.
   function handleSubmitClick() {
+    const items = buildItems();
+    const itemsTotal = items.reduce((a, b) => a + b.quantity, 0);
+    if (items.length === 0 || itemsTotal <= 0) {
+      setError("Please enter a quantity for at least 1 product before submitting your order.");
+      return;
+    }
+    setError(null);
     if (messageModalSkipped && senderName.trim()) {
       void handleSubmit(message);
     } else {
@@ -729,9 +791,9 @@ function OrderPage() {
 
       <div className="max-w-xl mx-auto px-5 space-y-2.5">
         {regulars.map((r) => {
-          const k: LineKey = `r:${r.sheet_row}`;
+          const k: LineKey = lineKeyForRegular(r);
           const product = r.product;
-          const rowQty = qty[k] ?? 0;
+          const rowQty = qty[k] ?? qty[`r:${r.sheet_row}`] ?? 0;
           const locked = atProductLimit && rowQty === 0;
           return (
             <div
@@ -777,8 +839,8 @@ function OrderPage() {
             </p>
             <div className="space-y-2">
               {extraProducts.map((p) => {
-                const k: LineKey = `x:${p.id}`;
-                const rowQty = qty[k] ?? 0;
+                const k: LineKey = `p:${p.id}`;
+                const rowQty = qty[k] ?? qty[`x:${p.id}`] ?? 0;
                 const locked = atProductLimit && rowQty === 0;
                 return (
                   <div
