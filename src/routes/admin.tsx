@@ -2519,10 +2519,18 @@ function ManualOrdersTab({
 }
 
 // ============================================================================
-// PRINT SHEET TAB (2-Column Side-by-Side Compact Print Sheet)
+// PRINT SHEET TAB (16px Crisp Print Layout + Printed/Added Snapshot Tracking)
 // ============================================================================
 
 type PrintCustomerMode = "items" | "total_only" | "hidden";
+
+type PrintedCustomerSnapshot = {
+  printedAt: string;
+  totalQuantity: number;
+  items: Record<string, number>; // normalized productName -> printed quantity
+};
+
+type CustomerPrintStatus = "unprinted" | "printed_clean" | "printed_added";
 
 // Default customers that show ONLY their "[Customer] Total" row on the print
 // sheet (matching the bakery's standard pivot print layout).
@@ -2552,11 +2560,30 @@ function getDefaultPrintMode(name: string): PrintCustomerMode {
 type PrintLine = {
   kind: "item" | "customer_total" | "driver_subtotal";
   customerName: string;
+  rawCustomerName?: string;
   customerSlug?: string;
   productName: string;
   quantity: number | string;
   driver?: string;
+  printStatus?: CustomerPrintStatus;
+  printedQty?: number;
+  addedQty?: number;
 };
+
+function getCustomerPrintStatus(
+  c: LiveSheetCustomerOrder,
+  snap: PrintedCustomerSnapshot | undefined,
+): CustomerPrintStatus {
+  if (!snap) return "unprinted";
+  if (c.totalQuantity !== snap.totalQuantity) return "printed_added";
+  for (const r of c.rows) {
+    if (r.quantity <= 0) continue;
+    const pKey = r.productName.trim().toLowerCase();
+    const prev = snap.items[pKey] ?? 0;
+    if (r.quantity !== prev) return "printed_added";
+  }
+  return "printed_clean";
+}
 
 function PrintSheetTab() {
   const qc = useQueryClient();
@@ -2564,8 +2591,36 @@ function PrintSheetTab() {
 
   const [driverFilter, setDriverFilter] = useState("__all__");
   const [groupByDriver, setGroupByDriver] = useState(true);
+  const [columnsMode, setColumnsMode] = useState<1 | 2>(2);
+  const [fontSizePx, setFontSizePx] = useState<number>(16);
+  const [viewFilter, setViewFilter] = useState<"to_print" | "all_highlight" | "printed_only">("to_print");
   const [showCustomize, setShowCustomize] = useState(false);
   const [customizeSearch, setCustomizeSearch] = useState("");
+
+  const forDateKey = liveQuery.data?.forDate ?? "current";
+  const snapshotStorageKey = `bakery_printed_snapshots_v1_${forDateKey}`;
+
+  const [printedSnapshots, setPrintedSnapshots] = useState<Record<string, PrintedCustomerSnapshot>>({});
+
+  // Load printed snapshots for the active delivery date
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = localStorage.getItem(snapshotStorageKey);
+      setPrintedSnapshots(raw ? (JSON.parse(raw) as Record<string, PrintedCustomerSnapshot>) : {});
+    } catch {
+      setPrintedSnapshots({});
+    }
+  }, [snapshotStorageKey]);
+
+  function saveSnapshots(next: Record<string, PrintedCustomerSnapshot>) {
+    setPrintedSnapshots(next);
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem(snapshotStorageKey, JSON.stringify(next));
+      } catch {}
+    }
+  }
 
   const [customModes, setCustomModes] = useState<Record<string, PrintCustomerMode>>(() => {
     if (typeof window === "undefined") return {};
@@ -2628,6 +2683,98 @@ function PrintSheetTab() {
     [allCustomers, driverFilter],
   );
 
+  // Classify every active customer into unprinted / printed_clean / printed_added
+  const customerStatuses = useMemo(() => {
+    const map = new Map<string, CustomerPrintStatus>();
+    for (const c of activeCustomers) {
+      const k = normPrintKey(c.name);
+      map.set(k, getCustomerPrintStatus(c, printedSnapshots[k]));
+    }
+    return map;
+  }, [activeCustomers, printedSnapshots]);
+
+  const unprintedOrAddedCustomers = useMemo(
+    () =>
+      activeCustomers.filter((c) => {
+        const st = customerStatuses.get(normPrintKey(c.name));
+        return st === "unprinted" || st === "printed_added";
+      }),
+    [activeCustomers, customerStatuses],
+  );
+
+  const printedCleanCustomers = useMemo(
+    () =>
+      activeCustomers.filter(
+        (c) => customerStatuses.get(normPrintKey(c.name)) === "printed_clean",
+      ),
+    [activeCustomers, customerStatuses],
+  );
+
+  const printedAddedCustomers = useMemo(
+    () =>
+      activeCustomers.filter(
+        (c) => customerStatuses.get(normPrintKey(c.name)) === "printed_added",
+      ),
+    [activeCustomers, customerStatuses],
+  );
+
+  // Customers currently shown on the sheet based on viewFilter
+  const sheetCustomers = useMemo(() => {
+    const pool =
+      viewFilter === "to_print"
+        ? unprintedOrAddedCustomers
+        : viewFilter === "printed_only"
+        ? printedCleanCustomers
+        : activeCustomers;
+    return pool.filter((c) => modeForCustomer(c.name) !== "hidden");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    viewFilter,
+    unprintedOrAddedCustomers,
+    printedCleanCustomers,
+    activeCustomers,
+    customModes,
+  ]);
+
+  function markCustomersPrinted(custList: LiveSheetCustomerOrder[]) {
+    if (!custList.length) return;
+    const next = { ...printedSnapshots };
+    const nowIso = new Date().toISOString();
+    for (const c of custList) {
+      const itemsMap: Record<string, number> = {};
+      for (const r of c.rows) {
+        if (r.quantity > 0) {
+          itemsMap[r.productName.trim().toLowerCase()] = r.quantity;
+        }
+      }
+      next[normPrintKey(c.name)] = {
+        printedAt: nowIso,
+        totalQuantity: c.totalQuantity,
+        items: itemsMap,
+      };
+    }
+    saveSnapshots(next);
+  }
+
+  function unmarkCustomerPrinted(customerName: string) {
+    const k = normPrintKey(customerName);
+    const next = { ...printedSnapshots };
+    delete next[k];
+    saveSnapshots(next);
+  }
+
+  function resetAllPrinted() {
+    saveSnapshots({});
+  }
+
+  function handlePrintAndHide() {
+    const toMark = [...sheetCustomers];
+    window.print();
+    // Mark the printed customers so they are highlighted and hidden away
+    // until/unless they add a product later.
+    markCustomersPrinted(toMark);
+  }
+
   const driverOptions = useMemo(() => {
     const s = new Set<string>();
     for (const c of allCustomers) {
@@ -2639,42 +2786,64 @@ function PrintSheetTab() {
   // Build the flat sequence of PrintLines, grouped by Driver (with driver
   // subtotals like 66, 946, 105, 74) or in sheet order.
   const printLines: PrintLine[] = useMemo(() => {
-    const visible = activeCustomers.filter((c) => modeForCustomer(c.name) !== "hidden");
     const lines: PrintLine[] = [];
 
     const appendCustomerLines = (c: LiveSheetCustomerOrder) => {
+      const k = normPrintKey(c.name);
+      const status = customerStatuses.get(k) ?? "unprinted";
+      const snap = printedSnapshots[k];
       const mode = modeForCustomer(c.name);
       const positiveRows = c.rows.filter((r) => r.quantity > 0);
-      if (mode === "items") {
+
+      // If a customer was ALREADY printed and later ADDED a product, always
+      // expand their product rows so the bakery can see exactly what was
+      // printed earlier and what was added!
+      const showItems = mode === "items" || status === "printed_added";
+
+      if (showItems) {
         positiveRows.forEach((r, idx) => {
+          const pKey = r.productName.trim().toLowerCase();
+          const prevQty = snap ? snap.items[pKey] ?? 0 : 0;
+          const addedQty = snap ? r.quantity - prevQty : 0;
           lines.push({
             kind: "item",
             customerName: idx === 0 ? c.name : "",
+            rawCustomerName: c.name,
             customerSlug: c.slug,
             productName: r.productName,
             quantity: r.quantity,
             driver: c.driver,
+            printStatus: status,
+            printedQty: snap ? prevQty : undefined,
+            addedQty: snap ? addedQty : undefined,
           });
         });
       }
+
+      const prevTotal = snap ? snap.totalQuantity : undefined;
+      const addedTotal = snap ? c.totalQuantity - snap.totalQuantity : undefined;
+
       lines.push({
         kind: "customer_total",
         customerName: `${c.name} Total`,
+        rawCustomerName: c.name,
         customerSlug: c.slug,
         productName: "",
         quantity: c.totalQuantity,
         driver: c.driver,
+        printStatus: status,
+        printedQty: prevTotal,
+        addedQty: addedTotal,
       });
     };
 
     if (!groupByDriver) {
-      for (const c of visible) appendCustomerLines(c);
+      for (const c of sheetCustomers) appendCustomerLines(c);
       return lines;
     }
 
-    // Group by driver in the order drivers appear
     const byDriver = new Map<string, LiveSheetCustomerOrder[]>();
-    for (const c of visible) {
+    for (const c of sheetCustomers) {
       const d = c.driver || "Unassigned";
       const list = byDriver.get(d) ?? [];
       list.push(c);
@@ -2698,10 +2867,17 @@ function PrintSheetTab() {
 
     return lines;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeCustomers, customModes, groupByDriver]);
+  }, [sheetCustomers, customerStatuses, printedSnapshots, customModes, groupByDriver]);
 
-  // Split printLines into Left Column and Right Column (balanced 2-column layout)
+  // Split printLines into Left Column and Right Column (or 1 single column)
   const { leftLines, rightLines, rowCount } = useMemo(() => {
+    if (columnsMode === 1) {
+      return {
+        leftLines: printLines,
+        rightLines: [],
+        rowCount: printLines.length,
+      };
+    }
     const mid = Math.ceil(printLines.length / 2);
     const left = printLines.slice(0, mid);
     const right = printLines.slice(mid);
@@ -2710,7 +2886,7 @@ function PrintSheetTab() {
       rightLines: right,
       rowCount: Math.max(left.length, right.length),
     };
-  }, [printLines]);
+  }, [printLines, columnsMode]);
 
   const filteredCustomizeCustomers = useMemo(() => {
     const q = customizeSearch.trim().toLowerCase();
@@ -2721,30 +2897,148 @@ function PrintSheetTab() {
 
   return (
     <section className="space-y-4">
+      {/* Print-specific @page rules so columns never get cut off */}
+      <style>{`
+        @media print {
+          @page {
+            size: A4 portrait;
+            margin: 6mm;
+          }
+          body {
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
+          }
+        }
+      `}</style>
+
       {/* Screen-only toolbar */}
       <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm space-y-3 print:hidden">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="flex items-center gap-2 flex-wrap">
-              <h2 className="font-bold text-base text-[#2a1810]">2-Column Order Print Sheet</h2>
+              <h2 className="font-bold text-base text-[#2a1810]">Order Print Sheet</h2>
               <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
                 {liveQuery.data?.sheetLabel ?? "…"} Sheet · For {liveQuery.data?.forDate ?? "Tomorrow"}
               </span>
-              <span className="text-xs text-[#8b6f4e]">
-                {activeCustomers.length} customers with orders · {printLines.length} lines ({rowCount} rows tall)
-              </span>
+              {printedAddedCustomers.length > 0 && (
+                <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300">
+                  ⚡ {printedAddedCustomers.length} Printed Customer{printedAddedCustomers.length === 1 ? "" : "s"} Added Items!
+                </span>
+              )}
             </div>
             <p className="text-xs text-[#8b6f4e] mt-1">
-              Click any <strong>Customer Total</strong> row in the table below to toggle that customer between{" "}
-              <strong>Full Items + Total</strong> and <strong>Total Only</strong>.
+              When you print, printed customers are highlighted and hidden away. If any printed customer later adds a product, they automatically reappear showing <strong>what was printed</strong> and <strong>what was added</strong>.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handlePrintAndHide}
+              disabled={printLines.length === 0}
+              className="text-xs font-bold px-4 py-2.5 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
+              title="Print this sheet and automatically mark these customers as Printed (hiding them until they add new items)"
+            >
+              🖨️ Print & Hide Printed ({sheetCustomers.length})
+            </button>
+
+            <button
+              type="button"
+              onClick={() => markCustomersPrinted(sheetCustomers)}
+              disabled={sheetCustomers.length === 0}
+              className="text-xs font-bold px-3 py-2.5 rounded-xl border border-green-700 text-green-800 bg-green-50 hover:bg-green-100 transition disabled:opacity-50"
+              title="Mark currently visible customers as Printed without opening the print dialog"
+            >
+              ✓ Mark Visible as Printed
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void qc.invalidateQueries({ queryKey: ["live-sheet-orders"] })}
+              disabled={liveQuery.isFetching}
+              className="text-xs font-bold px-3 py-2.5 rounded-xl border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition"
+            >
+              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh Sheet"}
+            </button>
+          </div>
+        </div>
+
+        {/* Filter & Layout Controls Row */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#e8dcc8]">
+          {/* View Filter Pills */}
+          <div className="flex flex-wrap gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
+            <button
+              type="button"
+              onClick={() => setViewFilter("to_print")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                viewFilter === "to_print" ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
+              }`}
+            >
+              To Print & Added ({unprintedOrAddedCustomers.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewFilter("all_highlight")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                viewFilter === "all_highlight" ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
+              }`}
+            >
+              Show All — Highlight Printed ({activeCustomers.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewFilter("printed_only")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                viewFilter === "printed_only" ? "bg-green-700 text-white" : "text-green-800"
+              }`}
+            >
+              ✓ Printed & Hidden ({printedCleanCustomers.length})
+            </button>
+          </div>
+
+          {/* Font size, Columns, Driver & Customize */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
+              <span className="text-[11px] font-semibold text-[#8b6f4e] px-2">Font:</span>
+              {[14, 16, 18].map((sz) => (
+                <button
+                  key={sz}
+                  type="button"
+                  onClick={() => setFontSizePx(sz)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
+                    fontSizePx === sz ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
+                  }`}
+                >
+                  {sz}px
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-center gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
+              <button
+                type="button"
+                onClick={() => setColumnsMode(2)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
+                  columnsMode === 2 ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
+                }`}
+              >
+                2 Columns
+              </button>
+              <button
+                type="button"
+                onClick={() => setColumnsMode(1)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
+                  columnsMode === 1 ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
+                }`}
+              >
+                1 Wide Column
+              </button>
+            </div>
+
             <select
               value={driverFilter}
               onChange={(e) => setDriverFilter(e.target.value)}
-              className="bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
+              className="bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
             >
               <option value="__all__">All drivers</option>
               {driverOptions.map((d) => (
@@ -2754,42 +3048,57 @@ function PrintSheetTab() {
               ))}
             </select>
 
-            <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] px-3 py-2 rounded-xl border border-[#e8dcc8] bg-[#fdf8f1] cursor-pointer">
+            <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] px-3 py-1.5 rounded-xl border border-[#e8dcc8] bg-[#fdf8f1] cursor-pointer">
               <input
                 type="checkbox"
                 checked={groupByDriver}
                 onChange={(e) => setGroupByDriver(e.target.checked)}
               />
-              Group subtotals by driver
+              Driver subtotals
             </label>
 
             <button
               type="button"
               onClick={() => setShowCustomize((s) => !s)}
-              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+              className="text-xs font-bold px-3 py-1.5 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1]"
             >
-              {showCustomize ? "Hide Customer Toggles" : "⚙️ Customize Customers"}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => void qc.invalidateQueries({ queryKey: ["live-sheet-orders"] })}
-              disabled={liveQuery.isFetching}
-              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition"
-            >
-              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh Sheet"}
-            </button>
-
-            <button
-              type="button"
-              onClick={() => window.print()}
-              disabled={printLines.length === 0}
-              className="text-xs font-bold px-4 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white transition disabled:opacity-50"
-            >
-              🖨️ Print Sheet
+              {showCustomize ? "Hide Toggles" : "⚙️ Customize"}
             </button>
           </div>
         </div>
+
+        {/* Printed & Hidden Customers Bar */}
+        {Object.keys(printedSnapshots).length > 0 && (
+          <div className="pt-2 border-t border-[#e8dcc8] flex flex-wrap items-center justify-between gap-2 bg-green-50/60 p-2.5 rounded-xl">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs font-bold text-green-900">
+                ✓ Printed & Hidden ({printedCleanCustomers.length}):
+              </span>
+              {printedCleanCustomers.length === 0 ? (
+                <span className="text-xs text-green-700">None currently hidden</span>
+              ) : (
+                printedCleanCustomers.map((c) => (
+                  <button
+                    key={c.slug}
+                    type="button"
+                    onClick={() => unmarkCustomerPrinted(c.name)}
+                    title="Click to unmark as printed and put back on the print sheet"
+                    className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-200/80 text-green-900 hover:bg-red-100 hover:text-red-800 transition"
+                  >
+                    ✓ {c.name} ({c.totalQuantity}) ×
+                  </button>
+                ))
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={resetAllPrinted}
+              className="text-xs font-bold px-2.5 py-1 rounded-lg border border-green-700 text-green-900 hover:bg-green-200 shrink-0"
+            >
+              ↺ Reset All Printed
+            </button>
+          </div>
+        )}
 
         {showCustomize && (
           <div className="pt-3 border-t border-[#e8dcc8] space-y-2.5">
@@ -2856,32 +3165,75 @@ function PrintSheetTab() {
         )}
       </div>
 
-      {/* Printable 2-Column Side-by-Side Table */}
+      {/* Printable Table (16px font, fixed column widths, clean word-wrap, zero cut-offs) */}
       <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm p-4 print:border-0 print:shadow-none print:p-0 print:rounded-none">
         {liveQuery.isLoading ? (
           <div className="p-8 text-center text-sm text-[#8b6f4e]">
             Loading live orders from Google Sheet…
           </div>
         ) : rowCount === 0 ? (
-          <div className="p-8 text-center text-sm text-[#8b6f4e]">
-            No orders with quantity &gt; 0 are currently on the active {liveQuery.data?.sheetLabel} sheet.
+          <div className="p-8 text-center text-sm text-[#8b6f4e] space-y-2">
+            <p>
+              {viewFilter === "to_print" && printedCleanCustomers.length > 0
+                ? `All ${printedCleanCustomers.length} active customer orders on the sheet have already been printed and hidden!`
+                : `No orders with quantity > 0 match this view on the active ${liveQuery.data?.sheetLabel} sheet.`}
+            </p>
+            {viewFilter === "to_print" && printedCleanCustomers.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setViewFilter("all_highlight")}
+                className="text-xs font-bold px-3 py-1.5 rounded-lg bg-[#c8362b] text-white"
+              >
+                Show All ({activeCustomers.length}) with Printed Highlighted
+              </button>
+            )}
           </div>
         ) : (
-          <div className="overflow-x-auto print:overflow-visible">
-            <div className="hidden print:flex items-center justify-between text-[11px] font-bold border-b border-black pb-1 mb-1">
+          <div className="w-full">
+            <div className="hidden print:flex items-center justify-between text-[14px] font-bold border-b-2 border-black pb-1 mb-2">
               <span>PORTUGAL BAKERY — ORDER SHEET ({liveQuery.data?.sheetLabel})</span>
               <span>DELIVERY DATE: {liveQuery.data?.forDate}</span>
             </div>
-            <table className="w-full border-collapse text-[12px] leading-tight print:text-[10px] print:leading-[1.15]">
+
+            <table
+              style={{
+                fontSize: `${fontSizePx}px`,
+                lineHeight: 1.25,
+                tableLayout: "fixed",
+                width: "100%",
+              }}
+              className="w-full border-collapse"
+            >
+              {columnsMode === 2 ? (
+                <colgroup>
+                  <col style={{ width: "18.5%" }} />
+                  <col style={{ width: "23.5%" }} />
+                  <col style={{ width: "7.5%" }} />
+                  <col style={{ width: "1%" }} />
+                  <col style={{ width: "18.5%" }} />
+                  <col style={{ width: "23.5%" }} />
+                  <col style={{ width: "7.5%" }} />
+                </colgroup>
+              ) : (
+                <colgroup>
+                  <col style={{ width: "36%" }} />
+                  <col style={{ width: "50%" }} />
+                  <col style={{ width: "14%" }} />
+                </colgroup>
+              )}
               <thead>
                 <tr className="bg-[#2a1810] text-white print:bg-gray-200 print:text-black">
-                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Customer</th>
-                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Product</th>
-                  <th className="border border-gray-400 px-2 py-1 text-right font-bold w-12">Qty</th>
-                  <th className="border-y border-gray-400 bg-[#e8dcc8] w-1.5 print:bg-gray-400" />
-                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Customer</th>
-                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Product</th>
-                  <th className="border border-gray-400 px-2 py-1 text-right font-bold w-12">Qty</th>
+                  <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Customer</th>
+                  <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Product</th>
+                  <th className="border border-gray-500 px-1.5 py-1 text-right font-bold">Qty</th>
+                  {columnsMode === 2 && (
+                    <>
+                      <th className="border-y border-gray-500 bg-[#e8dcc8] print:bg-gray-400 p-0" />
+                      <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Customer</th>
+                      <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Product</th>
+                      <th className="border border-gray-500 px-1.5 py-1 text-right font-bold">Qty</th>
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -2889,10 +3241,14 @@ function PrintSheetTab() {
                   const left = leftLines[idx];
                   const right = rightLines[idx];
                   return (
-                    <tr key={idx}>
+                    <tr key={idx} className="break-inside-avoid">
                       <PrintHalfRowCells line={left} onToggleCustomer={cycleCustomerMode} />
-                      <td className="border-x border-gray-400 bg-[#e8dcc8]/60 w-1.5 print:bg-gray-300" />
-                      <PrintHalfRowCells line={right} onToggleCustomer={cycleCustomerMode} />
+                      {columnsMode === 2 && (
+                        <>
+                          <td className="border-x border-gray-500 bg-[#e8dcc8]/70 print:bg-gray-400 p-0" />
+                          <PrintHalfRowCells line={right} onToggleCustomer={cycleCustomerMode} />
+                        </>
+                      )}
                     </tr>
                   );
                 })}
@@ -2915,9 +3271,9 @@ function PrintHalfRowCells({
   if (!line) {
     return (
       <>
-        <td className="border border-gray-300 px-2 py-0.5" />
-        <td className="border border-gray-300 px-2 py-0.5" />
-        <td className="border border-gray-300 px-2 py-0.5 text-right" />
+        <td className="border border-gray-300 px-2 py-1" />
+        <td className="border border-gray-300 px-2 py-1" />
+        <td className="border border-gray-300 px-1.5 py-1 text-right" />
       </>
     );
   }
@@ -2925,32 +3281,51 @@ function PrintHalfRowCells({
   if (line.kind === "driver_subtotal") {
     return (
       <>
-        <td className="border border-gray-400 bg-amber-50/80 print:bg-gray-100 px-2 py-0.5 font-bold text-[11px] text-[#6b5544] print:text-black">
-          {/* Blank customer cell on subtotal line to match spreadsheet pivot */}
-        </td>
-        <td className="border border-gray-400 bg-amber-50/80 print:bg-gray-100 px-2 py-0.5 text-right text-[10px] font-semibold text-[#8b6f4e] print:text-black">
+        <td className="border border-gray-500 bg-amber-100/80 print:bg-gray-200 px-2 py-1 font-bold text-[#6b5544] print:text-black break-words whitespace-normal" />
+        <td className="border border-gray-500 bg-amber-100/80 print:bg-gray-200 px-2 py-1 text-right font-bold text-[#6b5544] print:text-black break-words whitespace-normal">
           {line.driver ? `${line.driver}` : ""}
         </td>
-        <td className="border border-gray-400 bg-amber-50/80 print:bg-gray-100 px-2 py-0.5 text-right font-extrabold text-[#2a1810] print:text-black">
+        <td className="border border-gray-500 bg-amber-100/80 print:bg-gray-200 px-1.5 py-1 text-right font-extrabold text-[#2a1810] print:text-black whitespace-nowrap">
           {line.quantity}
         </td>
       </>
     );
   }
 
+  const isPrintedClean = line.printStatus === "printed_clean";
+  const isPrintedAdded = line.printStatus === "printed_added";
+
   if (line.kind === "customer_total") {
-    const baseName = line.customerName.replace(/\s+Total$/i, "");
+    const baseName = line.rawCustomerName ?? line.customerName.replace(/\s+Total$/i, "");
+    const bgClass = isPrintedClean
+      ? "bg-green-100/90 print:bg-green-100"
+      : isPrintedAdded
+      ? "bg-amber-100/90 print:bg-amber-100"
+      : "bg-[#fdf8f1] print:bg-gray-100";
+
     return (
       <>
         <td
           onClick={() => onToggleCustomer(baseName)}
           title="Click to toggle between Full Items and Total Only"
-          className="border border-gray-400 bg-[#fdf8f1] print:bg-gray-100 px-2 py-0.5 font-bold text-[#2a1810] print:text-black cursor-pointer hover:bg-[#e8dcc8]/50"
+          className={`border border-gray-500 ${bgClass} px-2 py-1 font-bold text-[#2a1810] print:text-black cursor-pointer hover:bg-[#e8dcc8]/50 break-words whitespace-normal`}
           colSpan={2}
         >
-          {line.customerName}
+          <span>{line.customerName}</span>
+          {isPrintedClean && (
+            <span className="ml-1.5 text-[12px] font-bold text-green-800 print:text-black">
+              [✓ Printed]
+            </span>
+          )}
+          {isPrintedAdded && line.printedQty !== undefined && line.addedQty !== undefined && (
+            <span className="ml-1.5 text-[13px] font-extrabold text-[#c8362b] print:text-black">
+              [Printed: {line.printedQty} | +{line.addedQty} Added]
+            </span>
+          )}
         </td>
-        <td className="border border-gray-400 bg-[#fdf8f1] print:bg-gray-100 px-2 py-0.5 text-right font-bold text-[#2a1810] print:text-black">
+        <td
+          className={`border border-gray-500 ${bgClass} px-1.5 py-1 text-right font-extrabold text-[#2a1810] print:text-black whitespace-nowrap`}
+        >
           {line.quantity}
         </td>
       </>
@@ -2958,21 +3333,58 @@ function PrintHalfRowCells({
   }
 
   // Regular item line
+  const itemBgClass = isPrintedClean
+    ? "bg-green-50/70 print:bg-green-50"
+    : isPrintedAdded && (line.addedQty ?? 0) > 0
+    ? "bg-amber-50/90 print:bg-amber-50"
+    : "";
+
   return (
     <>
       <td
-        onClick={() => line.customerName && onToggleCustomer(line.customerName)}
-        className={`border border-gray-300 px-2 py-0.5 font-semibold text-[#2a1810] print:text-black ${
+        onClick={() => line.rawCustomerName && onToggleCustomer(line.rawCustomerName)}
+        className={`border border-gray-400 ${itemBgClass} px-2 py-1 font-bold text-[#2a1810] print:text-black break-words whitespace-normal align-top ${
           line.customerName ? "cursor-pointer hover:underline" : ""
         }`}
       >
         {line.customerName}
+        {line.customerName && isPrintedAdded && (
+          <div className="text-[11px] font-extrabold text-[#c8362b] print:text-black leading-tight mt-0.5">
+            ⚡ UPDATED
+          </div>
+        )}
       </td>
-      <td className="border border-gray-300 px-2 py-0.5 text-[#2a1810] print:text-black">
-        {line.productName}
+      <td
+        className={`border border-gray-400 ${itemBgClass} px-2 py-1 text-[#2a1810] print:text-black break-words whitespace-normal align-top`}
+      >
+        <div>{line.productName}</div>
+        {isPrintedAdded && line.printedQty !== undefined && (
+          <div className="text-[12px] font-bold leading-tight mt-0.5">
+            {line.printedQty > 0 && (line.addedQty ?? 0) > 0 ? (
+              <span className="text-[#c8362b] print:text-black">
+                Printed: {line.printedQty} · <strong>+Added: {line.addedQty}</strong>
+              </span>
+            ) : line.printedQty === 0 && (line.addedQty ?? 0) > 0 ? (
+              <span className="text-[#c8362b] print:text-black">
+                <strong>NEW ADDED +{line.addedQty}</strong>
+              </span>
+            ) : (
+              <span className="text-green-800 print:text-black">
+                ✓ Printed: {line.printedQty}
+              </span>
+            )}
+          </div>
+        )}
       </td>
-      <td className="border border-gray-300 px-2 py-0.5 text-right font-semibold text-[#2a1810] print:text-black">
-        {line.quantity}
+      <td
+        className={`border border-gray-400 ${itemBgClass} px-1.5 py-1 text-right font-bold text-[#2a1810] print:text-black whitespace-nowrap align-top`}
+      >
+        <div>{line.quantity}</div>
+        {isPrintedAdded && (line.addedQty ?? 0) > 0 && (
+          <div className="text-[11px] font-extrabold text-[#c8362b] print:text-black">
+            (+{line.addedQty})
+          </div>
+        )}
       </td>
     </>
   );
