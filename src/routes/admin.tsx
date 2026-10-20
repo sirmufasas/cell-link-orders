@@ -2585,16 +2585,118 @@ function getCustomerPrintStatus(
   return "printed_clean";
 }
 
+type PrintLayoutSettings = {
+  colWidths: [number, number, number, number, number, number, number]; // A, B, C, D, E, F, G in px
+  rowHeightPx: number;
+  fontSizePx: number;
+  marginTopBottomMm: number;
+  marginLeftRightMm: number;
+  linkLeftRightCols: boolean;
+};
+
+const DEFAULT_PRINT_LAYOUT: PrintLayoutSettings = {
+  colWidths: [166, 160, 42, 14, 166, 160, 42],
+  rowHeightPx: 20,
+  fontSizePx: 14,
+  marginTopBottomMm: 5,
+  marginLeftRightMm: 5,
+  linkLeftRightCols: true,
+};
+
+const PRINT_LAYOUT_STORAGE_KEY = "bakery_print_layout_settings_v1";
+
 function PrintSheetTab() {
   const qc = useQueryClient();
   const liveQuery = useQuery(liveSheetOrdersQuery);
 
   const [driverFilter, setDriverFilter] = useState("__all__");
   const [groupByDriver, setGroupByDriver] = useState(true);
-  const [fontSizePx, setFontSizePx] = useState<number>(14);
   const [viewFilter, setViewFilter] = useState<"to_print" | "all_highlight" | "printed_only">("to_print");
   const [showCustomize, setShowCustomize] = useState(false);
+  const [showLayoutControls, setShowLayoutControls] = useState(true);
   const [customizeSearch, setCustomizeSearch] = useState("");
+
+  const [layout, setLayout] = useState<PrintLayoutSettings>(() => {
+    if (typeof window === "undefined") return DEFAULT_PRINT_LAYOUT;
+    try {
+      const raw = localStorage.getItem(PRINT_LAYOUT_STORAGE_KEY);
+      if (!raw) return DEFAULT_PRINT_LAYOUT;
+      const parsed = JSON.parse(raw) as Partial<PrintLayoutSettings>;
+      return {
+        ...DEFAULT_PRINT_LAYOUT,
+        ...parsed,
+        colWidths:
+          Array.isArray(parsed.colWidths) && parsed.colWidths.length === 7
+            ? (parsed.colWidths as [number, number, number, number, number, number, number])
+            : DEFAULT_PRINT_LAYOUT.colWidths,
+      };
+    } catch {
+      return DEFAULT_PRINT_LAYOUT;
+    }
+  });
+
+  function updateLayout(patch: Partial<PrintLayoutSettings>) {
+    setLayout((prev) => {
+      const next = { ...prev, ...patch };
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem(PRINT_LAYOUT_STORAGE_KEY, JSON.stringify(next));
+        } catch {}
+      }
+      return next;
+    });
+  }
+
+  function setColWidth(colIdx: number, rawPx: number) {
+    const minPx = colIdx === 3 ? 2 : colIdx === 2 || colIdx === 6 ? 24 : 60;
+    const maxPx = colIdx === 3 ? 60 : colIdx === 2 || colIdx === 6 ? 140 : 420;
+    const clamped = Math.max(minPx, Math.min(maxPx, Math.round(rawPx)));
+    setLayout((prev) => {
+      const nextCols = [...prev.colWidths] as [number, number, number, number, number, number, number];
+      nextCols[colIdx] = clamped;
+      if (prev.linkLeftRightCols) {
+        if (colIdx === 0) nextCols[4] = clamped;
+        if (colIdx === 4) nextCols[0] = clamped;
+        if (colIdx === 1) nextCols[5] = clamped;
+        if (colIdx === 5) nextCols[1] = clamped;
+        if (colIdx === 2) nextCols[6] = clamped;
+        if (colIdx === 6) nextCols[2] = clamped;
+      }
+      const next = { ...prev, colWidths: nextCols };
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem(PRINT_LAYOUT_STORAGE_KEY, JSON.stringify(next));
+        } catch {}
+      }
+      return next;
+    });
+  }
+
+  function startColResize(colIdx: number, e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = layout.colWidths[colIdx];
+    const onMove = (ev: MouseEvent) => {
+      setColWidth(colIdx, startW + (ev.clientX - startX));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  const {
+    colWidths,
+    rowHeightPx,
+    fontSizePx,
+    marginTopBottomMm,
+    marginLeftRightMm,
+    linkLeftRightCols,
+  } = layout;
+  const totalSheetWidthPx = colWidths.reduce((s, w) => s + w, 0);
 
   const forDateKey = liveQuery.data?.forDate ?? "current";
   const snapshotStorageKey = `bakery_printed_snapshots_v1_${forDateKey}`;
@@ -2891,13 +2993,23 @@ function PrintSheetTab() {
   }, [allCustomers, customizeSearch]);
 
   return (
-    <section className="space-y-3">
-      {/* Print-specific @page rules matching Google Sheets A1:G38 compact printout */}
+    <section className="space-y-3 print:space-y-0">
+      {/* Print-specific @page rules, custom margins, and 100% scrollbar removal */}
       <style>{`
         @media print {
           @page {
             size: A4 portrait;
-            margin: 5mm;
+            margin: ${marginTopBottomMm}mm ${marginLeftRightMm}mm;
+          }
+          html, body, #root, main, section, div {
+            overflow: visible !important;
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+          }
+          *::-webkit-scrollbar {
+            display: none !important;
+            width: 0 !important;
+            height: 0 !important;
           }
           body {
             -webkit-print-color-adjust: exact !important;
@@ -2916,7 +3028,7 @@ function PrintSheetTab() {
                 {liveQuery.data?.sheetLabel ?? "…"} · {liveQuery.data?.forDate ?? "Tomorrow"}
               </span>
               <span className="text-xs text-[#8b6f4e]">
-                {sheetCustomers.length} customers · {rowCount} rows
+                {sheetCustomers.length} customers · {rowCount} rows · {totalSheetWidthPx}px wide
               </span>
               {printedAddedCustomers.length > 0 && (
                 <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300">
@@ -2990,22 +3102,6 @@ function PrintSheetTab() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
-              <span className="text-[11px] font-semibold text-[#8b6f4e] px-1.5">Calibri:</span>
-              {[13, 14, 15, 16].map((sz) => (
-                <button
-                  key={sz}
-                  type="button"
-                  onClick={() => setFontSizePx(sz)}
-                  className={`px-2 py-0.5 rounded-lg text-xs font-bold ${
-                    fontSizePx === sz ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
-                  }`}
-                >
-                  {sz}
-                </button>
-              ))}
-            </div>
-
             <select
               value={driverFilter}
               onChange={(e) => setDriverFilter(e.target.value)}
@@ -3030,13 +3126,189 @@ function PrintSheetTab() {
 
             <button
               type="button"
+              onClick={() => setShowLayoutControls((s) => !s)}
+              className={`text-xs font-bold px-2.5 py-1 rounded-xl border transition ${
+                showLayoutControls
+                  ? "bg-[#2a1810] text-white border-[#2a1810]"
+                  : "border-[#e8dcc8] hover:bg-[#fdf8f1]"
+              }`}
+            >
+              📐 Columns & Margins
+            </button>
+
+            <button
+              type="button"
               onClick={() => setShowCustomize((s) => !s)}
               className="text-xs font-bold px-2.5 py-1 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1]"
             >
-              {showCustomize ? "Hide Toggles" : "⚙️ Customize"}
+              {showCustomize ? "Hide Toggles" : "⚙️ Customers"}
             </button>
           </div>
         </div>
+
+        {/* Interactive Column Width, Row Height, Font Size & Margin Controls */}
+        {showLayoutControls && (
+          <div className="pt-2.5 border-t border-[#e8dcc8] bg-[#fdf8f1]/70 rounded-xl p-3 space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-bold text-[#2a1810]">
+                📐 Resize Columns & Print Margins{" "}
+                <span className="font-normal text-[#8b6f4e]">
+                  (you can also drag the column borders between A..G directly on the sheet below)
+                </span>
+              </span>
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={linkLeftRightCols}
+                    onChange={(e) => updateLayout({ linkLeftRightCols: e.target.checked })}
+                  />
+                  Mirror Left & Right Columns (A=E, B=F, C=G)
+                </label>
+                <button
+                  type="button"
+                  onClick={() => updateLayout(DEFAULT_PRINT_LAYOUT)}
+                  className="text-xs font-bold px-2.5 py-1 rounded-lg border border-[#e8dcc8] bg-white hover:bg-[#e8dcc8]/40"
+                >
+                  ↺ Reset Sizes
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2.5 text-xs">
+              <label className="bg-white border border-[#e8dcc8] rounded-lg p-2 flex flex-col gap-1">
+                <div className="flex justify-between font-semibold text-[#6b5544]">
+                  <span>Customer (A/E)</span>
+                  <span className="font-bold text-[#2a1810]">{colWidths[0]}px</span>
+                </div>
+                <input
+                  type="range"
+                  min={80}
+                  max={320}
+                  value={colWidths[0]}
+                  onChange={(e) => setColWidth(0, parseInt(e.target.value, 10))}
+                  className="w-full accent-[#c8362b]"
+                />
+              </label>
+
+              <label className="bg-white border border-[#e8dcc8] rounded-lg p-2 flex flex-col gap-1">
+                <div className="flex justify-between font-semibold text-[#6b5544]">
+                  <span>Product (B/F)</span>
+                  <span className="font-bold text-[#2a1810]">{colWidths[1]}px</span>
+                </div>
+                <input
+                  type="range"
+                  min={80}
+                  max={320}
+                  value={colWidths[1]}
+                  onChange={(e) => setColWidth(1, parseInt(e.target.value, 10))}
+                  className="w-full accent-[#c8362b]"
+                />
+              </label>
+
+              <label className="bg-white border border-[#e8dcc8] rounded-lg p-2 flex flex-col gap-1">
+                <div className="flex justify-between font-semibold text-[#6b5544]">
+                  <span>Qty (C/G)</span>
+                  <span className="font-bold text-[#2a1810]">{colWidths[2]}px</span>
+                </div>
+                <input
+                  type="range"
+                  min={26}
+                  max={100}
+                  value={colWidths[2]}
+                  onChange={(e) => setColWidth(2, parseInt(e.target.value, 10))}
+                  className="w-full accent-[#c8362b]"
+                />
+              </label>
+
+              <label className="bg-white border border-[#e8dcc8] rounded-lg p-2 flex flex-col gap-1">
+                <div className="flex justify-between font-semibold text-[#6b5544]">
+                  <span>Divider (D)</span>
+                  <span className="font-bold text-[#2a1810]">{colWidths[3]}px</span>
+                </div>
+                <input
+                  type="range"
+                  min={2}
+                  max={40}
+                  value={colWidths[3]}
+                  onChange={(e) => setColWidth(3, parseInt(e.target.value, 10))}
+                  className="w-full accent-[#c8362b]"
+                />
+              </label>
+
+              <label className="bg-white border border-[#e8dcc8] rounded-lg p-2 flex flex-col gap-1">
+                <div className="flex justify-between font-semibold text-[#6b5544]">
+                  <span>Font / Row</span>
+                  <span className="font-bold text-[#2a1810]">
+                    {fontSizePx}px / {rowHeightPx}px
+                  </span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    min={10}
+                    max={22}
+                    value={fontSizePx}
+                    onChange={(e) =>
+                      updateLayout({
+                        fontSizePx: Math.max(10, Math.min(22, parseInt(e.target.value || "14", 10))),
+                      })
+                    }
+                    className="w-1/2 border border-[#e8dcc8] rounded px-1.5 py-0.5 text-center font-bold"
+                    title="Font size (px)"
+                  />
+                  <input
+                    type="number"
+                    min={16}
+                    max={36}
+                    value={rowHeightPx}
+                    onChange={(e) =>
+                      updateLayout({
+                        rowHeightPx: Math.max(16, Math.min(36, parseInt(e.target.value || "20", 10))),
+                      })
+                    }
+                    className="w-1/2 border border-[#e8dcc8] rounded px-1.5 py-0.5 text-center font-bold"
+                    title="Row height (px)"
+                  />
+                </div>
+              </label>
+
+              <label className="bg-white border border-[#e8dcc8] rounded-lg p-2 flex flex-col gap-1">
+                <div className="flex justify-between font-semibold text-[#6b5544]">
+                  <span>Top/Bot Margin</span>
+                  <span className="font-bold text-[#2a1810]">{marginTopBottomMm}mm</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={25}
+                  value={marginTopBottomMm}
+                  onChange={(e) =>
+                    updateLayout({ marginTopBottomMm: parseInt(e.target.value, 10) })
+                  }
+                  className="w-full accent-[#c8362b]"
+                />
+              </label>
+
+              <label className="bg-white border border-[#e8dcc8] rounded-lg p-2 flex flex-col gap-1">
+                <div className="flex justify-between font-semibold text-[#6b5544]">
+                  <span>Left/Right Margin</span>
+                  <span className="font-bold text-[#2a1810]">{marginLeftRightMm}mm</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={25}
+                  value={marginLeftRightMm}
+                  onChange={(e) =>
+                    updateLayout({ marginLeftRightMm: parseInt(e.target.value, 10) })
+                  }
+                  className="w-full accent-[#c8362b]"
+                />
+              </label>
+            </div>
+          </div>
+        )}
 
         {/* Printed & Hidden Customers Bar */}
         {Object.keys(printedSnapshots).length > 0 && (
@@ -3136,8 +3408,8 @@ function PrintSheetTab() {
         )}
       </div>
 
-      {/* Exact Google Sheets 'print sheet' A1:H38 Grid */}
-      <div className="bg-white rounded-xl border border-[#c0c0c0] shadow-sm p-2 print:border-0 print:shadow-none print:p-0 print:rounded-none overflow-x-auto">
+      {/* Exact Google Sheets 'print sheet' A1:G38 Grid (No dark right column H, no print scrollbars) */}
+      <div className="bg-white rounded-xl border border-[#c0c0c0] shadow-sm p-2 print:border-0 print:shadow-none print:p-0 print:rounded-none overflow-x-auto print:overflow-visible">
         {liveQuery.isLoading ? (
           <div className="p-8 text-center text-sm text-[#8b6f4e]">
             Loading live orders from Google Sheet…
@@ -3166,45 +3438,47 @@ function PrintSheetTab() {
                 fontFamily: 'Calibri, "Carlito", "Segoe UI", Arial, sans-serif',
                 fontSize: `${fontSizePx}px`,
                 fontWeight: 400,
-                lineHeight: "18px",
+                lineHeight: `${Math.max(14, rowHeightPx - 2)}px`,
                 tableLayout: "fixed",
-                width: "768px",
+                width: `${totalSheetWidthPx}px`,
                 borderCollapse: "collapse",
               }}
-              className="print:w-full"
             >
               <colgroup>
                 {/* Screen-only row index column */}
                 <col className="print:hidden" style={{ width: "28px" }} />
                 {/* Col A: Left Customer */}
-                <col style={{ width: "166px" }} />
+                <col style={{ width: `${colWidths[0]}px` }} />
                 {/* Col B: Left Product */}
-                <col style={{ width: "160px" }} />
+                <col style={{ width: `${colWidths[1]}px` }} />
                 {/* Col C: Left Qty */}
-                <col style={{ width: "42px" }} />
-                {/* Col D: Dark center divider */}
-                <col style={{ width: "14px" }} />
+                <col style={{ width: `${colWidths[2]}px` }} />
+                {/* Col D: Center divider */}
+                <col style={{ width: `${colWidths[3]}px` }} />
                 {/* Col E: Right Customer */}
-                <col style={{ width: "166px" }} />
+                <col style={{ width: `${colWidths[4]}px` }} />
                 {/* Col F: Right Product */}
-                <col style={{ width: "160px" }} />
+                <col style={{ width: `${colWidths[5]}px` }} />
                 {/* Col G: Right Qty */}
-                <col style={{ width: "42px" }} />
-                {/* Col H: Dark right border bar */}
-                <col style={{ width: "22px" }} />
+                <col style={{ width: `${colWidths[6]}px` }} />
               </colgroup>
-              {/* Screen-only Google Sheets A..H header bar */}
+              {/* Screen-only Google Sheets A..G header bar with drag-to-resize handles */}
               <thead className="print:hidden">
-                <tr style={{ height: "19px" }} className="bg-[#f8f9fa] text-[#5f6368] text-[11px] select-none">
+                <tr style={{ height: "20px" }} className="bg-[#f8f9fa] text-[#5f6368] text-[11px] select-none">
                   <th className="border border-[#c0c0c0] font-normal text-center" />
-                  <th className="border border-[#c0c0c0] font-normal text-center">A</th>
-                  <th className="border border-[#c0c0c0] font-normal text-center">B</th>
-                  <th className="border border-[#c0c0c0] font-normal text-center">C</th>
-                  <th className="border border-[#c0c0c0] font-normal text-center">D</th>
-                  <th className="border border-[#c0c0c0] font-normal text-center">E</th>
-                  <th className="border border-[#c0c0c0] font-normal text-center">F</th>
-                  <th className="border border-[#c0c0c0] font-normal text-center">G</th>
-                  <th className="border border-[#c0c0c0] font-normal text-center">H</th>
+                  {(["A", "B", "C", "D", "E", "F", "G"] as const).map((letter, cIdx) => (
+                    <th
+                      key={letter}
+                      className="border border-[#c0c0c0] font-normal text-center relative group"
+                      title={`Drag right edge to resize Column ${letter} (${colWidths[cIdx]}px)`}
+                    >
+                      <span>{letter}</span>
+                      <div
+                        onMouseDown={(e) => startColResize(cIdx, e)}
+                        className="absolute top-0 right-0 h-full w-2 cursor-col-resize hover:bg-[#1a73e8] z-10"
+                      />
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
@@ -3212,16 +3486,19 @@ function PrintSheetTab() {
                   const left = leftLines[idx];
                   const right = rightLines[idx];
                   return (
-                    <tr key={idx} style={{ height: "20px" }}>
+                    <tr key={idx} style={{ height: `${rowHeightPx}px` }}>
                       <td
                         className="print:hidden border border-[#c0c0c0] bg-[#f8f9fa] text-[#5f6368] text-[11px] text-center select-none"
-                        style={{ padding: 0, lineHeight: "18px" }}
+                        style={{ padding: 0, lineHeight: `${Math.max(14, rowHeightPx - 2)}px` }}
                       >
                         {idx + 1}
                       </td>
                       <PrintHalfRowCells
                         line={left}
                         fontSizePx={fontSizePx}
+                        rowHeightPx={rowHeightPx}
+                        custColWidth={colWidths[0]}
+                        prodColWidth={colWidths[1]}
                         onToggleCustomer={cycleCustomerMode}
                       />
                       <td
@@ -3235,15 +3512,10 @@ function PrintSheetTab() {
                       <PrintHalfRowCells
                         line={right}
                         fontSizePx={fontSizePx}
+                        rowHeightPx={rowHeightPx}
+                        custColWidth={colWidths[4]}
+                        prodColWidth={colWidths[5]}
                         onToggleCustomer={cycleCustomerMode}
-                      />
-                      <td
-                        style={{
-                          backgroundColor: "#434343",
-                          borderTop: "1px solid #333333",
-                          borderBottom: "1px solid #333333",
-                          padding: 0,
-                        }}
                       />
                     </tr>
                   );
@@ -3257,7 +3529,9 @@ function PrintSheetTab() {
   );
 }
 
-function fitCellFontSize(text: string, basePx: number, maxChars: number): string {
+function fitCellFontSize(text: string, basePx: number, colWidthPx: number): string {
+  const approxCharWidth = basePx * 0.52;
+  const maxChars = Math.max(8, Math.floor((colWidthPx - 8) / approxCharWidth));
   if (text.length > maxChars + 6) return `${Math.max(10, basePx - 2.5)}px`;
   if (text.length > maxChars) return `${Math.max(11, basePx - 1.5)}px`;
   return `${basePx}px`;
@@ -3266,16 +3540,22 @@ function fitCellFontSize(text: string, basePx: number, maxChars: number): string
 function PrintHalfRowCells({
   line,
   fontSizePx,
+  rowHeightPx,
+  custColWidth,
+  prodColWidth,
   onToggleCustomer,
 }: {
   line: PrintLine | undefined;
   fontSizePx: number;
+  rowHeightPx: number;
+  custColWidth: number;
+  prodColWidth: number;
   onToggleCustomer: (rawCustomerName: string) => void;
 }) {
   const baseCellStyle: React.CSSProperties = {
     padding: "0px 4px",
-    height: "20px",
-    lineHeight: "19px",
+    height: `${rowHeightPx}px`,
+    lineHeight: `${Math.max(14, rowHeightPx - 1)}px`,
     whiteSpace: "nowrap",
     overflow: "hidden",
     fontWeight: 400,
@@ -3354,14 +3634,14 @@ function PrintHalfRowCells({
   const isPrintedClean = line.printStatus === "printed_clean";
   const isPrintedAdded = line.printStatus === "printed_added";
 
-  // Customer Total row: "[Customer] Total" spanning Col A+B (or showing in Col A with empty Col B), Qty in Col C
+  // Customer Total row: "[Customer] Total" spanning Col A+B, Qty in Col C
   if (line.kind === "customer_total") {
     const baseName = line.rawCustomerName ?? line.customerName.replace(/\s+Total$/i, "");
     const rowBg = isPrintedClean
-      ? "#d9ead3" // Google Sheets light green
+      ? "#d9ead3"
       : isPrintedAdded
-      ? "#fff2cc" // Google Sheets light amber
-      : "#dfe8f3"; // Google Sheets pivot light blue-grey
+      ? "#fff2cc"
+      : "#dfe8f3";
 
     const labelText =
       isPrintedAdded && line.printedQty !== undefined && line.addedQty !== undefined
@@ -3378,7 +3658,7 @@ function PrintHalfRowCells({
           colSpan={2}
           style={{
             ...baseCellStyle,
-            fontSize: fitCellFontSize(labelText, fontSizePx, 36),
+            fontSize: fitCellFontSize(labelText, fontSizePx, custColWidth + prodColWidth),
             backgroundColor: rowBg,
             borderTop: "1px solid #434343",
             borderBottom: "1px solid #434343",
@@ -3434,7 +3714,7 @@ function PrintHalfRowCells({
         onClick={() => line.rawCustomerName && onToggleCustomer(line.rawCustomerName)}
         style={{
           ...baseCellStyle,
-          fontSize: fitCellFontSize(line.customerName, fontSizePx, 20),
+          fontSize: fitCellFontSize(line.customerName, fontSizePx, custColWidth),
           backgroundColor: custBg,
           borderTop: line.customerName ? "1px solid #434343" : "1px solid #9e9e9e",
           borderBottom: "1px solid #9e9e9e",
@@ -3448,7 +3728,7 @@ function PrintHalfRowCells({
       <td
         style={{
           ...baseCellStyle,
-          fontSize: fitCellFontSize(prodLabel, fontSizePx, 21),
+          fontSize: fitCellFontSize(prodLabel, fontSizePx, prodColWidth),
           backgroundColor: itemBg,
           border: "1px solid #b7b7b7",
         }}
