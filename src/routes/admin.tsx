@@ -10,7 +10,7 @@ import {
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
   autoSyncIfStale, getLiveSheetOrders, adminSaveManualOrder, getHistoryRetentionInfo,
-  clearOldOrderHistory, type LiveSheetCustomerOrder,
+  clearOldOrderHistory, savePrintSheetState, type LiveSheetCustomerOrder,
 } from "@/lib/bakery.functions";
 import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
 
@@ -346,7 +346,23 @@ function AdminPage() {
   const { data: analytics } = useSuspenseQuery(analyticsQuery);
   const { data: sheetInfo } = useQuery(sheetInfoQuery);
 
-  const [tab, setTab] = useState<AdminTab>("customers");
+  const [tab, setTabState] = useState<AdminTab>(() => {
+    if (typeof window === "undefined") return "customers";
+    const saved = sessionStorage.getItem("bakery_admin_active_tab") as AdminTab | null;
+    if (saved && ["customers", "manual", "print", "history", "analytics", "estimates", "stocks", "drivers"].includes(saved)) {
+      return saved;
+    }
+    return "customers";
+  });
+
+  function setTab(nextTab: AdminTab) {
+    setTabState(nextTab);
+    if (typeof window !== "undefined") {
+      try {
+        sessionStorage.setItem("bakery_admin_active_tab", nextTab);
+      } catch {}
+    }
+  }
   const [search, setSearch] = useState("");
   const [customerDriverFilter, setCustomerDriverFilter] = useState("__all__");
   const [customerStatusFilter, setCustomerStatusFilter] = useState<"all" | "ordered" | "pending" | "pinned">("all");
@@ -2789,19 +2805,73 @@ type PrintLine = {
   addedQty?: number;
 };
 
+function buildCustomerSnapshot(
+  c: LiveSheetCustomerOrder,
+  nowIso = new Date().toISOString(),
+): PrintedCustomerSnapshot {
+  const itemsMap: Record<string, number> = {};
+  for (const r of c.rows) {
+    if (r.quantity > 0) {
+      const pKey = r.productName.trim().toLowerCase();
+      itemsMap[pKey] = (itemsMap[pKey] ?? 0) + r.quantity;
+    }
+  }
+  return {
+    printedAt: nowIso,
+    totalQuantity: c.totalQuantity,
+    items: itemsMap,
+  };
+}
+
 function getCustomerPrintStatus(
   c: LiveSheetCustomerOrder,
   snap: PrintedCustomerSnapshot | undefined,
 ): CustomerPrintStatus {
   if (!snap) return "unprinted";
-  if (c.totalQuantity !== snap.totalQuantity) return "printed_added";
+  // Only re-show a printed customer if an order/item was ADDED to it
+  if (c.totalQuantity > snap.totalQuantity) return "printed_added";
+  const currentByProduct: Record<string, number> = {};
   for (const r of c.rows) {
     if (r.quantity <= 0) continue;
     const pKey = r.productName.trim().toLowerCase();
+    currentByProduct[pKey] = (currentByProduct[pKey] ?? 0) + r.quantity;
+  }
+  for (const [pKey, qty] of Object.entries(currentByProduct)) {
     const prev = snap.items[pKey] ?? 0;
-    if (r.quantity !== prev) return "printed_added";
+    if (qty > prev) return "printed_added";
   }
   return "printed_clean";
+}
+
+const PRINT_SNAPSHOTS_STORAGE_KEY = "bakery_printed_snapshots_v2";
+
+function loadInitialPrintedSnapshots(): Record<string, PrintedCustomerSnapshot> {
+  if (typeof window === "undefined") return {};
+  const merged: Record<string, PrintedCustomerSnapshot> = {};
+  try {
+    // Migrate any earlier date-keyed v1 snapshots so nothing previously printed today is lost
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith("bakery_printed_snapshots_v1_")) {
+        try {
+          const parsed = JSON.parse(localStorage.getItem(key) ?? "{}") as Record<
+            string,
+            PrintedCustomerSnapshot
+          >;
+          Object.assign(merged, parsed);
+        } catch {}
+      }
+    }
+    const rawV2 = localStorage.getItem(PRINT_SNAPSHOTS_STORAGE_KEY);
+    if (rawV2) {
+      const parsedV2 = JSON.parse(rawV2) as Record<string, PrintedCustomerSnapshot>;
+      Object.assign(merged, parsedV2);
+    }
+    if (Object.keys(merged).length > 0) {
+      localStorage.setItem(PRINT_SNAPSHOTS_STORAGE_KEY, JSON.stringify(merged));
+    }
+  } catch {}
+  return merged;
 }
 
 type PrintLayoutSettings = {
@@ -2917,30 +2987,9 @@ function PrintSheetTab() {
   } = layout;
   const totalSheetWidthPx = colWidths.reduce((s, w) => s + w, 0);
 
-  const forDateKey = liveQuery.data?.forDate ?? "current";
-  const snapshotStorageKey = `bakery_printed_snapshots_v1_${forDateKey}`;
-
-  const [printedSnapshots, setPrintedSnapshots] = useState<Record<string, PrintedCustomerSnapshot>>({});
-
-  // Load printed snapshots for the active delivery date
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const raw = localStorage.getItem(snapshotStorageKey);
-      setPrintedSnapshots(raw ? (JSON.parse(raw) as Record<string, PrintedCustomerSnapshot>) : {});
-    } catch {
-      setPrintedSnapshots({});
-    }
-  }, [snapshotStorageKey]);
-
-  function saveSnapshots(next: Record<string, PrintedCustomerSnapshot>) {
-    setPrintedSnapshots(next);
-    if (typeof window !== "undefined") {
-      try {
-        localStorage.setItem(snapshotStorageKey, JSON.stringify(next));
-      } catch {}
-    }
-  }
+  const [printedSnapshots, setPrintedSnapshots] = useState<Record<string, PrintedCustomerSnapshot>>(() =>
+    loadInitialPrintedSnapshots(),
+  );
 
   const [customModes, setCustomModes] = useState<Record<string, PrintCustomerMode>>(() => {
     if (typeof window === "undefined") return {};
@@ -2951,6 +3000,74 @@ function PrintSheetTab() {
       return {};
     }
   });
+
+  // Merge server-persisted print state (from Supabase) with local state whenever
+  // liveQuery finishes loading, and remove snapshots only for customers whose
+  // order on the sheet has been cleared to 0.
+  const serverSyncedOnceRef = useRef(false);
+  useEffect(() => {
+    if (!liveQuery.data) return;
+    const serverSnaps = liveQuery.data.printState?.printedSnapshots ?? {};
+    const serverModes = liveQuery.data.printState?.customModes ?? {};
+    const liveCusts = liveQuery.data.customers ?? [];
+
+    setPrintedSnapshots((prev) => {
+      const merged: Record<string, PrintedCustomerSnapshot> = { ...serverSnaps, ...prev };
+      // If both server and local have a snapshot for the same customer, keep the newer one
+      for (const [k, sSnap] of Object.entries(serverSnaps)) {
+        const lSnap = prev[k];
+        if (!lSnap || (sSnap.printedAt ?? "") > (lSnap.printedAt ?? "")) {
+          merged[k] = sSnap;
+        }
+      }
+      // If a customer on the live sheet now has totalQuantity === 0 (order cleared),
+      // remove their stale snapshot so their next order appears fresh.
+      for (const c of liveCusts) {
+        const k = normPrintKey(c.name);
+        if (c.totalQuantity === 0 && merged[k]) {
+          delete merged[k];
+        }
+      }
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem(PRINT_SNAPSHOTS_STORAGE_KEY, JSON.stringify(merged));
+        } catch {}
+      }
+      if (!serverSyncedOnceRef.current && Object.keys(merged).length > Object.keys(serverSnaps).length) {
+        serverSyncedOnceRef.current = true;
+        void savePrintSheetState({ data: { printedSnapshots: merged } });
+      } else {
+        serverSyncedOnceRef.current = true;
+      }
+      return merged;
+    });
+
+    if (Object.keys(serverModes).length > 0) {
+      setCustomModes((prev) => {
+        const mergedModes = { ...serverModes, ...prev };
+        if (typeof window !== "undefined") {
+          try {
+            localStorage.setItem(PRINT_MODES_STORAGE_KEY, JSON.stringify(mergedModes));
+          } catch {}
+        }
+        return mergedModes;
+      });
+    }
+  }, [liveQuery.data]);
+
+  function persistSnapshotsOnly(next: Record<string, PrintedCustomerSnapshot>) {
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem(PRINT_SNAPSHOTS_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+    }
+    void savePrintSheetState({ data: { printedSnapshots: next } });
+  }
+
+  function saveSnapshots(next: Record<string, PrintedCustomerSnapshot>) {
+    setPrintedSnapshots(next);
+    persistSnapshotsOnly(next);
+  }
 
   function modeForCustomer(name: string): PrintCustomerMode {
     const k = normPrintKey(name);
@@ -2964,13 +3081,32 @@ function PrintSheetTab() {
       try {
         localStorage.setItem(PRINT_MODES_STORAGE_KEY, JSON.stringify(next));
       } catch {}
+      void savePrintSheetState({ data: { customModes: next } });
       return next;
     });
+    // If the user is closing ("total_only" or "hidden") a customer that was
+    // previously flagged as "printed_added", update its snapshot to the current
+    // quantities so it stays closed unless another order is added later.
+    if (mode === "total_only" || mode === "hidden") {
+      const cust = (liveQuery.data?.customers ?? []).find((c) => normPrintKey(c.name) === k);
+      if (cust && printedSnapshots[k]) {
+        const nextSnaps = {
+          ...printedSnapshots,
+          [k]: buildCustomerSnapshot(cust),
+        };
+        saveSnapshots(nextSnaps);
+      }
+    }
   }
 
   function cycleCustomerMode(name: string) {
+    const k = normPrintKey(name);
+    const status = customerStatuses.get(k) ?? "unprinted";
     const current = modeForCustomer(name);
-    const next: PrintCustomerMode = current === "items" ? "total_only" : "items";
+    // If the customer is currently expanded (either mode === "items" or forced open by "printed_added"),
+    // clicking it closes it to "total_only" and snapshots its current quantities.
+    const isCurrentlyOpen = current === "items" || status === "printed_added";
+    const next: PrintCustomerMode = isCurrentlyOpen ? "total_only" : "items";
     setCustomerMode(name, next);
   }
 
@@ -2980,6 +3116,7 @@ function PrintSheetTab() {
       try {
         localStorage.removeItem(PRINT_MODES_STORAGE_KEY);
       } catch {}
+      void savePrintSheetState({ data: { customModes: {} } });
       return;
     }
     const next: Record<string, PrintCustomerMode> = {};
@@ -2990,6 +3127,7 @@ function PrintSheetTab() {
     try {
       localStorage.setItem(PRINT_MODES_STORAGE_KEY, JSON.stringify(next));
     } catch {}
+    void savePrintSheetState({ data: { customModes: next } });
   }
 
   const allCustomers = liveQuery.data?.customers ?? [];
@@ -3056,24 +3194,29 @@ function PrintSheetTab() {
     customModes,
   ]);
 
-  function markCustomersPrinted(custList: LiveSheetCustomerOrder[]) {
-    if (!custList.length) return;
-    const next = { ...printedSnapshots };
+  function buildUpdatedSnapshotsForList(
+    custList: LiveSheetCustomerOrder[],
+    base: Record<string, PrintedCustomerSnapshot> = printedSnapshots,
+  ): Record<string, PrintedCustomerSnapshot> {
+    const next = { ...base };
     const nowIso = new Date().toISOString();
     for (const c of custList) {
-      const itemsMap: Record<string, number> = {};
-      for (const r of c.rows) {
-        if (r.quantity > 0) {
-          itemsMap[r.productName.trim().toLowerCase()] = r.quantity;
-        }
-      }
-      next[normPrintKey(c.name)] = {
-        printedAt: nowIso,
-        totalQuantity: c.totalQuantity,
-        items: itemsMap,
-      };
+      next[normPrintKey(c.name)] = buildCustomerSnapshot(c, nowIso);
     }
+    return next;
+  }
+
+  function markCustomersPrinted(custList: LiveSheetCustomerOrder[]) {
+    if (!custList.length) return;
+    const next = buildUpdatedSnapshotsForList(custList);
     saveSnapshots(next);
+  }
+
+  function markSingleCustomerPrintedByName(customerName: string) {
+    const targetKey = normPrintKey(customerName);
+    const found = allCustomers.find((c) => normPrintKey(c.name) === targetKey);
+    if (!found) return;
+    markCustomersPrinted([found]);
   }
 
   function unmarkCustomerPrinted(customerName: string) {
@@ -3087,12 +3230,56 @@ function PrintSheetTab() {
     saveSnapshots({});
   }
 
+  // Keep a ref to the current sheetCustomers + printedSnapshots so even if the
+  // user prints via keyboard (Ctrl+P / Cmd+P) instead of clicking the button,
+  // beforeprint/afterprint automatically persists and hides the printed customers!
+  const sheetCustomersRef = useRef<LiveSheetCustomerOrder[]>(sheetCustomers);
+  sheetCustomersRef.current = sheetCustomers;
+  const printedSnapshotsRef = useRef<Record<string, PrintedCustomerSnapshot>>(printedSnapshots);
+  printedSnapshotsRef.current = printedSnapshots;
+  const pendingPrintSnapshotsRef = useRef<Record<string, PrintedCustomerSnapshot> | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onBeforePrint = () => {
+      if (sheetCustomersRef.current.length > 0 && !pendingPrintSnapshotsRef.current) {
+        const next = buildUpdatedSnapshotsForList(
+          sheetCustomersRef.current,
+          printedSnapshotsRef.current,
+        );
+        pendingPrintSnapshotsRef.current = next;
+        // Persist immediately to localStorage + Supabase BEFORE the print dialog
+        // even closes, so refreshing at any point never loses the printed state!
+        persistSnapshotsOnly(next);
+      }
+    };
+    const onAfterPrint = () => {
+      if (pendingPrintSnapshotsRef.current) {
+        const next = pendingPrintSnapshotsRef.current;
+        pendingPrintSnapshotsRef.current = null;
+        setPrintedSnapshots(next);
+      }
+    };
+    window.addEventListener("beforeprint", onBeforePrint);
+    window.addEventListener("afterprint", onAfterPrint);
+    return () => {
+      window.removeEventListener("beforeprint", onBeforePrint);
+      window.removeEventListener("afterprint", onAfterPrint);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function handlePrintAndHide() {
-    const toMark = [...sheetCustomers];
+    if (!sheetCustomers.length) return;
+    const next = buildUpdatedSnapshotsForList(sheetCustomers, printedSnapshots);
+    pendingPrintSnapshotsRef.current = next;
+    // Persist immediately to localStorage AND Supabase before window.print()
+    // so even if the user refreshes right away, the printed state is saved!
+    persistSnapshotsOnly(next);
     window.print();
-    // Mark the printed customers so they are highlighted and hidden away
-    // until/unless they add a product later.
-    markCustomersPrinted(toMark);
+    // Apply to React state so the printed customers immediately move to "Printed & Hidden"
+    pendingPrintSnapshotsRef.current = null;
+    setPrintedSnapshots(next);
   }
 
   const driverOptions = useMemo(() => {
@@ -3719,6 +3906,7 @@ function PrintSheetTab() {
                         custColWidth={colWidths[0]}
                         prodColWidth={colWidths[1]}
                         onToggleCustomer={cycleCustomerMode}
+                        onMarkCustomerPrinted={markSingleCustomerPrintedByName}
                       />
                       <td
                         style={{
@@ -3735,6 +3923,7 @@ function PrintSheetTab() {
                         custColWidth={colWidths[4]}
                         prodColWidth={colWidths[5]}
                         onToggleCustomer={cycleCustomerMode}
+                        onMarkCustomerPrinted={markSingleCustomerPrintedByName}
                       />
                     </tr>
                   );
@@ -3763,6 +3952,7 @@ function PrintHalfRowCells({
   custColWidth,
   prodColWidth,
   onToggleCustomer,
+  onMarkCustomerPrinted,
 }: {
   line: PrintLine | undefined;
   fontSizePx: number;
@@ -3770,6 +3960,7 @@ function PrintHalfRowCells({
   custColWidth: number;
   prodColWidth: number;
   onToggleCustomer: (rawCustomerName: string) => void;
+  onMarkCustomerPrinted?: (rawCustomerName: string) => void;
 }) {
   const baseCellStyle: React.CSSProperties = {
     padding: "0px 4px",
@@ -3873,8 +4064,9 @@ function PrintHalfRowCells({
       <>
         <td
           onClick={() => onToggleCustomer(baseName)}
-          title="Click to toggle between Full Items and Total Only"
+          title="Click to close/open items (Total Only vs Full Items)"
           colSpan={2}
+          className="group relative"
           style={{
             ...baseCellStyle,
             fontSize: fitCellFontSize(labelText, fontSizePx, custColWidth + prodColWidth),
@@ -3886,7 +4078,20 @@ function PrintHalfRowCells({
             cursor: "pointer",
           }}
         >
-          {labelText}
+          <span>{labelText}</span>
+          {!isPrintedClean && onMarkCustomerPrinted && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onMarkCustomerPrinted(baseName);
+              }}
+              title="Mark this customer as Printed & Hide"
+              className="print:hidden opacity-0 group-hover:opacity-100 transition-opacity absolute right-1 top-1/2 -translate-y-1/2 px-1.5 py-0 rounded bg-green-700 text-white text-[10px] leading-tight font-bold"
+            >
+              ✓ Hide
+            </button>
+          )}
         </td>
         <td
           style={{

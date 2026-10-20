@@ -1750,6 +1750,98 @@ export type LiveSheetCustomerOrder = {
   } | null;
 };
 
+export type PersistedPrintedCustomerSnapshot = {
+  printedAt: string;
+  totalQuantity: number;
+  items: Record<string, number>;
+};
+
+export type PersistedPrintSheetState = {
+  updatedAt: string;
+  printedSnapshots: Record<string, PersistedPrintedCustomerSnapshot>;
+  customModes: Record<string, "items" | "total_only" | "hidden">;
+};
+
+const PRINT_STATE_SLUG = "__print_sheet_state_v2__";
+
+async function readServerPrintSheetState(): Promise<PersistedPrintSheetState> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("name")
+      .eq("slug", PRINT_STATE_SLUG)
+      .maybeSingle();
+    if (data?.name) {
+      const parsed = JSON.parse(data.name) as Partial<PersistedPrintSheetState>;
+      return {
+        updatedAt: parsed.updatedAt ?? new Date().toISOString(),
+        printedSnapshots: parsed.printedSnapshots ?? {},
+        customModes: parsed.customModes ?? {},
+      };
+    }
+  } catch {
+    // non-fatal
+  }
+  return { updatedAt: new Date().toISOString(), printedSnapshots: {}, customModes: {} };
+}
+
+async function writeServerPrintSheetState(state: PersistedPrintSheetState): Promise<void> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const payload = JSON.stringify(state);
+    const { data: existing } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("id")
+      .eq("slug", PRINT_STATE_SLUG)
+      .maybeSingle();
+    if (existing?.id) {
+      await supabaseAdmin
+        .from("sheet_groups")
+        .update({ name: payload })
+        .eq("id", existing.id);
+    } else {
+      await supabaseAdmin
+        .from("sheet_groups")
+        .insert({ slug: PRINT_STATE_SLUG, name: payload });
+    }
+  } catch {
+    // non-fatal
+  }
+}
+
+export const savePrintSheetState = createServerFn({ method: "POST" })
+  .validator((d: {
+    printedSnapshots?: Record<string, PersistedPrintedCustomerSnapshot>;
+    customModes?: Record<string, "items" | "total_only" | "hidden">;
+  }) =>
+    z
+      .object({
+        printedSnapshots: z
+          .record(
+            z.string(),
+            z.object({
+              printedAt: z.string(),
+              totalQuantity: z.number(),
+              items: z.record(z.string(), z.number()),
+            }),
+          )
+          .optional(),
+        customModes: z.record(z.string(), z.enum(["items", "total_only", "hidden"])).optional(),
+      })
+      .parse(d),
+  )
+  .handler(async ({ data }) => {
+    const current = await readServerPrintSheetState();
+    const next: PersistedPrintSheetState = {
+      updatedAt: new Date().toISOString(),
+      printedSnapshots: data.printedSnapshots ?? current.printedSnapshots,
+      customModes: data.customModes ?? current.customModes,
+    };
+    await writeServerPrintSheetState(next);
+    return { ok: true, printState: next };
+  });
+
 export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const {
@@ -1758,7 +1850,7 @@ export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(asyn
     getActiveSheetUrl,
   } = await import("@/lib/sheets.server");
 
-  const [sheetRows, { data: dbCustomers }, { data: dbProducts }, { data: recentSubs }] =
+  const [sheetRows, { data: dbCustomers }, { data: dbProducts }, { data: recentSubs }, serverPrintState] =
     await Promise.all([
       readLiveCustomerOrderSheet(),
       supabaseAdmin.from("customers").select("id, slug, name, driver, sort_order"),
@@ -1769,6 +1861,7 @@ export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(asyn
         .gt("total_items", 0)
         .order("created_at", { ascending: false })
         .limit(400),
+      readServerPrintSheetState(),
     ]);
 
   const customerByKey = new Map<
@@ -1842,11 +1935,30 @@ export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(asyn
     });
   }
 
+  // If a customer on the active sheet now has totalQuantity === 0 (i.e. their
+  // order on the sheet was cleared/reset for the next day), automatically
+  // remove their old printed snapshot so their next order appears fresh in
+  // "To Print". Customers who still have totalQuantity > 0 keep their snapshot
+  // across refreshes and overnight into the morning print!
+  let cleanedAnyZeroSnapshot = false;
+  const activeSnapshots = { ...serverPrintState.printedSnapshots };
+  for (const [cKey, entry] of byCustomerKey.entries()) {
+    if (entry.totalQuantity === 0 && activeSnapshots[cKey]) {
+      delete activeSnapshots[cKey];
+      cleanedAnyZeroSnapshot = true;
+    }
+  }
+  if (cleanedAnyZeroSnapshot) {
+    serverPrintState.printedSnapshots = activeSnapshots;
+    await writeServerPrintSheetState(serverPrintState);
+  }
+
   return {
     sheetLabel: getActiveSheetLabel(),
     sheetUrl: getActiveSheetUrl(),
     forDate: tomorrowISO(),
     customers: Array.from(byCustomerKey.values()),
+    printState: serverPrintState,
   };
 });
 
