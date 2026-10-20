@@ -9,7 +9,8 @@ import {
   listCustomers, listProducts, listSubmissions, syncAllSheets, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
-  autoSyncIfStale, getLiveSheetOrders, adminSaveManualOrder, type LiveSheetCustomerOrder,
+  autoSyncIfStale, getLiveSheetOrders, adminSaveManualOrder, getHistoryRetentionInfo,
+  clearOldOrderHistory, type LiveSheetCustomerOrder,
 } from "@/lib/bakery.functions";
 import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
 
@@ -18,6 +19,10 @@ const productsQuery = queryOptions({ queryKey: ["products"], queryFn: () => list
 const submissionsQuery = queryOptions({ queryKey: ["submissions"], queryFn: () => listSubmissions({ data: {} }) });
 const analyticsQuery = queryOptions({ queryKey: ["analytics"], queryFn: () => analyticsOverview() });
 const sheetInfoQuery = queryOptions({ queryKey: ["sheet-info"], queryFn: () => getActiveSheetInfo() });
+const historyRetentionQuery = queryOptions({
+  queryKey: ["history-retention"],
+  queryFn: () => getHistoryRetentionInfo(),
+});
 const liveSheetOrdersQuery = queryOptions({
   queryKey: ["live-sheet-orders"],
   queryFn: () => getLiveSheetOrders(),
@@ -170,6 +175,17 @@ function orderTypeTag(type?: string | null) {
     default:
       return { label: "New Order", className: "bg-green-100 text-green-800" };
   }
+}
+
+function parseOrderMessage(raw?: string | null): { senderName: string; comment: string } {
+  const text = (raw ?? "").trim();
+  if (!text) return { senderName: "", comment: "" };
+  const idx = text.indexOf(":");
+  if (idx === -1) return { senderName: text, comment: "" };
+  return {
+    senderName: text.slice(0, idx).trim(),
+    comment: text.slice(idx + 1).trim(),
+  };
 }
 
 // Decodes a base64 string (as returned by exportOrdersForDate) into a Blob
@@ -347,6 +363,43 @@ function AdminPage() {
   const [detailLoading, setDetailLoading] = useState(false);
 
   const { data: liveSheetData } = useQuery(liveSheetOrdersQuery);
+  const { data: retentionInfo } = useQuery(historyRetentionQuery);
+  const [showClearHistoryModal, setShowClearHistoryModal] = useState(false);
+  const [clearingHistory, setClearingHistory] = useState(false);
+  const [clearHistoryFeedback, setClearHistoryFeedback] = useState<string | null>(null);
+  const [dismissedExpiryPrompt, setDismissedExpiryPrompt] = useState(false);
+
+  // Automatically notify the admin with a confirmation dialog if orders older
+  // than 3 months are waiting to be cleared.
+  useEffect(() => {
+    if ((retentionInfo?.expiredCount ?? 0) > 0 && !dismissedExpiryPrompt) {
+      setShowClearHistoryModal(true);
+    }
+  }, [retentionInfo?.expiredCount, dismissedExpiryPrompt]);
+
+  async function handleConfirmClearOldHistory() {
+    setClearingHistory(true);
+    setClearHistoryFeedback(null);
+    try {
+      const res = await clearOldOrderHistory();
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["submissions"] }),
+        qc.invalidateQueries({ queryKey: ["history-retention"] }),
+      ]);
+      setShowClearHistoryModal(false);
+      setDismissedExpiryPrompt(true);
+      setClearHistoryFeedback(
+        res.deletedCount > 0
+          ? `✓ Cleared ${res.deletedCount} order${res.deletedCount === 1 ? "" : "s"} older than 3 months (before ${res.cutoffDateISO}).`
+          : `No orders older than 3 months (before ${res.cutoffDateISO}) to clear.`,
+      );
+      setTimeout(() => setClearHistoryFeedback(null), 6000);
+    } catch (e) {
+      setClearHistoryFeedback(`Error: ${(e as Error).message}`);
+    } finally {
+      setClearingHistory(false);
+    }
+  }
 
   // Pinned "Manual Regulars" customers stored in localStorage so Admin can
   // star the customers they always enter manually.
@@ -479,7 +532,15 @@ function AdminPage() {
     if (newestId && newestId !== lastSeenSubmissionIdRef.current) {
       lastSeenSubmissionIdRef.current = newestId;
       if (soundEnabled) {
-        shoutAlert(newest?.order_type === "late" ? "LATE ORDER" : "NEW ORDER", audioCtxRef.current);
+        const phrase =
+          newest?.order_type === "added"
+            ? "ADDED ORDER"
+            : newest?.order_type === "changed"
+              ? "CHANGED ORDER"
+              : newest?.order_type === "late"
+                ? "LATE ORDER"
+                : "NEW ORDER";
+        shoutAlert(phrase, audioCtxRef.current);
       }
     }
   }, [submissions, soundEnabled]);
@@ -937,7 +998,45 @@ function AdminPage() {
         {tab === "print" && <PrintSheetTab />}
 
         {tab === "history" && (
-          <section className="space-y-5">
+          <section className="space-y-4">
+            {/* 3-Month Order History Retention & Notification Banner */}
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-2.5 text-xs">
+              <div className="flex flex-wrap items-center gap-2 text-[#2a1810]">
+                <span className="font-bold text-[#c8362b]">📅 3-Month Order History</span>
+                <span className="text-[#8b6f4e]">·</span>
+                <span>
+                  Showing <strong>{submissions.length}</strong> orders from the last 3 months
+                  {retentionInfo?.oldestCreatedAt
+                    ? ` (since ${new Date(retentionInfo.oldestCreatedAt).toLocaleDateString()})`
+                    : ""}
+                </span>
+                {retentionInfo?.nextClearDateISO && (
+                  <>
+                    <span className="text-[#8b6f4e]">·</span>
+                    <span className="text-[#6b5544]">
+                      Next 3-month mark: <strong>{retentionInfo.nextClearDateISO}</strong> (system will notify you before clearing)
+                    </span>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {(retentionInfo?.expiredCount ?? 0) > 0 && (
+                  <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 font-bold">
+                    ⚠️ {retentionInfo?.expiredCount} order{retentionInfo?.expiredCount === 1 ? "" : "s"} &gt; 3 months old
+                  </span>
+                )}
+                {clearHistoryFeedback && (
+                  <span className="text-green-700 font-semibold">{clearHistoryFeedback}</span>
+                )}
+                <button
+                  onClick={() => setShowClearHistoryModal(true)}
+                  className="px-2.5 py-1 rounded-lg border border-[#e8dcc8] bg-white hover:bg-[#f5ede0] text-[#6b5544] font-semibold transition-colors"
+                >
+                  🧹 Clear &gt;3 Months Old
+                </button>
+              </div>
+            </div>
+
             <div className="flex flex-wrap items-center justify-between gap-3 bg-white border border-[#e8dcc8] rounded-xl p-3 shadow-sm">
               <div className="flex flex-wrap items-center gap-2">
                 <label className="text-xs font-semibold text-[#6b5544]">Download orders for:</label>
@@ -960,8 +1059,8 @@ function AdminPage() {
                 <input
                   value={historySearch}
                   onChange={(e) => setHistorySearch(e.target.value)}
-                  placeholder="Search customer or comment…"
-                  className="border border-[#e8dcc8] rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b] min-w-[200px]"
+                  placeholder="Search customer, person name, or comment…"
+                  className="border border-[#e8dcc8] rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b] min-w-[220px]"
                 />
                 <select
                   value={historyTypeFilter}
@@ -988,24 +1087,37 @@ function AdminPage() {
                 <div className="space-y-3">
                   {subs.map((s) => {
                     const tag = orderTypeTag(s.order_type);
+                    const { senderName, comment } = parseOrderMessage(s.message);
                     return (
                       <button
                         key={s.id}
                         onClick={() => openDetail(s.id)}
-                        className="w-full text-left border border-[#e8dcc8] bg-white rounded-xl p-3 shadow-sm hover:bg-[#fdf8f1]"
+                        className="w-full text-left border border-[#e8dcc8] bg-white rounded-xl p-3 shadow-sm hover:bg-[#fdf8f1] transition-colors"
                       >
-                        <div className="flex items-center justify-between mb-1 gap-2">
-                          <div className="font-semibold text-sm truncate">{s.customer?.name ?? "—"}</div>
+                        <div className="flex items-center justify-between mb-1.5 gap-2">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="font-bold text-sm text-[#2a1810] truncate">{s.customer?.name ?? "—"}</span>
+                            {senderName && (
+                              <span className="text-xs px-2 py-0.5 rounded-md bg-[#f5ede0] text-[#5c4433] font-semibold shrink-0">
+                                👤 {senderName}
+                              </span>
+                            )}
+                          </div>
                           <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full shrink-0 ${tag.className}`}>
                             {tag.label}
                           </span>
                         </div>
+                        {comment && (
+                          <div className="mb-1.5 px-2.5 py-1.5 rounded-lg bg-amber-50 border border-amber-200 text-xs text-[#2a1810]">
+                            <span className="font-bold text-amber-900">💬 Comment:</span>{" "}
+                            <span className="font-medium">{comment}</span>
+                          </div>
+                        )}
                         <div className="flex items-center justify-between text-xs text-[#8b6f4e]">
                           <span>
                             For {s.for_date} · {s.total_items} items · {new Date(s.created_at).toLocaleString()}
-                            {s.message ? ` · 💬 ${s.message}` : ""}
                           </span>
-                          <span className="text-[#c8362b] font-semibold shrink-0">View →</span>
+                          <span className="text-[#c8362b] font-semibold shrink-0">View order →</span>
                         </div>
                       </button>
                     );
@@ -1084,29 +1196,135 @@ function AdminPage() {
         <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => setDetailId(null)}>
           <div className="bg-white rounded-2xl max-w-md w-full max-h-[85vh] overflow-auto shadow-xl" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between p-4 border-b border-[#e8dcc8] sticky top-0 bg-white">
-              <h3 className="font-bold">Order details</h3>
+              <h3 className="font-bold text-[#2a1810]">Order details</h3>
               <button onClick={() => setDetailId(null)} className="text-2xl leading-none text-[#8b6f4e]">×</button>
             </div>
-            <div className="p-4">
+            <div className="p-4 space-y-3">
               {detailLoading && <p className="text-sm text-[#8b6f4e]">Loading…</p>}
-              {detail && (
-                <>
-                  <div className="mb-3">
-                    <div className="font-bold">{detail.customer?.name ?? "—"}</div>
-                    <div className="text-xs text-[#8b6f4e]">
-                      For {detail.for_date} · {detail.total_items} items · {new Date(detail.created_at).toLocaleString()}
+              {detail && (() => {
+                const tag = orderTypeTag((detail as any).order_type);
+                const { senderName, comment } = parseOrderMessage((detail as any).message);
+                return (
+                  <>
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="font-bold text-base text-[#2a1810]">{detail.customer?.name ?? "—"}</div>
+                        <div className="text-xs text-[#8b6f4e] mt-0.5">
+                          For {detail.for_date} · {detail.total_items} items · {new Date(detail.created_at).toLocaleString()}
+                        </div>
+                      </div>
+                      <span className={`text-[10px] font-bold uppercase tracking-wide px-2.5 py-1 rounded-full shrink-0 ${tag.className}`}>
+                        {tag.label}
+                      </span>
                     </div>
-                  </div>
-                  <ul className="text-sm divide-y divide-[#e8dcc8] border border-[#e8dcc8] rounded-xl">
-                    {detail.items.map((it, i) => (
-                      <li key={i} className="flex justify-between px-3 py-2">
-                        <span>{it.product_name}</span>
-                        <span className="font-semibold">{it.quantity}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </>
+
+                    {/* Customer Name & Comment Box */}
+                    <div className="rounded-xl border border-[#e8dcc8] bg-[#fdf8f1] p-3 space-y-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-[#6b5544]">👤 Placed by (Customer Name):</span>
+                        <span className="font-bold text-[#2a1810] text-sm">{senderName || "—"}</span>
+                      </div>
+                      <div className="border-t border-[#e8dcc8] pt-2">
+                        <div className="font-semibold text-[#6b5544] mb-1">💬 Customer Comment / Note:</div>
+                        {comment ? (
+                          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm font-semibold text-[#2a1810]">
+                            {comment}
+                          </div>
+                        ) : (
+                          <div className="text-xs italic text-[#8b6f4e]">No comment left on this order.</div>
+                        )}
+                      </div>
+                    </div>
+
+                    <ul className="text-sm divide-y divide-[#e8dcc8] border border-[#e8dcc8] rounded-xl">
+                      {detail.items.map((it, i) => (
+                        <li key={i} className="flex justify-between px-3 py-2">
+                          <span>{it.product_name}</span>
+                          <span className="font-semibold">{it.quantity}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showClearHistoryModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
+          onClick={() => setShowClearHistoryModal(false)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-md w-full p-5 shadow-xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <span className="text-2xl">🔔</span>
+                <div>
+                  <h3 className="font-bold text-[#2a1810] text-base">3-Month Order History Notice</h3>
+                  <p className="text-xs text-[#8b6f4e]">Confirmation required before clearing old history</p>
+                </div>
+              </div>
+              <button
+                onClick={() => {
+                  setShowClearHistoryModal(false);
+                  setDismissedExpiryPrompt(true);
+                }}
+                className="text-2xl leading-none text-[#8b6f4e]"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] p-3.5 text-xs text-[#2a1810] space-y-1.5">
+              <p>
+                Order history is kept for <strong>3 months</strong> (cutoff date:{" "}
+                <strong>{retentionInfo?.cutoffDateISO ?? "—"}</strong>).
+              </p>
+              {(retentionInfo?.expiredCount ?? 0) > 0 ? (
+                <p className="text-amber-900 font-semibold">
+                  ⚠️ There {retentionInfo?.expiredCount === 1 ? "is" : "are"} currently{" "}
+                  <strong>{retentionInfo?.expiredCount}</strong> order
+                  {retentionInfo?.expiredCount === 1 ? "" : "s"} older than 3 months waiting for your confirmation to clear.
+                </p>
+              ) : (
+                <p className="text-green-800 font-semibold">
+                  ✓ All <strong>{retentionInfo?.totalActiveCount ?? submissions.length}</strong> orders in your history are within the last 3 months.
+                  {retentionInfo?.nextClearDateISO
+                    ? ` The oldest orders will reach 3 months on ${retentionInfo.nextClearDateISO}.`
+                    : ""}
+                </p>
               )}
+              <p className="text-[#8b6f4e]">
+                Nothing is ever deleted automatically without notifying you first.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                onClick={() => {
+                  setShowClearHistoryModal(false);
+                  setDismissedExpiryPrompt(true);
+                }}
+                className="px-3.5 py-2 rounded-xl border border-[#e8dcc8] text-xs font-semibold text-[#6b5544] hover:bg-[#fdf8f1]"
+              >
+                Keep History / Remind Later
+              </button>
+              <button
+                onClick={handleConfirmClearOldHistory}
+                disabled={clearingHistory || (retentionInfo?.expiredCount ?? 0) === 0}
+                className="px-4 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white text-xs font-bold"
+              >
+                {clearingHistory
+                  ? "Clearing…"
+                  : (retentionInfo?.expiredCount ?? 0) > 0
+                    ? `Confirm & Clear (${retentionInfo?.expiredCount})`
+                    : "Nothing >3 Months to Clear"}
+              </button>
             </div>
           </div>
         </div>
@@ -1240,14 +1458,14 @@ function EstimatesTab() {
   }
 
   return (
-    <section className="space-y-3">
-      <div className="flex flex-wrap items-center gap-3">
+    <section className="space-y-3 max-w-md">
+      <div className="flex flex-wrap items-center gap-2">
         <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1">
           {(["Production", "Freezer"] as const).map((s) => (
             <button
               key={s}
               onClick={() => setSection(s)}
-              className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${section === s ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold ${section === s ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}
             >
               {s}
             </button>
@@ -1257,11 +1475,11 @@ function EstimatesTab() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search products…"
-          className="flex-1 min-w-[180px] bg-white border border-[#e8dcc8] rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+          className="flex-1 min-w-[140px] bg-white border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b]"
         />
-        <label className="flex items-center gap-2 text-xs font-semibold text-[#6b5544] shrink-0">
+        <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] shrink-0">
           <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
-          Show all products
+          Show all
         </label>
       </div>
 
@@ -1271,14 +1489,13 @@ function EstimatesTab() {
       <div className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
         {filtered.length === 0 && !query.isLoading && (
           <div className="p-6 text-center text-sm text-[#8b6f4e]">
-            {anyHasValue ? 'No products match. Toggle "Show all products" to see everything.' : "No products match your search."}
+            {anyHasValue ? 'No products match. Toggle "Show all" to see everything.' : "No products match your search."}
           </div>
         )}
         {filtered.map((p) => (
-          <div key={p.id} className="p-3 flex items-center justify-between gap-3 hover:bg-[#fdf8f1]">
-            <div className="min-w-0">
-              <div className="font-semibold text-sm truncate">{p.name}</div>
-            </div>
+          <div key={p.id} className="px-3 py-2 flex items-center gap-2 hover:bg-[#fdf8f1]">
+            <div className="font-semibold text-sm truncate text-[#2a1810]">{p.name}</div>
+            <div className="flex-1 border-b border-dotted border-[#e2d4be] min-w-[12px]" />
             <input
               type="number"
               inputMode="numeric"
@@ -1288,7 +1505,7 @@ function EstimatesTab() {
               onChange={(e) =>
                 setEdits((s) => ({ ...s, [p.id]: e.target.value === "" ? 0 : Math.max(0, Number(e.target.value)) }))
               }
-              className="w-20 h-9 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b]"
+              className="w-20 h-8 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b] shrink-0"
             />
           </div>
         ))}
@@ -1423,14 +1640,14 @@ function StocksTab() {
   }
 
   return (
-    <section className="space-y-3">
-      <div className="flex flex-wrap items-center gap-3">
+    <section className="space-y-3 max-w-md">
+      <div className="flex flex-wrap items-center gap-2">
         <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1">
           {(["Production", "Freezer"] as const).map((s) => (
             <button
               key={s}
               onClick={() => setSection(s)}
-              className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${section === s ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}
+              className={`px-3 py-1 rounded-lg text-xs font-semibold ${section === s ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}
             >
               {s}
             </button>
@@ -1440,11 +1657,11 @@ function StocksTab() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search products…"
-          className="flex-1 min-w-[180px] bg-white border border-[#e8dcc8] rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+          className="flex-1 min-w-[140px] bg-white border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b]"
         />
-        <label className="flex items-center gap-2 text-xs font-semibold text-[#6b5544] shrink-0">
+        <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] shrink-0">
           <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
-          Show all products
+          Show all
         </label>
       </div>
 
@@ -1454,12 +1671,13 @@ function StocksTab() {
       <div className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
         {filtered.length === 0 && !query.isLoading && (
           <div className="p-6 text-center text-sm text-[#8b6f4e]">
-            {anyHasValue ? 'No products match. Toggle "Show all products" to see everything.' : "No products yet — add quantities below and save."}
+            {anyHasValue ? 'No products match. Toggle "Show all" to see everything.' : "No products yet — add quantities below and save."}
           </div>
         )}
         {filtered.map((p) => (
-          <div key={p.id} className="p-3 flex items-center justify-between gap-3 hover:bg-[#fdf8f1]">
-            <div className="font-semibold text-sm truncate">{p.name}</div>
+          <div key={p.id} className="px-3 py-2 flex items-center gap-2 hover:bg-[#fdf8f1]">
+            <div className="font-semibold text-sm truncate text-[#2a1810]">{p.name}</div>
+            <div className="flex-1 border-b border-dotted border-[#e2d4be] min-w-[12px]" />
             <input
               type="number"
               inputMode="numeric"
@@ -1469,7 +1687,7 @@ function StocksTab() {
               onChange={(e) =>
                 setEdits((s) => ({ ...s, [p.id]: e.target.value === "" ? 0 : Math.max(0, Number(e.target.value)) }))
               }
-              className="w-20 h-9 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b]"
+              className="w-20 h-8 text-center font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b] shrink-0"
             />
           </div>
         ))}
@@ -1613,24 +1831,24 @@ function DriversTab() {
   }
 
   return (
-    <section className="space-y-3">
+    <section className="space-y-3 max-w-md">
       {query.data?.sheetLabel && (
         <p className="text-xs text-[#8b6f4e]">
           Reading and writing the <span className="font-semibold">{query.data.sheetLabel}</span> sheet — the same one used for order submission.
         </p>
       )}
 
-      <div className="flex flex-wrap items-center gap-3">
+      <div className="flex flex-wrap items-center gap-2">
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search customers…"
-          className="flex-1 min-w-[180px] bg-white border border-[#e8dcc8] rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-[#c8362b]"
+          className="flex-1 min-w-[140px] bg-white border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b]"
         />
         <select
           value={driverFilter}
           onChange={(e) => setDriverFilter(e.target.value)}
-          className="bg-white border border-[#e8dcc8] rounded-xl px-3 py-2.5 text-sm font-semibold focus:outline-none focus:border-[#c8362b]"
+          className="bg-white border border-[#e8dcc8] rounded-xl px-2.5 py-1.5 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
         >
           <option value="__all__">All drivers</option>
           <option value="__unassigned__">Unassigned</option>
@@ -1656,12 +1874,13 @@ function DriversTab() {
             ? [current, ...driverOptions]
             : driverOptions;
           return (
-            <div key={c.name} className="p-3 flex items-center justify-between gap-3 hover:bg-[#fdf8f1]">
-              <div className="font-semibold text-sm truncate">{c.name}</div>
+            <div key={c.name} className="px-3 py-2 flex items-center gap-2 hover:bg-[#fdf8f1]">
+              <div className="font-semibold text-sm truncate text-[#2a1810]">{c.name}</div>
+              <div className="flex-1 border-b border-dotted border-[#e2d4be] min-w-[12px]" />
               <select
                 value={current}
                 onChange={(e) => setEdits((s) => ({ ...s, [c.name]: e.target.value }))}
-                className="w-40 h-9 px-2 text-sm font-semibold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b]"
+                className="w-36 h-8 px-2 text-xs font-semibold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1] focus:outline-none focus:border-[#c8362b] shrink-0"
               >
                 <option value="">Unassigned</option>
                 {options.map((d) => (

@@ -935,6 +935,17 @@ function orderTypeTag(type?: string | null) {
   }
 }
 
+function parseOrderMessage(raw?: string | null): { senderName: string; comment: string } {
+  const text = (raw ?? "").trim();
+  if (!text) return { senderName: "", comment: "" };
+  const idx = text.indexOf(":");
+  if (idx === -1) return { senderName: text, comment: "" };
+  return {
+    senderName: text.slice(0, idx).trim(),
+    comment: text.slice(idx + 1).trim(),
+  };
+}
+
 function HistoryModal({
   history,
   onClose,
@@ -945,6 +956,7 @@ function HistoryModal({
     total_items: number;
     created_at: string;
     order_type?: string | null;
+    message?: string | null;
     items: Array<{ product_name: string; quantity: number }>;
   }>;
   onClose: () => void;
@@ -967,12 +979,12 @@ function HistoryModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between p-4 border-b border-[#e8dcc8] sticky top-0 bg-white">
-          <h3 className="font-bold">Order history (last 7 days)</h3>
+          <h3 className="font-bold">Order history (last 3 months)</h3>
           <button onClick={onClose} className="text-2xl leading-none text-[#8b6f4e]">×</button>
         </div>
         <div className="p-4 space-y-5">
           {groups.length === 0 && (
-            <p className="text-sm text-[#8b6f4e] text-center">No orders in the last 7 days.</p>
+            <p className="text-sm text-[#8b6f4e] text-center">No orders in the last 3 months.</p>
           )}
           {groups.map(([day, subs]) => (
             <div key={day}>
@@ -980,16 +992,33 @@ function HistoryModal({
               <div className="space-y-3">
                 {subs.map((s) => {
                   const tag = orderTypeTag(s.order_type);
+                  const { senderName, comment } = parseOrderMessage(s.message);
                   return (
-                    <div key={s.id} className="border border-[#e8dcc8] rounded-xl p-3">
-                      <div className="flex items-center justify-between mb-2">
+                    <div key={s.id} className="border border-[#e8dcc8] rounded-xl p-3 space-y-2">
+                      <div className="flex items-center justify-between">
                         <div className="text-xs text-[#8b6f4e]">
-                          For {s.for_date} · {s.total_items} items
+                          For {s.for_date} · {s.total_items} items · {new Date(s.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                         </div>
                         <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full ${tag.className}`}>
                           {tag.label}
                         </span>
                       </div>
+                      {(senderName || comment) && (
+                        <div className="bg-[#fdf8f1] border border-[#e8dcc8] rounded-lg px-2.5 py-1.5 text-xs space-y-0.5">
+                          {senderName && (
+                            <div className="text-[#2a1810]">
+                              <span className="font-semibold text-[#8b6f4e]">Placed by:</span>{" "}
+                              <span className="font-bold">{senderName}</span>
+                            </div>
+                          )}
+                          {comment && (
+                            <div className="text-[#2a1810]">
+                              <span className="font-semibold text-[#8b6f4e]">Comment:</span>{" "}
+                              <span className="font-semibold text-[#c8362b]">{comment}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
                       <ul className="text-sm space-y-1">
                         {s.items.map((it, i) => (
                           <li key={i} className="flex justify-between">

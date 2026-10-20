@@ -183,10 +183,11 @@ export const getCustomerPage = createServerFn({ method: "GET" })
       (a, b) => a.sheet_row - b.sheet_row,
     );
 
+    // Show 3 months of history. Never silently auto-delete old orders here —
+    // clearing old history is handled explicitly in Admin after notifying.
     const historyCutoffDate = new Date();
-    historyCutoffDate.setMonth(historyCutoffDate.getMonth() - 4);
+    historyCutoffDate.setMonth(historyCutoffDate.getMonth() - 3);
     const historyCutoff = historyCutoffDate.toISOString();
-    await supabaseAdmin.from("order_submissions").delete().lt("created_at", historyCutoff);
 
     const todayKey = tomorrowISO();
     const { data: todaySubs } = await supabaseAdmin
@@ -300,6 +301,9 @@ export const submitOrder = createServerFn({ method: "POST" })
       writeOrderQuantities,
       writeLateOrderQuantities,
       writeLateOrderQuantitiesToColumnC,
+      addOnQuantityToRow,
+      addLateOrderQuantityToRow,
+      addLateQuantityToColumnC,
       insertCustomerProductRow,
       writeOrderComment,
     } = await import("@/lib/sheets.server");
@@ -319,46 +323,73 @@ export const submitOrder = createServerFn({ method: "POST" })
     }
     const message = data.message.trim();
     const late = isLateOrder();
+    const targetDate = tomorrowISO();
+
+    // Check if this customer ALREADY has a non-empty order for targetDate.
+    // If they do (e.g. they had a second tab open and clicked Submit Order
+    // again), treat this as an add-on ("added") so we never overwrite their
+    // first order or log two "new" / "late" orders for the same day.
+    const { count: existingTodayCount } = await supabaseAdmin
+      .from("order_submissions")
+      .select("id", { count: "exact", head: true })
+      .eq("customer_id", customer.id)
+      .eq("for_date", targetDate)
+      .gt("total_items", 0);
+    const hasOrderForToday = (existingTodayCount ?? 0) > 0;
 
     const allRows = await readCustomerRows();
     resolveItemsSheetRows(customer.name, positive, allRows);
 
     let insertedAny = false;
-    for (const item of positive) {
-      if (item.sheetRow === 0) {
-        const newRow = await insertCustomerProductRow({
-          customerName: customer.name,
-          productName: item.productName,
-          quantity: late ? 0 : item.quantity,
-        });
-        item.sheetRow = newRow;
-        insertedAny = true;
+    if (!hasOrderForToday) {
+      for (const item of positive) {
+        if (item.sheetRow === 0) {
+          const newRow = await insertCustomerProductRow({
+            customerName: customer.name,
+            productName: item.productName,
+            quantity: late ? 0 : item.quantity,
+          });
+          item.sheetRow = newRow;
+          insertedAny = true;
+        }
       }
-    }
 
-    if (late) {
-      // K keeps the separate late-order tracking the LATE tab reads from;
-      // C now also gets the same quantity (highlighted red) so the
-      // kitchen's main total reflects it without checking a second tab.
-      await writeLateOrderQuantities(
-        positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
-      );
-      await writeLateOrderQuantitiesToColumnC(
-        positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
-      );
+      if (late) {
+        await writeLateOrderQuantities(
+          positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+        );
+        await writeLateOrderQuantitiesToColumnC(
+          positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+        );
+      } else {
+        await writeOrderQuantities(
+          positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+        );
+      }
     } else {
-      await writeOrderQuantities(
-        positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
-      );
+      for (const item of positive) {
+        if (item.sheetRow === 0) {
+          const newRow = await insertCustomerProductRow({
+            customerName: customer.name,
+            productName: item.productName,
+            quantity: 0,
+          });
+          item.sheetRow = newRow;
+          insertedAny = true;
+        }
+        if (late) {
+          await addLateOrderQuantityToRow(item.sheetRow, item.quantity);
+          await addLateQuantityToColumnC(item.sheetRow, item.quantity);
+        } else {
+          await addOnQuantityToRow(item.sheetRow, item.quantity);
+        }
+      }
     }
 
     if (message.length > 0) {
       await writeOrderComment(positive.map((i) => i.sheetRow), message);
     }
 
-    // ── message now saved to Supabase ──
-    // Tag the order with the sheet it came from (null until the
-    // sheet-groups migration is applied — history stays untouched either way).
     const { activeSheetGroupSlug: activeSlug } = await import("@/lib/sheets.server");
     const activeGroupId = await groupIdBySlug(activeSlug());
     const { data: submission, error: sErr } = await supabaseAdmin
@@ -366,21 +397,10 @@ export const submitOrder = createServerFn({ method: "POST" })
       .insert({
         customer_id: customer.id,
         ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
-        // Always the server's own "tomorrow" (bakery-timezone), never the
-        // client-supplied data.forDate. The client's own notion of
-        // "tomorrow" can drift from this — its clock/timezone isn't
-        // guaranteed to match the bakery's, and its UI-facing delivery
-        // label logic skips Sunday (Sat -> shows "Monday") for display
-        // purposes only. If the client's value were trusted here, an
-        // order could get saved under a different date than the one
-        // getCustomerPage looks it up with above, and the "you've already
-        // ordered" screen would silently never show up. Keeping one
-        // source of truth for this date on the server fixes that for
-        // good, regardless of what the client sends.
-        for_date: tomorrowISO(),
+        for_date: targetDate,
         total_items: totalItems,
         synced_to_sheet: true,
-        order_type: late ? "late" : "new",
+        order_type: hasOrderForToday ? "added" : late ? "late" : "new",
         message,
       })
       .select("id")
@@ -617,7 +637,7 @@ export const addOnToOrder = createServerFn({ method: "POST" })
         for_date: targetDate,
         total_items: totalItems,
         synced_to_sheet: true,
-        order_type: late ? "late" : hasOrderForToday ? "added" : "new",
+        order_type: hasOrderForToday ? "added" : late ? "late" : "new",
         message,
       })
       .select("id")
@@ -1081,20 +1101,159 @@ export const getActiveSheetInfo = createServerFn({ method: "GET" }).handler(asyn
 
 export const listSubmissions = createServerFn({ method: "GET" })
   .validator((d: { customerId?: string; limit?: number }) =>
-    z.object({ customerId: z.string().uuid().optional(), limit: z.number().int().min(1).max(500).optional() }).parse(d),
+    z.object({ customerId: z.string().uuid().optional(), limit: z.number().int().min(1).max(10000).optional() }).parse(d),
   )
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    let q = supabaseAdmin
-      .from("order_submissions")
-      .select("id, for_date, total_items, created_at, order_type, message, customer:customers(id, name, slug)")
-      .order("created_at", { ascending: false })
-      .limit(data.limit ?? 200);
-    if (data.customerId) q = q.eq("customer_id", data.customerId);
-    const { data: rows, error } = await q;
-    if (error) throw error;
-    return rows ?? [];
+
+    // 3-month (90-day) history window
+    const cutoffDate = new Date();
+    cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+    const cutoffISO = cutoffDate.toISOString();
+
+    const maxRows = data.limit ?? 5000;
+    const pageSize = 1000;
+    const allRows: Array<{
+      id: string;
+      for_date: string;
+      total_items: number;
+      created_at: string;
+      order_type: string | null;
+      message: string | null;
+      customer: { id: string; name: string; slug: string } | null;
+    }> = [];
+
+    for (let offset = 0; offset < maxRows; offset += pageSize) {
+      let q = supabaseAdmin
+        .from("order_submissions")
+        .select("id, for_date, total_items, created_at, order_type, message, customer:customers(id, name, slug)")
+        .gte("created_at", cutoffISO)
+        .gt("total_items", 0)
+        .order("created_at", { ascending: false })
+        .range(offset, offset + pageSize - 1);
+      if (data.customerId) q = q.eq("customer_id", data.customerId);
+      const { data: rows, error } = await q;
+      if (error) throw error;
+      if (!rows?.length) break;
+      allRows.push(...(rows as any));
+      if (rows.length < pageSize) break;
+    }
+
+    // Self-heal any second/subsequent submission on the same (customer, for_date)
+    // that was previously marked "late" instead of "added" (e.g. Rio Douro's
+    // late add-on before the order_type ternary fix).
+    const byCustDate = new Map<string, typeof allRows>();
+    for (const r of allRows) {
+      const cid = r.customer?.id;
+      if (!cid) continue;
+      const k = `${cid}_${r.for_date}`;
+      const list = byCustDate.get(k) ?? [];
+      list.push(r);
+      byCustDate.set(k, list);
+    }
+    const idsToMarkAdded: string[] = [];
+    for (const list of byCustDate.values()) {
+      if (list.length <= 1) continue;
+      // Sort oldest-first
+      const chronological = [...list].sort((a, b) => a.created_at.localeCompare(b.created_at));
+      for (let i = 1; i < chronological.length; i++) {
+        const sub = chronological[i];
+        if (sub.order_type === "late") {
+          sub.order_type = "added";
+          idsToMarkAdded.push(sub.id);
+        }
+      }
+    }
+    if (idsToMarkAdded.length > 0) {
+      await supabaseAdmin
+        .from("order_submissions")
+        .update({ order_type: "added" })
+        .in("id", idsToMarkAdded);
+    }
+
+    return allRows;
   });
+
+export const getHistoryRetentionInfo = createServerFn({ method: "GET" }).handler(async () => {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const cutoffDate = new Date();
+  cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+  const cutoffISO = cutoffDate.toISOString();
+
+  // Check if any submissions are older than 3 months (90 days), or within 7 days of reaching 3 months
+  const warnDate = new Date();
+  warnDate.setMonth(warnDate.getMonth() - 3);
+  warnDate.setDate(warnDate.getDate() + 7);
+  const warnISO = warnDate.toISOString();
+
+  const [
+    { count: expiredCount },
+    { count: expiringSoonCount },
+    { data: oldestRows },
+    { count: totalActiveCount },
+  ] = await Promise.all([
+    supabaseAdmin
+      .from("order_submissions")
+      .select("id", { count: "exact", head: true })
+      .lt("created_at", cutoffISO),
+    supabaseAdmin
+      .from("order_submissions")
+      .select("id", { count: "exact", head: true })
+      .gte("created_at", cutoffISO)
+      .lt("created_at", warnISO),
+    supabaseAdmin
+      .from("order_submissions")
+      .select("created_at, for_date")
+      .order("created_at", { ascending: true })
+      .limit(1),
+    supabaseAdmin
+      .from("order_submissions")
+      .select("id", { count: "exact", head: true })
+      .gte("created_at", cutoffISO),
+  ]);
+
+  const oldestCreatedAt = oldestRows?.[0]?.created_at ?? null;
+  let nextClearDateISO: string | null = null;
+  if (oldestCreatedAt) {
+    const d = new Date(oldestCreatedAt);
+    d.setMonth(d.getMonth() + 3);
+    nextClearDateISO = d.toISOString().slice(0, 10);
+  }
+
+  return {
+    cutoffDateISO: cutoffISO.slice(0, 10),
+    expiredCount: expiredCount ?? 0,
+    expiringSoonCount: expiringSoonCount ?? 0,
+    totalActiveCount: totalActiveCount ?? 0,
+    oldestCreatedAt,
+    nextClearDateISO,
+  };
+});
+
+export const clearOldOrderHistory = createServerFn({ method: "POST" }).handler(async () => {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const cutoffDate = new Date();
+  cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+  const cutoffISO = cutoffDate.toISOString();
+
+  const { count } = await supabaseAdmin
+    .from("order_submissions")
+    .select("id", { count: "exact", head: true })
+    .lt("created_at", cutoffISO);
+
+  if ((count ?? 0) > 0) {
+    const { error } = await supabaseAdmin
+      .from("order_submissions")
+      .delete()
+      .lt("created_at", cutoffISO);
+    if (error) throw error;
+  }
+
+  return {
+    deletedCount: count ?? 0,
+    cutoffDateISO: cutoffISO.slice(0, 10),
+  };
+});
 
 export const getSubmissionDetail = createServerFn({ method: "GET" })
   .validator((d: { id: string }) => z.object({ id: z.string().uuid() }).parse(d))
@@ -1102,7 +1261,7 @@ export const getSubmissionDetail = createServerFn({ method: "GET" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data: sub, error } = await supabaseAdmin
       .from("order_submissions")
-      .select("id, for_date, total_items, created_at, message, customer:customers(id, name, slug)")
+      .select("id, for_date, total_items, created_at, order_type, message, customer:customers(id, name, slug)")
       .eq("id", data.id)
       .maybeSingle();
     if (error) throw error;
@@ -1803,29 +1962,99 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
     }
 
     if (customer?.id) {
+      const targetDate = tomorrowISO();
       const activeGroupId = await groupIdBySlug(activeSheetGroupSlug());
-      const { data: submission, error: sErr } = await supabaseAdmin
-        .from("order_submissions")
-        .insert({
-          customer_id: customer.id,
-          ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
-          for_date: tomorrowISO(),
-          total_items: totalItems,
-          synced_to_sheet: true,
-          order_type: data.mode === "addon" ? "added" : "new",
-          message: fullComment,
-        })
-        .select("id")
-        .single();
-      if (!sErr && submission) {
-        const rows = positive.map((i) => ({
-          submission_id: submission.id,
-          product_id: i.productId ?? null,
-          product_name: i.productName,
-          quantity: i.quantity,
-          sheet_row: i.sheetRow,
-        }));
-        await supabaseAdmin.from("order_submission_items").insert(rows);
+
+      if (data.mode === "set") {
+        // Check if there is already an existing submission for this customer & delivery date.
+        // If the most recent one was an Admin manual entry, update it in place so repeated
+        // saves while building a manual order don't create duplicate "new" history entries.
+        const { data: existingToday } = await supabaseAdmin
+          .from("order_submissions")
+          .select("id, message")
+          .eq("customer_id", customer.id)
+          .eq("for_date", targetDate)
+          .order("created_at", { ascending: false });
+
+        const latestAdminSub = (existingToday ?? []).find((s) =>
+          (s.message ?? "").toLowerCase().startsWith("admin"),
+        );
+
+        if (latestAdminSub) {
+          await supabaseAdmin
+            .from("order_submissions")
+            .update({
+              total_items: totalItems,
+              message: fullComment,
+            })
+            .eq("id", latestAdminSub.id);
+          await supabaseAdmin
+            .from("order_submission_items")
+            .delete()
+            .eq("submission_id", latestAdminSub.id);
+          await supabaseAdmin.from("order_submission_items").insert(
+            positive.map((i) => ({
+              submission_id: latestAdminSub.id,
+              product_id: i.productId ?? null,
+              product_name: i.productName,
+              quantity: i.quantity,
+              sheet_row: i.sheetRow,
+            })),
+          );
+          return { ok: true, totalItems, mode: data.mode };
+        }
+
+        const hasPriorToday = (existingToday?.length ?? 0) > 0;
+        const { data: submission, error: sErr } = await supabaseAdmin
+          .from("order_submissions")
+          .insert({
+            customer_id: customer.id,
+            ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
+            for_date: targetDate,
+            total_items: totalItems,
+            synced_to_sheet: true,
+            order_type: hasPriorToday ? "changed" : "new",
+            message: fullComment,
+          })
+          .select("id")
+          .single();
+        if (!sErr && submission) {
+          await supabaseAdmin.from("order_submission_items").insert(
+            positive.map((i) => ({
+              submission_id: submission.id,
+              product_id: i.productId ?? null,
+              product_name: i.productName,
+              quantity: i.quantity,
+              sheet_row: i.sheetRow,
+            })),
+          );
+        }
+      } else {
+        // mode === "addon"
+        const { data: submission, error: sErr } = await supabaseAdmin
+          .from("order_submissions")
+          .insert({
+            customer_id: customer.id,
+            ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
+            for_date: targetDate,
+            total_items: totalItems,
+            synced_to_sheet: true,
+            order_type: "added",
+            message: fullComment,
+          })
+          .select("id")
+          .single();
+        if (!sErr && submission) {
+          await supabaseAdmin.from("order_submission_items").insert(
+            positive.map((i) => ({
+              submission_id: submission.id,
+              product_id: i.productId ?? null,
+              product_name: i.productName,
+              quantity: i.quantity,
+              sheet_row: i.sheetRow,
+            })),
+          );
+        }
       }
     }
 
