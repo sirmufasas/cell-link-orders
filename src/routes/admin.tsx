@@ -6,17 +6,23 @@ import {
   LineChart, Line,
 } from "recharts";
 import {
-  listCustomers, listSubmissions, syncAllSheets, analyticsOverview, ensureSeeded,
+  listCustomers, listProducts, listSubmissions, syncAllSheets, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
-  autoSyncIfStale,
+  autoSyncIfStale, getLiveSheetOrders, adminSaveManualOrder, type LiveSheetCustomerOrder,
 } from "@/lib/bakery.functions";
 import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
 
 const customersQuery = queryOptions({ queryKey: ["customers"], queryFn: () => listCustomers() });
+const productsQuery = queryOptions({ queryKey: ["products"], queryFn: () => listProducts() });
 const submissionsQuery = queryOptions({ queryKey: ["submissions"], queryFn: () => listSubmissions({ data: {} }) });
 const analyticsQuery = queryOptions({ queryKey: ["analytics"], queryFn: () => analyticsOverview() });
 const sheetInfoQuery = queryOptions({ queryKey: ["sheet-info"], queryFn: () => getActiveSheetInfo() });
+const liveSheetOrdersQuery = queryOptions({
+  queryKey: ["live-sheet-orders"],
+  queryFn: () => getLiveSheetOrders(),
+  staleTime: 15_000,
+});
 
 // New-order sound alert preference. The actual siren + shouted-voice sound
 // lives in src/lib/alertSound.ts, shared with the customer-facing
@@ -44,7 +50,7 @@ export const Route = createFileRoute("/admin")({
 
 type Bucket = "day" | "week" | "month";
 type Dim = "items" | "products" | "customers";
-type AdminTab = "customers" | "history" | "analytics" | "estimates" | "stocks" | "drivers";
+type AdminTab = "customers" | "manual" | "print" | "history" | "analytics" | "estimates" | "stocks" | "drivers";
 
 // ---------------------------------------------------------------------------
 // Simple password gate
@@ -60,7 +66,9 @@ type AdminTab = "customers" | "history" | "analytics" | "estimates" | "stocks" |
 
 const ADMIN_PASSWORD = "portugalbakery";
 const UNLOCK_STORAGE_KEY = "bakery_admin_unlocked";
-const PROTECTED_TABS: AdminTab[] = ["customers", "analytics", "estimates", "stocks", "drivers"];
+const PROTECTED_TABS: AdminTab[] = ["customers", "manual", "print", "analytics", "estimates", "stocks", "drivers"];
+const MANUAL_REGULARS_STORAGE_KEY = "bakery_manual_regulars_v1";
+const PRINT_MODES_STORAGE_KEY = "bakery_print_customer_modes_v1";
 
 function LockScreen({
   pwInput,
@@ -324,6 +332,12 @@ function AdminPage() {
 
   const [tab, setTab] = useState<AdminTab>("customers");
   const [search, setSearch] = useState("");
+  const [customerDriverFilter, setCustomerDriverFilter] = useState("__all__");
+  const [customerStatusFilter, setCustomerStatusFilter] = useState<"all" | "ordered" | "pending" | "pinned">("all");
+  const [manualSelectedSlug, setManualSelectedSlug] = useState<string | null>(null);
+  const [copiedSlug, setCopiedSlug] = useState<string | null>(null);
+  const [historySearch, setHistorySearch] = useState("");
+  const [historyTypeFilter, setHistoryTypeFilter] = useState<string>("all");
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [bucket, setBucket] = useState<Bucket>("day");
@@ -331,6 +345,38 @@ function AdminPage() {
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof getSubmissionDetail>> | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+
+  const { data: liveSheetData } = useQuery(liveSheetOrdersQuery);
+
+  // Pinned "Manual Regulars" customers stored in localStorage so Admin can
+  // star the customers they always enter manually.
+  const [manualRegulars, setManualRegulars] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(MANUAL_REGULARS_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as string[]) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  function toggleManualRegular(slug: string) {
+    setManualRegulars((prev) => {
+      const next = prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug];
+      try {
+        localStorage.setItem(MANUAL_REGULARS_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }
+
+  function copyCustomerLink(slug: string) {
+    const url = `${window.location.origin}/order/${slug}`;
+    navigator.clipboard.writeText(url).then(() => {
+      setCopiedSlug(slug);
+      setTimeout(() => setCopiedSlug((cur) => (cur === slug ? null : cur)), 2000);
+    });
+  }
 
   // --- Order History export (download button) ---
   const [exportDate, setExportDate] = useState(() => toLocalISODate(new Date()));
@@ -505,24 +551,61 @@ function AdminPage() {
     return () => clearInterval(t);
   }, [qc]);
 
+  const sheetQtyBySlug = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const sc of liveSheetData?.customers ?? []) {
+      m.set(sc.slug, sc.totalQuantity);
+    }
+    return m;
+  }, [liveSheetData]);
+
+  const customerDriverOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const c of customers) {
+      if (c.driver?.trim()) set.add(c.driver.trim());
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [customers]);
+
   const filteredCustomers = useMemo(() => {
     const s = search.trim().toLowerCase();
-    if (!s) return customers;
-    return customers.filter((c) => c.name.toLowerCase().includes(s));
-  }, [search, customers]);
+    return customers.filter((c) => {
+      if (s && !c.name.toLowerCase().includes(s) && !(c.driver ?? "").toLowerCase().includes(s)) {
+        return false;
+      }
+      if (customerDriverFilter !== "__all__" && (c.driver ?? "") !== customerDriverFilter) {
+        return false;
+      }
+      const onSheetQty = sheetQtyBySlug.get(c.slug) ?? 0;
+      if (customerStatusFilter === "ordered" && onSheetQty <= 0) return false;
+      if (customerStatusFilter === "pending" && onSheetQty > 0) return false;
+      if (customerStatusFilter === "pinned" && !manualRegulars.includes(c.slug)) return false;
+      return true;
+    });
+  }, [search, customers, customerDriverFilter, customerStatusFilter, sheetQtyBySlug, manualRegulars]);
 
   // Group submissions by created_at date (local) — same grouping as the
   // customer-facing HistoryModal, just across all customers.
   const historyGroups = useMemo(() => {
+    const s = historySearch.trim().toLowerCase();
     const m = new Map<string, typeof submissions>();
-    for (const s of submissions) {
-      const key = new Date(s.created_at).toISOString().slice(0, 10);
+    for (const sub of submissions) {
+      if (s) {
+        const cName = (sub.customer?.name ?? "").toLowerCase();
+        const msg = (sub.message ?? "").toLowerCase();
+        if (!cName.includes(s) && !msg.includes(s)) continue;
+      }
+      if (historyTypeFilter !== "all") {
+        const t = sub.order_type ?? "new";
+        if (t !== historyTypeFilter) continue;
+      }
+      const key = new Date(sub.created_at).toISOString().slice(0, 10);
       const arr = m.get(key) ?? [];
-      arr.push(s);
+      arr.push(sub);
       m.set(key, arr);
     }
     return Array.from(m.entries()).sort(([a], [b]) => b.localeCompare(a));
-  }, [submissions]);
+  }, [submissions, historySearch, historyTypeFilter]);
 
   async function handleSync() {
     setSyncing(true); setSyncMsg(null);
@@ -590,9 +673,18 @@ function AdminPage() {
     return arr;
   }, [analytics]);
 
+  const activeOnSheetCount = useMemo(
+    () => (liveSheetData?.customers ?? []).filter((c) => c.totalQuantity > 0).length,
+    [liveSheetData],
+  );
+  const totalItemsOnSheet = useMemo(
+    () => (liveSheetData?.customers ?? []).reduce((a, b) => a + b.totalQuantity, 0),
+    [liveSheetData],
+  );
+
   return (
     <div className="min-h-screen bg-[#fdf8f1] text-[#2a1810]">
-      <header className="bg-white border-b border-[#e8dcc8]">
+      <header className="bg-white border-b border-[#e8dcc8] print:hidden">
         <div className="max-w-6xl mx-auto px-6 py-5 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <Link to="/" className="text-sm px-3 py-2 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]" aria-label="Back to home">
@@ -606,7 +698,7 @@ function AdminPage() {
               </div>
             </Link>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <button
               onClick={toggleSound}
               className={`text-sm px-3 py-2 rounded-lg border font-semibold ${
@@ -656,97 +748,238 @@ function AdminPage() {
         )}
       </header>
 
-      <main className="max-w-6xl mx-auto px-6 py-6 space-y-6">
-        <section className="grid grid-cols-3 gap-3">
+      <main className="max-w-6xl mx-auto px-6 py-6 space-y-6 print:max-w-none print:p-0 print:space-y-0">
+        <section className="grid grid-cols-2 sm:grid-cols-4 gap-3 print:hidden">
           {[
             { label: "Customers", value: customers.length },
-            { label: "Orders logged", value: submissions.length },
-            { label: "Sheet", value: sheetInfo ? `✓ ${sheetInfo.label}` : "✓ Connected" },
+            {
+              label: "On Sheet Today",
+              value: liveSheetData
+                ? `${activeOnSheetCount} (${totalItemsOnSheet.toLocaleString()} items)`
+                : "Loading…",
+            },
+            { label: "Orders Logged", value: submissions.length },
+            { label: "Active Sheet", value: sheetInfo ? `✓ ${sheetInfo.label}` : "✓ Connected" },
           ].map((s) => (
             <div key={s.label} className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm">
               <div className="text-xs uppercase tracking-wider text-[#8b6f4e] font-semibold">{s.label}</div>
-              <div className="text-xl font-bold mt-1">{s.value}</div>
+              <div className="text-xl font-bold mt-1 truncate">{s.value}</div>
             </div>
           ))}
         </section>
 
-       <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 w-fit flex-wrap">
-        {(["customers", "history", "analytics", "estimates", "stocks", "drivers"] as const).map((t) => (
-    <button
-      key={t}
-      onClick={() => setTab(t)}
-      className={`px-4 py-1.5 rounded-lg text-sm font-semibold ${
-        tab === t ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
-      }`}
-    >
-      {t === "customers"
-        ? "Customers"
-        : t === "history"
-        ? "Order History"
-        : t === "analytics"
-        ? "Analytics"
-        : t === "estimates"
-        ? "Estimates"
-        : t === "stocks"
-        ? "Stocks"
-        : "Drivers"}
-      {PROTECTED_TABS.includes(t) && !unlocked ? " 🔒" : ""}
-    </button>
-  ))}
-</div>
+        <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 w-fit flex-wrap print:hidden">
+          {(["customers", "manual", "print", "history", "analytics", "estimates", "stocks", "drivers"] as const).map((t) => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition ${
+                tab === t ? "bg-[#c8362b] text-white" : "text-[#6b5544] hover:bg-[#fdf8f1]"
+              }`}
+            >
+              {t === "customers"
+                ? "Customers"
+                : t === "manual"
+                ? "⚡ Manual Orders"
+                : t === "print"
+                ? "🖨️ Print Sheet"
+                : t === "history"
+                ? "Order History"
+                : t === "analytics"
+                ? "Analytics"
+                : t === "estimates"
+                ? "Estimates"
+                : t === "stocks"
+                ? "Stocks"
+                : "Drivers"}
+              {PROTECTED_TABS.includes(t) && !unlocked ? " 🔒" : ""}
+            </button>
+          ))}
+        </div>
 
         {needsPassword ? (
-          <div className="py-10">
+          <div className="py-10 print:hidden">
             <LockScreen pwInput={pwInput} setPwInput={setPwInput} pwError={pwError} onUnlock={handleUnlock} />
           </div>
         ) : (
         <>
         {tab === "customers" && (
           <section className="space-y-3">
-            <input value={search} onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search customers…"
-              className="w-full bg-white border border-[#e8dcc8] rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-[#c8362b]" />
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative flex-1 min-w-[220px]">
+                <input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search customers by name or driver…"
+                  className="w-full bg-white border border-[#e8dcc8] rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-[#c8362b]"
+                />
+                {search && (
+                  <button
+                    onClick={() => setSearch("")}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[#8b6f4e] hover:text-[#2a1810] text-lg leading-none"
+                    title="Clear search"
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+              <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 flex-wrap">
+                {([
+                  { id: "all", label: `All (${customers.length})` },
+                  { id: "pinned", label: `★ Manual (${manualRegulars.length})` },
+                  { id: "ordered", label: `🟢 On Sheet (${activeOnSheetCount})` },
+                  { id: "pending", label: `⚪ Not Ordered` },
+                ] as const).map((f) => (
+                  <button
+                    key={f.id}
+                    onClick={() => setCustomerStatusFilter(f.id)}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold ${
+                      customerStatusFilter === f.id ? "bg-[#c8362b] text-white" : "text-[#6b5544] hover:bg-[#fdf8f1]"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+              <select
+                value={customerDriverFilter}
+                onChange={(e) => setCustomerDriverFilter(e.target.value)}
+                className="bg-white border border-[#e8dcc8] rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
+              >
+                <option value="__all__">All drivers</option>
+                {customerDriverOptions.map((d) => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
+
             <div className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
               {filteredCustomers.length === 0 && (
-                <div className="p-6 text-center text-sm text-[#8b6f4e]">No customers yet — data will load automatically from your sheet.</div>
+                <div className="p-6 text-center text-sm text-[#8b6f4e]">No customers match your filter.</div>
               )}
-              {filteredCustomers.map((c) => (
-                <div key={c.id} className="p-3 flex items-center justify-between hover:bg-[#fdf8f1]">
-                  <div className="min-w-0">
-                    <div className="font-semibold truncate">{c.name}</div>
-                    <div className="text-xs text-[#8b6f4e] truncate">/order/{c.slug}{c.driver ? ` · ${c.driver}` : ""}</div>
+              {filteredCustomers.map((c) => {
+                const onSheetQty = sheetQtyBySlug.get(c.slug) ?? 0;
+                const isPinned = manualRegulars.includes(c.slug);
+                return (
+                  <div key={c.id} className="p-3 flex flex-wrap items-center justify-between gap-3 hover:bg-[#fdf8f1]">
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                      <button
+                        onClick={() => toggleManualRegular(c.slug)}
+                        title={isPinned ? "Pinned in Manual Orders — click to unpin" : "Pin to Manual Regulars"}
+                        className={`text-lg leading-none transition ${
+                          isPinned ? "text-amber-500" : "text-[#d5c5ae] hover:text-amber-400"
+                        }`}
+                      >
+                        ★
+                      </button>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-semibold truncate">{c.name}</span>
+                          {onSheetQty > 0 ? (
+                            <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-green-100 text-green-800">
+                              🟢 {onSheetQty} on sheet
+                            </span>
+                          ) : (
+                            <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-[#fdf8f1] border border-[#e8dcc8] text-[#8b6f4e]">
+                              0 on sheet
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-[#8b6f4e] truncate">
+                          /order/{c.slug}{c.driver ? ` · ${c.driver}` : ""}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        onClick={() => {
+                          setManualSelectedSlug(c.slug);
+                          setTab("manual");
+                        }}
+                        className="text-xs font-bold px-3 py-1.5 rounded-lg bg-[#c8362b]/10 text-[#c8362b] hover:bg-[#c8362b] hover:text-white transition"
+                        title="Enter or edit order in Manual Orders"
+                      >
+                        ⚡ Manual Order
+                      </button>
+                      <button
+                        onClick={() => copyCustomerLink(c.slug)}
+                        className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-[#e8dcc8] hover:bg-white transition"
+                        title="Copy customer order link"
+                      >
+                        {copiedSlug === c.slug ? "✓ Copied!" : "📋 Copy Link"}
+                      </button>
+                      <Link
+                        to="/order/$slug"
+                        params={{ slug: c.slug }}
+                        className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-[#e8dcc8] hover:bg-white"
+                      >
+                        Open
+                      </Link>
+                    </div>
                   </div>
-                  <Link to="/order/$slug" params={{ slug: c.slug }}
-                    className="text-sm px-3 py-1.5 rounded-lg border border-[#e8dcc8] hover:bg-white">Open</Link>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </section>
         )}
 
+        {tab === "manual" && (
+          <ManualOrdersTab
+            selectedSlug={manualSelectedSlug}
+            onSelectSlug={setManualSelectedSlug}
+            manualRegulars={manualRegulars}
+            onToggleManualRegular={toggleManualRegular}
+            onCopyLink={copyCustomerLink}
+            copiedSlug={copiedSlug}
+          />
+        )}
+
+        {tab === "print" && <PrintSheetTab />}
+
         {tab === "history" && (
           <section className="space-y-5">
-            <div className="flex flex-wrap items-center gap-2 bg-white border border-[#e8dcc8] rounded-xl p-3 shadow-sm">
-              <label className="text-xs font-semibold text-[#6b5544]">Download orders for:</label>
-              <input
-                type="date"
-                value={exportDate}
-                onChange={(e) => setExportDate(e.target.value)}
-                className="border border-[#e8dcc8] rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b]"
-              />
-              <button
-                onClick={handleExportOrders}
-                disabled={exporting}
-                className="text-sm px-3 py-1.5 rounded-lg bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold"
-              >
-                {exporting ? "Preparing…" : "⬇ Download"}
-              </button>
-              {exportError && <span className="text-xs text-red-600">{exportError}</span>}
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-white border border-[#e8dcc8] rounded-xl p-3 shadow-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="text-xs font-semibold text-[#6b5544]">Download orders for:</label>
+                <input
+                  type="date"
+                  value={exportDate}
+                  onChange={(e) => setExportDate(e.target.value)}
+                  className="border border-[#e8dcc8] rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b]"
+                />
+                <button
+                  onClick={handleExportOrders}
+                  disabled={exporting}
+                  className="text-sm px-3 py-1.5 rounded-lg bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white font-bold"
+                >
+                  {exporting ? "Preparing…" : "⬇ Download"}
+                </button>
+                {exportError && <span className="text-xs text-red-600">{exportError}</span>}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 flex-1 min-w-[240px] justify-end">
+                <input
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                  placeholder="Search customer or comment…"
+                  className="border border-[#e8dcc8] rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-[#c8362b] min-w-[200px]"
+                />
+                <select
+                  value={historyTypeFilter}
+                  onChange={(e) => setHistoryTypeFilter(e.target.value)}
+                  className="border border-[#e8dcc8] rounded-lg px-2.5 py-1.5 text-xs font-semibold bg-white focus:outline-none focus:border-[#c8362b]"
+                >
+                  <option value="all">All types</option>
+                  <option value="new">New Order</option>
+                  <option value="added">Added Order</option>
+                  <option value="changed">Changed Order</option>
+                  <option value="late">Late Order</option>
+                </select>
+              </div>
             </div>
 
             {historyGroups.length === 0 && (
               <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e] shadow-sm">
-                No orders submitted yet.
+                No orders match your filter.
               </div>
             )}
             {historyGroups.map(([day, subs]) => (
@@ -768,7 +1001,10 @@ function AdminPage() {
                           </span>
                         </div>
                         <div className="flex items-center justify-between text-xs text-[#8b6f4e]">
-                          <span>For {s.for_date} · {s.total_items} items · {new Date(s.created_at).toLocaleString()}</span>
+                          <span>
+                            For {s.for_date} · {s.total_items} items · {new Date(s.created_at).toLocaleString()}
+                            {s.message ? ` · 💬 ${s.message}` : ""}
+                          </span>
                           <span className="text-[#c8362b] font-semibold shrink-0">View →</span>
                         </div>
                       </button>
@@ -1496,3 +1732,1249 @@ function ChartCard({ title, children }: { title: string; children: React.ReactEl
     </div>
   );
 }
+
+// ============================================================================
+// MANUAL ORDERS TAB (Live Sheet Reader + Fast Admin Order Entry)
+// ============================================================================
+
+function ManualOrdersTab({
+  selectedSlug,
+  onSelectSlug,
+  manualRegulars,
+  onToggleManualRegular,
+  onCopyLink,
+  copiedSlug,
+}: {
+  selectedSlug: string | null;
+  onSelectSlug: (slug: string) => void;
+  manualRegulars: string[];
+  onToggleManualRegular: (slug: string) => void;
+  onCopyLink: (slug: string) => void;
+  copiedSlug: string | null;
+}) {
+  const qc = useQueryClient();
+  const liveQuery = useQuery(liveSheetOrdersQuery);
+  const productsQ = useQuery(productsQuery);
+
+  const [customerSearch, setCustomerSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "pinned" | "pending" | "ordered">("all");
+  const [driverFilter, setDriverFilter] = useState("__all__");
+
+  const [entryMode, setEntryMode] = useState<"set" | "addon">("set");
+  const [qty, setQty] = useState<Record<string, number>>({});
+  const [comment, setComment] = useState("");
+  const [productSearch, setProductSearch] = useState("");
+  const [showExtraProducts, setShowExtraProducts] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  const customers = liveQuery.data?.customers ?? [];
+  const allProducts = productsQ.data ?? [];
+
+  const driverOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const c of customers) {
+      if (c.driver?.trim()) s.add(c.driver.trim());
+    }
+    return Array.from(s).sort((a, b) => a.localeCompare(b));
+  }, [customers]);
+
+  const filteredCustomers = useMemo(() => {
+    const q = customerSearch.trim().toLowerCase();
+    return customers.filter((c) => {
+      if (q && !c.name.toLowerCase().includes(q) && !c.driver.toLowerCase().includes(q)) {
+        return false;
+      }
+      if (driverFilter !== "__all__" && c.driver !== driverFilter) return false;
+      if (statusFilter === "pinned" && !manualRegulars.includes(c.slug)) return false;
+      if (statusFilter === "pending" && c.totalQuantity > 0) return false;
+      if (statusFilter === "ordered" && c.totalQuantity <= 0) return false;
+      return true;
+    });
+  }, [customers, customerSearch, driverFilter, statusFilter, manualRegulars]);
+
+  // Default to first customer in list if none selected yet
+  useEffect(() => {
+    if (!selectedSlug && filteredCustomers.length > 0) {
+      onSelectSlug(filteredCustomers[0].slug);
+    }
+  }, [selectedSlug, filteredCustomers, onSelectSlug]);
+
+  const selectedCustomer: LiveSheetCustomerOrder | null = useMemo(
+    () => customers.find((c) => c.slug === selectedSlug) ?? null,
+    [customers, selectedSlug],
+  );
+
+  // Sync the form inputs whenever the selected customer or entryMode changes
+  useEffect(() => {
+    setFeedback(null);
+    setProductSearch("");
+    setShowExtraProducts(false);
+    if (!selectedCustomer) {
+      setQty({});
+      setComment("");
+      return;
+    }
+    if (entryMode === "set") {
+      const next: Record<string, number> = {};
+      for (const r of selectedCustomer.rows) {
+        if (r.quantity > 0) {
+          next[`r:${r.sheetRow}`] = r.quantity;
+        }
+      }
+      setQty(next);
+      setComment(selectedCustomer.comment || "");
+    } else {
+      setQty({});
+      setComment("");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCustomer?.slug, entryMode, liveQuery.dataUpdatedAt]);
+
+  const regularProductNamesLower = useMemo(
+    () => new Set((selectedCustomer?.rows ?? []).map((r) => r.productName.trim().toLowerCase())),
+    [selectedCustomer],
+  );
+
+  const filteredRegulars = useMemo(() => {
+    if (!selectedCustomer) return [];
+    const s = productSearch.trim().toLowerCase();
+    if (!s) return selectedCustomer.rows;
+    return selectedCustomer.rows.filter((r) => r.productName.toLowerCase().includes(s));
+  }, [selectedCustomer, productSearch]);
+
+  const extraProducts = useMemo(() => {
+    const s = productSearch.trim().toLowerCase();
+    if (!showExtraProducts && !s) return [];
+    return allProducts.filter((p) => {
+      if (regularProductNamesLower.has(p.name.trim().toLowerCase())) return false;
+      if (!s) return true;
+      return p.name.toLowerCase().includes(s);
+    });
+  }, [allProducts, regularProductNamesLower, productSearch, showExtraProducts]);
+
+  function setLineQty(key: string, val: number) {
+    setQty((prev) => ({ ...prev, [key]: Math.max(0, val || 0) }));
+  }
+
+  function adjustLineQty(key: string, delta: number) {
+    setQty((prev) => ({ ...prev, [key]: Math.max(0, (prev[key] ?? 0) + delta) }));
+  }
+
+  function handleRepeatLastOrder() {
+    if (!selectedCustomer?.lastOrder) return;
+    const next: Record<string, number> = {};
+    for (const item of selectedCustomer.lastOrder.items) {
+      const matchRow = selectedCustomer.rows.find(
+        (r) =>
+          (item.productId && r.productId === item.productId) ||
+          r.productName.trim().toLowerCase() === item.productName.trim().toLowerCase(),
+      );
+      if (matchRow) {
+        next[`r:${matchRow.sheetRow}`] = item.quantity;
+      } else {
+        const extraProd = allProducts.find(
+          (p) =>
+            (item.productId && p.id === item.productId) ||
+            p.name.trim().toLowerCase() === item.productName.trim().toLowerCase(),
+        );
+        if (extraProd) {
+          next[`x:${extraProd.id}`] = item.quantity;
+          setShowExtraProducts(true);
+        }
+      }
+    }
+    setQty(next);
+    setFeedback({
+      type: "ok",
+      text: `Loaded ${selectedCustomer.lastOrder.totalItems} items from last order (${selectedCustomer.lastOrder.forDate}). Click "Save to Sheet" to confirm.`,
+    });
+  }
+
+  function handleResetToSheet() {
+    if (!selectedCustomer) return;
+    const next: Record<string, number> = {};
+    if (entryMode === "set") {
+      for (const r of selectedCustomer.rows) {
+        if (r.quantity > 0) next[`r:${r.sheetRow}`] = r.quantity;
+      }
+    }
+    setQty(next);
+    setFeedback(null);
+  }
+
+  const builtItems = useMemo(() => {
+    if (!selectedCustomer) return [];
+    const out: Array<{ sheetRow: number; productName: string; productId: string | null; quantity: number }> = [];
+    for (const r of selectedCustomer.rows) {
+      const v = qty[`r:${r.sheetRow}`] ?? 0;
+      if (v > 0) {
+        out.push({
+          sheetRow: r.sheetRow,
+          productName: r.productName,
+          productId: r.productId,
+          quantity: v,
+        });
+      }
+    }
+    for (const [k, v] of Object.entries(qty)) {
+      if (!k.startsWith("x:") || v <= 0) continue;
+      const pid = k.slice(2);
+      const p = allProducts.find((x) => x.id === pid);
+      if (!p) continue;
+      out.push({
+        sheetRow: 0,
+        productName: p.name,
+        productId: p.id,
+        quantity: v,
+      });
+    }
+    return out;
+  }, [selectedCustomer, qty, allProducts]);
+
+  const totalToSave = useMemo(
+    () => builtItems.reduce((a, b) => a + b.quantity, 0),
+    [builtItems],
+  );
+
+  async function saveOrder(advanceToNextPending: boolean) {
+    if (!selectedCustomer) return;
+    if (builtItems.length === 0 || totalToSave <= 0) {
+      setFeedback({
+        type: "err",
+        text: "Enter a quantity for at least 1 product (or click 'Clear Sheet Order to 0' to zero out).",
+      });
+      return;
+    }
+    setSaving(true);
+    setFeedback(null);
+    try {
+      const res = await adminSaveManualOrder({
+        data: {
+          customerName: selectedCustomer.name,
+          slug: selectedCustomer.slug,
+          mode: entryMode,
+          items: builtItems,
+          comment,
+        },
+      });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["live-sheet-orders"] }),
+        qc.invalidateQueries({ queryKey: ["submissions"] }),
+        qc.invalidateQueries({ queryKey: ["analytics"] }),
+      ]);
+      setFeedback({
+        type: "ok",
+        text:
+          entryMode === "addon"
+            ? `Added +${res.totalItems} items onto ${selectedCustomer.name}'s sheet order.`
+            : `Saved ${res.totalItems} items to ${selectedCustomer.name} on the sheet.`,
+      });
+
+      if (advanceToNextPending) {
+        const currentIdx = filteredCustomers.findIndex((c) => c.slug === selectedCustomer.slug);
+        const nextPending =
+          filteredCustomers.slice(currentIdx + 1).find((c) => c.totalQuantity === 0) ??
+          filteredCustomers.find((c) => c.slug !== selectedCustomer.slug && c.totalQuantity === 0);
+        if (nextPending) {
+          onSelectSlug(nextPending.slug);
+        }
+      }
+    } catch (e) {
+      setFeedback({ type: "err", text: (e as Error).message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleClearCustomerOrder() {
+    if (!selectedCustomer) return;
+    setSaving(true);
+    setFeedback(null);
+    try {
+      await adminSaveManualOrder({
+        data: {
+          customerName: selectedCustomer.name,
+          slug: selectedCustomer.slug,
+          mode: "clear",
+          items: [],
+          comment: "",
+        },
+      });
+      setQty({});
+      setComment("");
+      await qc.invalidateQueries({ queryKey: ["live-sheet-orders"] });
+      setFeedback({
+        type: "ok",
+        text: `Cleared ${selectedCustomer.name}'s quantities to 0 on the active sheet.`,
+      });
+    } catch (e) {
+      setFeedback({ type: "err", text: (e as Error).message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const orderedCount = customers.filter((c) => c.totalQuantity > 0).length;
+  const pendingCount = customers.length - orderedCount;
+
+  return (
+    <section className="space-y-4">
+      {/* Top status bar */}
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-bold uppercase tracking-wider px-2.5 py-1 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
+              Active Sheet: {liveQuery.data?.sheetLabel ?? "…"}
+            </span>
+            {liveQuery.data?.forDate && (
+              <span className="text-xs font-semibold text-[#6b5544]">
+                Delivery Date: <strong>{liveQuery.data.forDate}</strong>
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-[#8b6f4e] mt-1">
+            Reads live quantities directly from Column C of the active Google Sheet — including orders typed straight into the sheet.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void qc.invalidateQueries({ queryKey: ["live-sheet-orders"] })}
+            disabled={liveQuery.isFetching}
+            className="text-xs font-bold px-3 py-2 rounded-xl border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition disabled:opacity-50"
+          >
+            {liveQuery.isFetching ? "Reading Sheet…" : "↻ Refresh from Sheet"}
+          </button>
+        </div>
+      </div>
+
+      {liveQuery.isLoading && (
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center text-sm text-[#8b6f4e]">
+          Reading live customer orders from the Google Sheet…
+        </div>
+      )}
+
+      {liveQuery.isError && (
+        <div className="bg-white rounded-2xl border border-red-300 p-6 text-center text-sm text-red-700">
+          Failed to read live sheet: {(liveQuery.error as Error).message}
+        </div>
+      )}
+
+      {!liveQuery.isLoading && !liveQuery.isError && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+          {/* LEFT PANEL: Customer Search & Picker */}
+          <div className="lg:col-span-5 bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden flex flex-col">
+            <div className="p-3.5 border-b border-[#e8dcc8] space-y-2.5 bg-[#fdf8f1]/60">
+              <div className="relative">
+                <input
+                  value={customerSearch}
+                  onChange={(e) => setCustomerSearch(e.target.value)}
+                  placeholder="Search customer or driver…"
+                  className="w-full bg-white border border-[#e8dcc8] rounded-xl px-3.5 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+                />
+                {customerSearch && (
+                  <button
+                    onClick={() => setCustomerSearch("")}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-[#8b6f4e] hover:text-[#2a1810] font-bold"
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+
+              <div className="flex flex-wrap gap-1">
+                {([
+                  { id: "all", label: `All (${customers.length})` },
+                  { id: "pinned", label: `★ Manual (${manualRegulars.length})` },
+                  { id: "pending", label: `⚪ 0 on Sheet (${pendingCount})` },
+                  { id: "ordered", label: `🟢 On Sheet (${orderedCount})` },
+                ] as const).map((f) => (
+                  <button
+                    key={f.id}
+                    onClick={() => setStatusFilter(f.id)}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition ${
+                      statusFilter === f.id
+                        ? "bg-[#c8362b] text-white"
+                        : "bg-white border border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1]"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
+              <select
+                value={driverFilter}
+                onChange={(e) => setDriverFilter(e.target.value)}
+                className="w-full bg-white border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
+              >
+                <option value="__all__">All drivers</option>
+                {driverOptions.map((d) => (
+                  <option key={d} value={d}>
+                    Driver: {d}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="divide-y divide-[#e8dcc8] max-h-[640px] overflow-y-auto">
+              {filteredCustomers.length === 0 && (
+                <div className="p-6 text-center text-xs text-[#8b6f4e]">
+                  No customers match your search/filter.
+                </div>
+              )}
+              {filteredCustomers.map((c) => {
+                const active = c.slug === selectedCustomer?.slug;
+                const pinned = manualRegulars.includes(c.slug);
+                return (
+                  <div
+                    key={c.slug}
+                    onClick={() => onSelectSlug(c.slug)}
+                    className={`p-3 flex items-center justify-between gap-2 cursor-pointer transition ${
+                      active ? "bg-[#c8362b]/10 border-l-4 border-l-[#c8362b]" : "hover:bg-[#fdf8f1]"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleManualRegular(c.slug);
+                        }}
+                        title={pinned ? "Unpin from Manual Regulars" : "Pin to Manual Regulars"}
+                        className={`text-base leading-none ${
+                          pinned ? "text-amber-500" : "text-[#d5c5ae] hover:text-amber-400"
+                        }`}
+                      >
+                        ★
+                      </button>
+                      <div className="min-w-0">
+                        <div className="font-semibold text-sm truncate">{c.name}</div>
+                        <div className="text-[11px] text-[#8b6f4e] truncate">
+                          {c.driver || "Unassigned"} · {c.rows.length} regular items
+                        </div>
+                      </div>
+                    </div>
+                    <div className="shrink-0">
+                      {c.totalQuantity > 0 ? (
+                        <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-green-100 text-green-800">
+                          🟢 {c.totalQuantity}
+                        </span>
+                      ) : (
+                        <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-[#fdf8f1] border border-[#e8dcc8] text-[#8b6f4e]">
+                          0
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* RIGHT PANEL: Order Entry Pad */}
+          <div className="lg:col-span-7 bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden">
+            {!selectedCustomer ? (
+              <div className="p-10 text-center text-sm text-[#8b6f4e]">
+                Select a customer on the left to view or enter their order.
+              </div>
+            ) : (
+              <div className="divide-y divide-[#e8dcc8]">
+                {/* Customer Header */}
+                <div className="p-4 bg-[#fdf8f1]/70 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h2 className="text-lg font-bold text-[#2a1810]">{selectedCustomer.name}</h2>
+                      <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-white border border-[#e8dcc8] text-[#6b5544]">
+                        🚚 {selectedCustomer.driver || "Unassigned"}
+                      </span>
+                      {selectedCustomer.totalQuantity > 0 ? (
+                        <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-green-100 text-green-800">
+                          🟢 Currently on sheet: {selectedCustomer.totalQuantity} items
+                        </span>
+                      ) : (
+                        <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800">
+                          ⚪ Not ordered yet (0 on sheet)
+                        </span>
+                      )}
+                    </div>
+                    {selectedCustomer.comment && (
+                      <p className="text-xs text-[#6b5544] mt-1">
+                        💬 Current sheet comment: <strong>{selectedCustomer.comment}</strong>
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => onCopyLink(selectedCustomer.slug)}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-[#e8dcc8] bg-white hover:bg-[#fdf8f1]"
+                    >
+                      {copiedSlug === selectedCustomer.slug ? "✓ Copied!" : "📋 Copy Link"}
+                    </button>
+                    <Link
+                      to="/order/$slug"
+                      params={{ slug: selectedCustomer.slug }}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-[#e8dcc8] bg-white hover:bg-[#fdf8f1]"
+                    >
+                      Customer View ↗
+                    </Link>
+                  </div>
+                </div>
+
+                {/* Mode & Quick Fill Toolbar */}
+                <div className="p-3.5 flex flex-wrap items-center justify-between gap-2 bg-white">
+                  <div className="flex gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
+                    <button
+                      type="button"
+                      onClick={() => setEntryMode("set")}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                        entryMode === "set" ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
+                      }`}
+                    >
+                      ✏️ Set / Overwrite Sheet (Col C)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEntryMode("addon")}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                        entryMode === "addon" ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
+                      }`}
+                    >
+                      ➕ Add onto Existing
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {selectedCustomer.lastOrder && (
+                      <button
+                        type="button"
+                        onClick={handleRepeatLastOrder}
+                        className="text-xs font-bold px-3 py-1.5 rounded-lg bg-amber-100 text-amber-900 hover:bg-amber-200 transition"
+                        title={`Fill quantities from their last order (${selectedCustomer.lastOrder.forDate})`}
+                      >
+                        ⟳ Repeat Last ({selectedCustomer.lastOrder.totalItems} items)
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleResetToSheet}
+                      className="text-xs font-semibold px-2.5 py-1.5 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+                    >
+                      ↺ Reset
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setQty({})}
+                      className="text-xs font-semibold px-2.5 py-1.5 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+                    >
+                      Zero Inputs
+                    </button>
+                  </div>
+                </div>
+
+                {/* Product Search */}
+                <div className="p-3 bg-[#fdf8f1]/40">
+                  <div className="relative">
+                    <input
+                      value={productSearch}
+                      onChange={(e) => setProductSearch(e.target.value)}
+                      placeholder="Filter regular products or type any product name to add extra…"
+                      className="w-full bg-white border border-[#e8dcc8] rounded-xl px-3.5 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+                    />
+                    {productSearch && (
+                      <button
+                        onClick={() => setProductSearch("")}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-[#8b6f4e] hover:text-[#2a1810] font-bold"
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Regular Products List */}
+                <div className="divide-y divide-[#e8dcc8] max-h-[420px] overflow-y-auto">
+                  {filteredRegulars.map((r) => {
+                    const k = `r:${r.sheetRow}`;
+                    const val = qty[k] ?? 0;
+                    return (
+                      <div
+                        key={r.sheetRow}
+                        className={`p-3 flex items-center justify-between gap-3 ${
+                          val > 0 ? "bg-[#c8362b]/[0.04]" : "hover:bg-[#fdf8f1]/60"
+                        }`}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="font-semibold text-sm leading-snug">{r.productName}</div>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <span className="text-[11px] text-[#8b6f4e]">Row #{r.sheetRow}</span>
+                            {r.quantity > 0 && (
+                              <span className="text-[11px] font-bold text-green-700">
+                                On sheet: {r.quantity}
+                              </span>
+                            )}
+                            {r.lateQuantity > 0 && (
+                              <span className="text-[11px] font-bold text-red-600">
+                                Late: {r.lateQuantity}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => adjustLineQty(k, -1)}
+                            className="w-8 h-8 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] font-bold text-base hover:bg-[#e8dcc8]/50"
+                          >
+                            −
+                          </button>
+                          <input
+                            type="number"
+                            inputMode="numeric"
+                            min={0}
+                            value={val === 0 ? "" : val}
+                            placeholder="0"
+                            onChange={(e) =>
+                              setLineQty(k, e.target.value === "" ? 0 : parseInt(e.target.value, 10))
+                            }
+                            className={`w-16 h-8 text-center font-bold border rounded-lg focus:outline-none ${
+                              val > 0
+                                ? "border-[#c8362b] bg-white text-[#c8362b]"
+                                : "border-[#e8dcc8] bg-[#fdf8f1] text-[#2a1810]"
+                            }`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => adjustLineQty(k, 1)}
+                            className="w-8 h-8 rounded-lg bg-[#c8362b] text-white font-bold text-base hover:bg-[#a82a22]"
+                          >
+                            +
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => adjustLineQty(k, 5)}
+                            className="px-2 h-8 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] text-xs font-bold text-[#6b5544] hover:bg-[#e8dcc8]/50"
+                            title="Add 5"
+                          >
+                            +5
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => adjustLineQty(k, 10)}
+                            className="px-2 h-8 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] text-xs font-bold text-[#6b5544] hover:bg-[#e8dcc8]/50"
+                            title="Add 10"
+                          >
+                            +10
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {/* Extra Products Section */}
+                  <div className="p-3 bg-[#fdf8f1]/40">
+                    {!showExtraProducts && !productSearch.trim() ? (
+                      <button
+                        type="button"
+                        onClick={() => setShowExtraProducts(true)}
+                        className="w-full py-2 rounded-xl border border-dashed border-[#c8362b]/50 text-xs font-bold text-[#c8362b] hover:bg-[#c8362b]/5"
+                      >
+                        + Add Extra Product (from full bakery list)
+                      </button>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold uppercase tracking-wider text-[#8b6f4e]">
+                            Extra Products ({extraProducts.length}) — inserts into sheet automatically
+                          </span>
+                          {showExtraProducts && (
+                            <button
+                              type="button"
+                              onClick={() => setShowExtraProducts(false)}
+                              className="text-xs font-semibold text-[#c8362b] hover:underline"
+                            >
+                              Hide extra
+                            </button>
+                          )}
+                        </div>
+                        <div className="divide-y divide-[#e8dcc8] bg-white rounded-xl border border-[#e8dcc8] max-h-60 overflow-y-auto">
+                          {extraProducts.slice(0, 60).map((p) => {
+                            const k = `x:${p.id}`;
+                            const val = qty[k] ?? 0;
+                            return (
+                              <div key={p.id} className="p-2.5 flex items-center justify-between gap-2">
+                                <span className="text-xs font-medium truncate">{p.name}</span>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => adjustLineQty(k, -1)}
+                                    className="w-7 h-7 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] font-bold text-sm"
+                                  >
+                                    −
+                                  </button>
+                                  <input
+                                    type="number"
+                                    inputMode="numeric"
+                                    min={0}
+                                    value={val === 0 ? "" : val}
+                                    placeholder="0"
+                                    onChange={(e) =>
+                                      setLineQty(k, e.target.value === "" ? 0 : parseInt(e.target.value, 10))
+                                    }
+                                    className="w-14 h-7 text-center text-xs font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1]"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => adjustLineQty(k, 1)}
+                                    className="w-7 h-7 rounded-lg bg-[#c8362b] text-white font-bold text-sm"
+                                  >
+                                    +
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Comment & Save Bar */}
+                <div className="p-4 bg-[#fdf8f1] space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={comment}
+                      onChange={(e) => setComment(e.target.value.replace(/[\r\n\t]+/g, " "))}
+                      placeholder="Optional note / comment (writes to Column J on sheet)…"
+                      className="flex-1 min-w-[200px] bg-white border border-[#e8dcc8] rounded-xl px-3.5 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+                    />
+                  </div>
+
+                  {feedback && (
+                    <div
+                      className={`text-xs font-semibold px-3 py-2 rounded-xl border ${
+                        feedback.type === "ok"
+                          ? "bg-green-50 border-green-200 text-green-800"
+                          : "bg-red-50 border-red-200 text-red-700"
+                      }`}
+                    >
+                      {feedback.text}
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs text-[#6b5544]">
+                      Total entered: <strong className="text-sm text-[#2a1810]">{totalToSave} items</strong> across{" "}
+                      <strong>{builtItems.length} products</strong>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {selectedCustomer.totalQuantity > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleClearCustomerOrder}
+                          disabled={saving}
+                          className="text-xs font-bold px-3 py-2.5 rounded-xl border border-red-300 text-red-700 bg-white hover:bg-red-50 transition disabled:opacity-50"
+                          title="Zero out this customer's quantities on the active sheet"
+                        >
+                          🗑 Clear Sheet Order to 0
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void saveOrder(false)}
+                        disabled={saving || totalToSave <= 0}
+                        className="text-xs font-bold px-4 py-2.5 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white transition disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e]"
+                      >
+                        {saving
+                          ? "Saving…"
+                          : entryMode === "addon"
+                          ? `➕ Add +${totalToSave} to Sheet`
+                          : `💾 Save to Sheet (${totalToSave})`}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void saveOrder(true)}
+                        disabled={saving || totalToSave <= 0}
+                        className="text-xs font-bold px-4 py-2.5 rounded-xl bg-[#2a1810] hover:bg-black text-white transition disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e]"
+                        title="Save this customer's order and jump to the next customer with 0 on the sheet"
+                      >
+                        💾 Save & Next Pending →
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {saving && <CenterLoader title="Updating Google Sheet…" subtitle={selectedCustomer?.name} />}
+    </section>
+  );
+}
+
+// ============================================================================
+// PRINT SHEET TAB (2-Column Side-by-Side Compact Print Sheet)
+// ============================================================================
+
+type PrintCustomerMode = "items" | "total_only" | "hidden";
+
+// Default customers that show ONLY their "[Customer] Total" row on the print
+// sheet (matching the bakery's standard pivot print layout).
+const DEFAULT_TOTAL_ONLY_CUSTOMERS = new Set([
+  "louise",
+  "discountjeppe",
+  "jose",
+  "discountplain",
+  "lilly",
+  "newstop",
+  "sasol",
+  "patrick",
+  "shaft22",
+  "shopcollections",
+  "tiptopcafe",
+  "illovo",
+]);
+
+function normPrintKey(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function getDefaultPrintMode(name: string): PrintCustomerMode {
+  return DEFAULT_TOTAL_ONLY_CUSTOMERS.has(normPrintKey(name)) ? "total_only" : "items";
+}
+
+type PrintLine = {
+  kind: "item" | "customer_total" | "driver_subtotal";
+  customerName: string;
+  customerSlug?: string;
+  productName: string;
+  quantity: number | string;
+  driver?: string;
+};
+
+function PrintSheetTab() {
+  const qc = useQueryClient();
+  const liveQuery = useQuery(liveSheetOrdersQuery);
+
+  const [driverFilter, setDriverFilter] = useState("__all__");
+  const [groupByDriver, setGroupByDriver] = useState(true);
+  const [showCustomize, setShowCustomize] = useState(false);
+  const [customizeSearch, setCustomizeSearch] = useState("");
+
+  const [customModes, setCustomModes] = useState<Record<string, PrintCustomerMode>>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = localStorage.getItem(PRINT_MODES_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as Record<string, PrintCustomerMode>) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  function modeForCustomer(name: string): PrintCustomerMode {
+    const k = normPrintKey(name);
+    return customModes[k] ?? getDefaultPrintMode(name);
+  }
+
+  function setCustomerMode(name: string, mode: PrintCustomerMode) {
+    const k = normPrintKey(name);
+    setCustomModes((prev) => {
+      const next = { ...prev, [k]: mode };
+      try {
+        localStorage.setItem(PRINT_MODES_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }
+
+  function cycleCustomerMode(name: string) {
+    const current = modeForCustomer(name);
+    const next: PrintCustomerMode = current === "items" ? "total_only" : "items";
+    setCustomerMode(name, next);
+  }
+
+  function setAllCustomerModes(mode: PrintCustomerMode | "default") {
+    if (mode === "default") {
+      setCustomModes({});
+      try {
+        localStorage.removeItem(PRINT_MODES_STORAGE_KEY);
+      } catch {}
+      return;
+    }
+    const next: Record<string, PrintCustomerMode> = {};
+    for (const c of liveQuery.data?.customers ?? []) {
+      next[normPrintKey(c.name)] = mode;
+    }
+    setCustomModes(next);
+    try {
+      localStorage.setItem(PRINT_MODES_STORAGE_KEY, JSON.stringify(next));
+    } catch {}
+  }
+
+  const allCustomers = liveQuery.data?.customers ?? [];
+  const activeCustomers = useMemo(
+    () =>
+      allCustomers.filter((c) => {
+        if (c.totalQuantity <= 0) return false;
+        if (driverFilter !== "__all__" && c.driver !== driverFilter) return false;
+        return true;
+      }),
+    [allCustomers, driverFilter],
+  );
+
+  const driverOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const c of allCustomers) {
+      if (c.driver?.trim()) s.add(c.driver.trim());
+    }
+    return Array.from(s).sort((a, b) => a.localeCompare(b));
+  }, [allCustomers]);
+
+  // Build the flat sequence of PrintLines, grouped by Driver (with driver
+  // subtotals like 66, 946, 105, 74) or in sheet order.
+  const printLines: PrintLine[] = useMemo(() => {
+    const visible = activeCustomers.filter((c) => modeForCustomer(c.name) !== "hidden");
+    const lines: PrintLine[] = [];
+
+    const appendCustomerLines = (c: LiveSheetCustomerOrder) => {
+      const mode = modeForCustomer(c.name);
+      const positiveRows = c.rows.filter((r) => r.quantity > 0);
+      if (mode === "items") {
+        positiveRows.forEach((r, idx) => {
+          lines.push({
+            kind: "item",
+            customerName: idx === 0 ? c.name : "",
+            customerSlug: c.slug,
+            productName: r.productName,
+            quantity: r.quantity,
+            driver: c.driver,
+          });
+        });
+      }
+      lines.push({
+        kind: "customer_total",
+        customerName: `${c.name} Total`,
+        customerSlug: c.slug,
+        productName: "",
+        quantity: c.totalQuantity,
+        driver: c.driver,
+      });
+    };
+
+    if (!groupByDriver) {
+      for (const c of visible) appendCustomerLines(c);
+      return lines;
+    }
+
+    // Group by driver in the order drivers appear
+    const byDriver = new Map<string, LiveSheetCustomerOrder[]>();
+    for (const c of visible) {
+      const d = c.driver || "Unassigned";
+      const list = byDriver.get(d) ?? [];
+      list.push(c);
+      byDriver.set(d, list);
+    }
+
+    for (const [driver, groupCusts] of byDriver.entries()) {
+      let groupTotal = 0;
+      for (const c of groupCusts) {
+        appendCustomerLines(c);
+        groupTotal += c.totalQuantity;
+      }
+      lines.push({
+        kind: "driver_subtotal",
+        customerName: "",
+        productName: "",
+        quantity: groupTotal,
+        driver,
+      });
+    }
+
+    return lines;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCustomers, customModes, groupByDriver]);
+
+  // Split printLines into Left Column and Right Column (balanced 2-column layout)
+  const { leftLines, rightLines, rowCount } = useMemo(() => {
+    const mid = Math.ceil(printLines.length / 2);
+    const left = printLines.slice(0, mid);
+    const right = printLines.slice(mid);
+    return {
+      leftLines: left,
+      rightLines: right,
+      rowCount: Math.max(left.length, right.length),
+    };
+  }, [printLines]);
+
+  const filteredCustomizeCustomers = useMemo(() => {
+    const q = customizeSearch.trim().toLowerCase();
+    const base = allCustomers.filter((c) => c.totalQuantity > 0 || q.length > 0);
+    if (!q) return base;
+    return base.filter((c) => c.name.toLowerCase().includes(q) || c.driver.toLowerCase().includes(q));
+  }, [allCustomers, customizeSearch]);
+
+  return (
+    <section className="space-y-4">
+      {/* Screen-only toolbar */}
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm space-y-3 print:hidden">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h2 className="font-bold text-base text-[#2a1810]">2-Column Order Print Sheet</h2>
+              <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
+                {liveQuery.data?.sheetLabel ?? "…"} Sheet · For {liveQuery.data?.forDate ?? "Tomorrow"}
+              </span>
+              <span className="text-xs text-[#8b6f4e]">
+                {activeCustomers.length} customers with orders · {printLines.length} lines ({rowCount} rows tall)
+              </span>
+            </div>
+            <p className="text-xs text-[#8b6f4e] mt-1">
+              Click any <strong>Customer Total</strong> row in the table below to toggle that customer between{" "}
+              <strong>Full Items + Total</strong> and <strong>Total Only</strong>.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={driverFilter}
+              onChange={(e) => setDriverFilter(e.target.value)}
+              className="bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
+            >
+              <option value="__all__">All drivers</option>
+              {driverOptions.map((d) => (
+                <option key={d} value={d}>
+                  Driver: {d}
+                </option>
+              ))}
+            </select>
+
+            <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] px-3 py-2 rounded-xl border border-[#e8dcc8] bg-[#fdf8f1] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={groupByDriver}
+                onChange={(e) => setGroupByDriver(e.target.checked)}
+              />
+              Group subtotals by driver
+            </label>
+
+            <button
+              type="button"
+              onClick={() => setShowCustomize((s) => !s)}
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+            >
+              {showCustomize ? "Hide Customer Toggles" : "⚙️ Customize Customers"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void qc.invalidateQueries({ queryKey: ["live-sheet-orders"] })}
+              disabled={liveQuery.isFetching}
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition"
+            >
+              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh Sheet"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => window.print()}
+              disabled={printLines.length === 0}
+              className="text-xs font-bold px-4 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white transition disabled:opacity-50"
+            >
+              🖨️ Print Sheet
+            </button>
+          </div>
+        </div>
+
+        {showCustomize && (
+          <div className="pt-3 border-t border-[#e8dcc8] space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <input
+                value={customizeSearch}
+                onChange={(e) => setCustomizeSearch(e.target.value)}
+                placeholder="Search customer to toggle Items / Total Only / Hide…"
+                className="flex-1 min-w-[220px] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-xs focus:outline-none focus:border-[#c8362b]"
+              />
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setAllCustomerModes("items")}
+                  className="text-xs font-semibold px-2.5 py-1 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+                >
+                  Expand All (Items + Total)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAllCustomerModes("total_only")}
+                  className="text-xs font-semibold px-2.5 py-1 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+                >
+                  Collapse All (Totals Only)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAllCustomerModes("default")}
+                  className="text-xs font-semibold px-2.5 py-1 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+                >
+                  Reset to Default Layout
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 max-h-56 overflow-y-auto p-1">
+              {filteredCustomizeCustomers.map((c) => {
+                const m = modeForCustomer(c.name);
+                return (
+                  <div
+                    key={c.slug}
+                    className="flex items-center justify-between gap-2 p-2 rounded-xl border border-[#e8dcc8] bg-[#fdf8f1]/50 text-xs"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-semibold truncate">{c.name}</div>
+                      <div className="text-[10px] text-[#8b6f4e]">
+                        {c.driver} · {c.totalQuantity} items
+                      </div>
+                    </div>
+                    <select
+                      value={m}
+                      onChange={(e) => setCustomerMode(c.name, e.target.value as PrintCustomerMode)}
+                      className="border border-[#e8dcc8] rounded-lg px-2 py-1 text-[11px] font-bold bg-white"
+                    >
+                      <option value="items">Items + Total</option>
+                      <option value="total_only">Total Only</option>
+                      <option value="hidden">Hidden</option>
+                    </select>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Printable 2-Column Side-by-Side Table */}
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm p-4 print:border-0 print:shadow-none print:p-0 print:rounded-none">
+        {liveQuery.isLoading ? (
+          <div className="p-8 text-center text-sm text-[#8b6f4e]">
+            Loading live orders from Google Sheet…
+          </div>
+        ) : rowCount === 0 ? (
+          <div className="p-8 text-center text-sm text-[#8b6f4e]">
+            No orders with quantity &gt; 0 are currently on the active {liveQuery.data?.sheetLabel} sheet.
+          </div>
+        ) : (
+          <div className="overflow-x-auto print:overflow-visible">
+            <div className="hidden print:flex items-center justify-between text-[11px] font-bold border-b border-black pb-1 mb-1">
+              <span>PORTUGAL BAKERY — ORDER SHEET ({liveQuery.data?.sheetLabel})</span>
+              <span>DELIVERY DATE: {liveQuery.data?.forDate}</span>
+            </div>
+            <table className="w-full border-collapse text-[12px] leading-tight print:text-[10px] print:leading-[1.15]">
+              <thead>
+                <tr className="bg-[#2a1810] text-white print:bg-gray-200 print:text-black">
+                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Customer</th>
+                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Product</th>
+                  <th className="border border-gray-400 px-2 py-1 text-right font-bold w-12">Qty</th>
+                  <th className="border-y border-gray-400 bg-[#e8dcc8] w-1.5 print:bg-gray-400" />
+                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Customer</th>
+                  <th className="border border-gray-400 px-2 py-1 text-left font-bold">Product</th>
+                  <th className="border border-gray-400 px-2 py-1 text-right font-bold w-12">Qty</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Array.from({ length: rowCount }).map((_, idx) => {
+                  const left = leftLines[idx];
+                  const right = rightLines[idx];
+                  return (
+                    <tr key={idx}>
+                      <PrintHalfRowCells line={left} onToggleCustomer={cycleCustomerMode} />
+                      <td className="border-x border-gray-400 bg-[#e8dcc8]/60 w-1.5 print:bg-gray-300" />
+                      <PrintHalfRowCells line={right} onToggleCustomer={cycleCustomerMode} />
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function PrintHalfRowCells({
+  line,
+  onToggleCustomer,
+}: {
+  line: PrintLine | undefined;
+  onToggleCustomer: (rawCustomerName: string) => void;
+}) {
+  if (!line) {
+    return (
+      <>
+        <td className="border border-gray-300 px-2 py-0.5" />
+        <td className="border border-gray-300 px-2 py-0.5" />
+        <td className="border border-gray-300 px-2 py-0.5 text-right" />
+      </>
+    );
+  }
+
+  if (line.kind === "driver_subtotal") {
+    return (
+      <>
+        <td className="border border-gray-400 bg-amber-50/80 print:bg-gray-100 px-2 py-0.5 font-bold text-[11px] text-[#6b5544] print:text-black">
+          {/* Blank customer cell on subtotal line to match spreadsheet pivot */}
+        </td>
+        <td className="border border-gray-400 bg-amber-50/80 print:bg-gray-100 px-2 py-0.5 text-right text-[10px] font-semibold text-[#8b6f4e] print:text-black">
+          {line.driver ? `${line.driver}` : ""}
+        </td>
+        <td className="border border-gray-400 bg-amber-50/80 print:bg-gray-100 px-2 py-0.5 text-right font-extrabold text-[#2a1810] print:text-black">
+          {line.quantity}
+        </td>
+      </>
+    );
+  }
+
+  if (line.kind === "customer_total") {
+    const baseName = line.customerName.replace(/\s+Total$/i, "");
+    return (
+      <>
+        <td
+          onClick={() => onToggleCustomer(baseName)}
+          title="Click to toggle between Full Items and Total Only"
+          className="border border-gray-400 bg-[#fdf8f1] print:bg-gray-100 px-2 py-0.5 font-bold text-[#2a1810] print:text-black cursor-pointer hover:bg-[#e8dcc8]/50"
+          colSpan={2}
+        >
+          {line.customerName}
+        </td>
+        <td className="border border-gray-400 bg-[#fdf8f1] print:bg-gray-100 px-2 py-0.5 text-right font-bold text-[#2a1810] print:text-black">
+          {line.quantity}
+        </td>
+      </>
+    );
+  }
+
+  // Regular item line
+  return (
+    <>
+      <td
+        onClick={() => line.customerName && onToggleCustomer(line.customerName)}
+        className={`border border-gray-300 px-2 py-0.5 font-semibold text-[#2a1810] print:text-black ${
+          line.customerName ? "cursor-pointer hover:underline" : ""
+        }`}
+      >
+        {line.customerName}
+      </td>
+      <td className="border border-gray-300 px-2 py-0.5 text-[#2a1810] print:text-black">
+        {line.productName}
+      </td>
+      <td className="border border-gray-300 px-2 py-0.5 text-right font-semibold text-[#2a1810] print:text-black">
+        {line.quantity}
+      </td>
+    </>
+  );
+}
+

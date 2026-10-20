@@ -1566,3 +1566,268 @@ export const saveProductStocks = createServerFn({ method: "POST" })
     );
     return { ok: true, updated: data.updates.length };
   });
+
+// ============================== LIVE SHEET ORDERS (MANUAL ENTRY & PRINT SHEET) ==============================
+
+export type LiveSheetCustomerOrder = {
+  id: string | null;
+  slug: string;
+  name: string;
+  driver: string;
+  sortOrder: number;
+  totalQuantity: number;
+  comment: string;
+  rows: Array<{
+    sheetRow: number;
+    productId: string | null;
+    productName: string;
+    quantity: number;
+    lateQuantity: number;
+  }>;
+  lastOrder: {
+    forDate: string;
+    totalItems: number;
+    items: Array<{ productName: string; productId: string | null; quantity: number }>;
+  } | null;
+};
+
+export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(async () => {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const {
+    readLiveCustomerOrderSheet,
+    getActiveSheetLabel,
+    getActiveSheetUrl,
+  } = await import("@/lib/sheets.server");
+
+  const [sheetRows, { data: dbCustomers }, { data: dbProducts }, { data: recentSubs }] =
+    await Promise.all([
+      readLiveCustomerOrderSheet(),
+      supabaseAdmin.from("customers").select("id, slug, name, driver, sort_order"),
+      supabaseAdmin.from("products").select("id, name"),
+      supabaseAdmin
+        .from("order_submissions")
+        .select("customer_id, for_date, total_items, created_at, items:order_submission_items(product_id, product_name, quantity)")
+        .gt("total_items", 0)
+        .order("created_at", { ascending: false })
+        .limit(400),
+    ]);
+
+  const customerByKey = new Map<
+    string,
+    { id: string; slug: string; name: string; driver: string | null; sort_order: number }
+  >();
+  for (const c of dbCustomers ?? []) {
+    const k = normCustomerKey(c.name);
+    if (!customerByKey.has(k) || !c.slug.endsWith("-2")) {
+      customerByKey.set(k, c);
+    }
+  }
+
+  const productIdByName = new Map<string, string>();
+  for (const p of dbProducts ?? []) {
+    productIdByName.set(p.name.trim().toLowerCase(), p.id);
+  }
+
+  const lastOrderByCustomerId = new Map<
+    string,
+    {
+      forDate: string;
+      totalItems: number;
+      items: Array<{ productName: string; productId: string | null; quantity: number }>;
+    }
+  >();
+  for (const s of recentSubs ?? []) {
+    if (!s.customer_id || lastOrderByCustomerId.has(s.customer_id)) continue;
+    lastOrderByCustomerId.set(s.customer_id, {
+      forDate: s.for_date,
+      totalItems: s.total_items,
+      items: ((s as any).items ?? []).map((it: any) => ({
+        productName: it.product_name,
+        productId: it.product_id ?? null,
+        quantity: it.quantity,
+      })),
+    });
+  }
+
+  const byCustomerKey = new Map<string, LiveSheetCustomerOrder>();
+  let orderCounter = 0;
+
+  for (const r of sheetRows) {
+    const cKey = normCustomerKey(r.customerName);
+    let entry = byCustomerKey.get(cKey);
+    if (!entry) {
+      orderCounter += 1;
+      const dbCust = customerByKey.get(cKey);
+      entry = {
+        id: dbCust?.id ?? null,
+        slug: dbCust?.slug ?? slugify(r.customerName),
+        name: dbCust?.name ?? r.customerName,
+        driver: r.driver || dbCust?.driver || "Collection",
+        sortOrder: orderCounter,
+        totalQuantity: 0,
+        comment: "",
+        rows: [],
+        lastOrder: dbCust?.id ? lastOrderByCustomerId.get(dbCust.id) ?? null : null,
+      };
+      byCustomerKey.set(cKey, entry);
+    }
+    if (!entry.driver && r.driver) entry.driver = r.driver;
+    if (!entry.comment && r.comment) entry.comment = r.comment;
+    entry.totalQuantity += r.quantity;
+    entry.rows.push({
+      sheetRow: r.row,
+      productId: productIdByName.get(r.productName.toLowerCase()) ?? null,
+      productName: r.productName,
+      quantity: r.quantity,
+      lateQuantity: r.lateQuantity,
+    });
+  }
+
+  return {
+    sheetLabel: getActiveSheetLabel(),
+    sheetUrl: getActiveSheetUrl(),
+    forDate: tomorrowISO(),
+    customers: Array.from(byCustomerKey.values()),
+  };
+});
+
+const AdminManualOrderInput = z.object({
+  customerName: z.string().min(1),
+  slug: z.string().min(1),
+  mode: z.enum(["set", "addon", "clear"]),
+  items: z.array(SubmitItem),
+  comment: z
+    .string()
+    .optional()
+    .default("")
+    .transform((v) => v.replace(/[\r\n\t]+/g, " ").replace(/ {2,}/g, " ").trim()),
+});
+
+export const adminSaveManualOrder = createServerFn({ method: "POST" })
+  .validator((d) => AdminManualOrderInput.parse(d))
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const {
+      readCustomerRows,
+      writeOrderQuantities,
+      addOnQuantityToRow,
+      clearAddOnColumns,
+      insertCustomerProductRow,
+      writeOrderComment,
+      writeCells,
+      activeSheetGroupSlug,
+    } = await import("@/lib/sheets.server");
+
+    const allRows = await readCustomerRows();
+    const targetKey = normCustomerKey(data.customerName);
+    const customerRowNumbers: number[] = [];
+    for (let i = 1; i < allRows.length; i++) {
+      if (normCustomerKey(allRows[i]?.[0] ?? "") === targetKey) {
+        customerRowNumbers.push(i + 1);
+      }
+    }
+
+    const { data: customer } = await supabaseAdmin
+      .from("customers")
+      .select("id, name, slug")
+      .eq("slug", data.slug)
+      .maybeSingle();
+
+    const canonicalName = customer?.name ?? data.customerName;
+
+    if (data.mode === "clear") {
+      if (customerRowNumbers.length) {
+        await writeOrderQuantities(customerRowNumbers.map((row) => ({ row, quantity: 0 })));
+        await clearAddOnColumns(customerRowNumbers);
+        await writeCells(
+          customerRowNumbers.flatMap((row) => [
+            { range: `Customer Order Details!J${row}`, value: "" },
+            { range: `Customer Order Details!K${row}`, value: "" },
+          ]),
+        );
+      }
+      return { ok: true, totalItems: 0, mode: "clear" as const };
+    }
+
+    const positive = data.items.filter((i) => i.quantity > 0);
+    const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    if (positive.length === 0 || totalItems <= 0) {
+      throw new Error("Please enter a quantity for at least 1 product (or use 'Clear Sheet Order' to zero out).");
+    }
+
+    resolveItemsSheetRows(canonicalName, positive, allRows);
+
+    if (data.mode === "set") {
+      // First clear all existing quantities and add-on columns for this customer on the sheet
+      if (customerRowNumbers.length) {
+        await writeOrderQuantities(customerRowNumbers.map((row) => ({ row, quantity: 0 })));
+        await clearAddOnColumns(customerRowNumbers);
+      }
+      for (const item of positive) {
+        if (item.sheetRow === 0) {
+          item.sheetRow = await insertCustomerProductRow({
+            customerName: canonicalName,
+            productName: item.productName,
+            quantity: item.quantity,
+          });
+        }
+      }
+      await writeOrderQuantities(
+        positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+      );
+    } else {
+      // mode === "addon"
+      for (const item of positive) {
+        if (item.sheetRow === 0) {
+          item.sheetRow = await insertCustomerProductRow({
+            customerName: canonicalName,
+            productName: item.productName,
+            quantity: 0,
+          });
+        }
+        await addOnQuantityToRow(item.sheetRow, item.quantity);
+      }
+    }
+
+    const fullComment = data.comment
+      ? data.comment.toLowerCase().startsWith("admin")
+        ? data.comment
+        : `Admin: ${data.comment}`
+      : "Admin (Manual)";
+
+    if (data.comment) {
+      await writeOrderComment(
+        positive.map((i) => i.sheetRow),
+        data.comment,
+      );
+    }
+
+    if (customer?.id) {
+      const activeGroupId = await groupIdBySlug(activeSheetGroupSlug());
+      const { data: submission, error: sErr } = await supabaseAdmin
+        .from("order_submissions")
+        .insert({
+          customer_id: customer.id,
+          ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
+          for_date: tomorrowISO(),
+          total_items: totalItems,
+          synced_to_sheet: true,
+          order_type: data.mode === "addon" ? "added" : "new",
+          message: fullComment,
+        })
+        .select("id")
+        .single();
+      if (!sErr && submission) {
+        const rows = positive.map((i) => ({
+          submission_id: submission.id,
+          product_id: i.productId ?? null,
+          product_name: i.productName,
+          quantity: i.quantity,
+          sheet_row: i.sheetRow,
+        }));
+        await supabaseAdmin.from("order_submission_items").insert(rows);
+      }
+    }
+
+    return { ok: true, totalItems, mode: data.mode };
+  });

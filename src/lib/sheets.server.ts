@@ -263,6 +263,66 @@ export async function readCustomerRows(
   return (res.data.values as string[][]) ?? [];
 }
 
+/**
+ * Reads columns A..K of "Customer Order Details" on the active (or specified)
+ * spreadsheet so Admin Manual Orders and Print Sheet can see live quantities
+ * in Column C (including evaluated SUM formulas from add-ons), Drivers in
+ * Column D, Comments in Column J, and Late quantities in Column K.
+ */
+export async function readLiveCustomerOrderSheet(
+  sheetId: string = getActiveSheetId(),
+): Promise<
+  Array<{
+    row: number;
+    customerName: string;
+    productName: string;
+    quantity: number;
+    driver: string;
+    comment: string;
+    lateQuantity: number;
+  }>
+> {
+  const sheets = await getSheetsClient();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: `${TAB_CUSTOMERS}!A1:K2000`,
+  });
+  const rows = (res.data.values as string[][]) ?? [];
+  const out: Array<{
+    row: number;
+    customerName: string;
+    productName: string;
+    quantity: number;
+    driver: string;
+    comment: string;
+    lateQuantity: number;
+  }> = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] ?? [];
+    const customerName = (r[0] ?? "").toString().trim();
+    const productName = (r[1] ?? "").toString().trim();
+    if (!customerName || !productName) continue;
+    const qtyRaw = (r[2] ?? "").toString().replace(/[^0-9-]/g, "").trim();
+    const quantity = qtyRaw === "" ? 0 : parseInt(qtyRaw, 10);
+    const driver = (r[3] ?? "").toString().trim();
+    const comment = (r[9] ?? "").toString().trim();
+    const lateRaw = (r[10] ?? "").toString().replace(/[^0-9-]/g, "").trim();
+    const lateQuantity = lateRaw === "" ? 0 : parseInt(lateRaw, 10);
+    out.push({
+      row: i + 1,
+      customerName,
+      productName,
+      quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 0,
+      driver,
+      comment,
+      lateQuantity: Number.isFinite(lateQuantity) && lateQuantity > 0 ? lateQuantity : 0,
+    });
+  }
+
+  return out;
+}
+
 export async function readProductRows(
   sheetId: string = getActiveSheetId(),
 ): Promise<string[][]> {
