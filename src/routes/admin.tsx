@@ -2591,8 +2591,7 @@ function PrintSheetTab() {
 
   const [driverFilter, setDriverFilter] = useState("__all__");
   const [groupByDriver, setGroupByDriver] = useState(true);
-  const [columnsMode, setColumnsMode] = useState<1 | 2>(2);
-  const [fontSizePx, setFontSizePx] = useState<number>(16);
+  const [fontSizePx, setFontSizePx] = useState<number>(14);
   const [viewFilter, setViewFilter] = useState<"to_print" | "all_highlight" | "printed_only">("to_print");
   const [showCustomize, setShowCustomize] = useState(false);
   const [customizeSearch, setCustomizeSearch] = useState("");
@@ -2784,7 +2783,7 @@ function PrintSheetTab() {
   }, [allCustomers]);
 
   // Build the flat sequence of PrintLines, grouped by Driver (with driver
-  // subtotals like 66, 946, 105, 74) or in sheet order.
+  // subtotals like 66, 946, 105, 74) and sorted A-Z like the Google Sheet pivot.
   const printLines: PrintLine[] = useMemo(() => {
     const lines: PrintLine[] = [];
 
@@ -2793,11 +2792,12 @@ function PrintSheetTab() {
       const status = customerStatuses.get(k) ?? "unprinted";
       const snap = printedSnapshots[k];
       const mode = modeForCustomer(c.name);
-      const positiveRows = c.rows.filter((r) => r.quantity > 0);
+      const positiveRows = [...c.rows]
+        .filter((r) => r.quantity > 0)
+        .sort((a, b) => a.productName.localeCompare(b.productName));
 
       // If a customer was ALREADY printed and later ADDED a product, always
-      // expand their product rows so the bakery can see exactly what was
-      // printed earlier and what was added!
+      // expand their product rows so the bakery can see what was printed & added.
       const showItems = mode === "items" || status === "printed_added";
 
       if (showItems) {
@@ -2838,7 +2838,8 @@ function PrintSheetTab() {
     };
 
     if (!groupByDriver) {
-      for (const c of sheetCustomers) appendCustomerLines(c);
+      const sorted = [...sheetCustomers].sort((a, b) => a.name.localeCompare(b.name));
+      for (const c of sorted) appendCustomerLines(c);
       return lines;
     }
 
@@ -2851,8 +2852,9 @@ function PrintSheetTab() {
     }
 
     for (const [driver, groupCusts] of byDriver.entries()) {
+      const sortedGroup = [...groupCusts].sort((a, b) => a.name.localeCompare(b.name));
       let groupTotal = 0;
-      for (const c of groupCusts) {
+      for (const c of sortedGroup) {
         appendCustomerLines(c);
         groupTotal += c.totalQuantity;
       }
@@ -2869,15 +2871,8 @@ function PrintSheetTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sheetCustomers, customerStatuses, printedSnapshots, customModes, groupByDriver]);
 
-  // Split printLines into Left Column and Right Column (or 1 single column)
+  // Split printLines into Left Column (A:C) and Right Column (E:G)
   const { leftLines, rightLines, rowCount } = useMemo(() => {
-    if (columnsMode === 1) {
-      return {
-        leftLines: printLines,
-        rightLines: [],
-        rowCount: printLines.length,
-      };
-    }
     const mid = Math.ceil(printLines.length / 2);
     const left = printLines.slice(0, mid);
     const right = printLines.slice(mid);
@@ -2886,7 +2881,7 @@ function PrintSheetTab() {
       rightLines: right,
       rowCount: Math.max(left.length, right.length),
     };
-  }, [printLines, columnsMode]);
+  }, [printLines]);
 
   const filteredCustomizeCustomers = useMemo(() => {
     const q = customizeSearch.trim().toLowerCase();
@@ -2896,13 +2891,13 @@ function PrintSheetTab() {
   }, [allCustomers, customizeSearch]);
 
   return (
-    <section className="space-y-4">
-      {/* Print-specific @page rules so columns never get cut off */}
+    <section className="space-y-3">
+      {/* Print-specific @page rules matching Google Sheets A1:G38 compact printout */}
       <style>{`
         @media print {
           @page {
             size: A4 portrait;
-            margin: 6mm;
+            margin: 5mm;
           }
           body {
             -webkit-print-color-adjust: exact !important;
@@ -2912,13 +2907,16 @@ function PrintSheetTab() {
       `}</style>
 
       {/* Screen-only toolbar */}
-      <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm space-y-3 print:hidden">
-        <div className="flex flex-wrap items-center justify-between gap-3">
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] p-3.5 shadow-sm space-y-2.5 print:hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <div className="flex items-center gap-2 flex-wrap">
-              <h2 className="font-bold text-base text-[#2a1810]">Order Print Sheet</h2>
+              <h2 className="font-bold text-sm text-[#2a1810]">Print Sheet (A1:G38 Layout)</h2>
               <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
-                {liveQuery.data?.sheetLabel ?? "…"} Sheet · For {liveQuery.data?.forDate ?? "Tomorrow"}
+                {liveQuery.data?.sheetLabel ?? "…"} · {liveQuery.data?.forDate ?? "Tomorrow"}
+              </span>
+              <span className="text-xs text-[#8b6f4e]">
+                {sheetCustomers.length} customers · {rowCount} rows
               </span>
               {printedAddedCustomers.length > 0 && (
                 <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300">
@@ -2926,9 +2924,6 @@ function PrintSheetTab() {
                 </span>
               )}
             </div>
-            <p className="text-xs text-[#8b6f4e] mt-1">
-              When you print, printed customers are highlighted and hidden away. If any printed customer later adds a product, they automatically reappear showing <strong>what was printed</strong> and <strong>what was added</strong>.
-            </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -2936,8 +2931,8 @@ function PrintSheetTab() {
               type="button"
               onClick={handlePrintAndHide}
               disabled={printLines.length === 0}
-              className="text-xs font-bold px-4 py-2.5 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
-              title="Print this sheet and automatically mark these customers as Printed (hiding them until they add new items)"
+              className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
+              title="Print this sheet and mark these customers as Printed (hiding them until they add new items)"
             >
               🖨️ Print & Hide Printed ({sheetCustomers.length})
             </button>
@@ -2946,31 +2941,29 @@ function PrintSheetTab() {
               type="button"
               onClick={() => markCustomersPrinted(sheetCustomers)}
               disabled={sheetCustomers.length === 0}
-              className="text-xs font-bold px-3 py-2.5 rounded-xl border border-green-700 text-green-800 bg-green-50 hover:bg-green-100 transition disabled:opacity-50"
-              title="Mark currently visible customers as Printed without opening the print dialog"
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-green-700 text-green-800 bg-green-50 hover:bg-green-100 transition disabled:opacity-50"
             >
-              ✓ Mark Visible as Printed
+              ✓ Mark Printed
             </button>
 
             <button
               type="button"
               onClick={() => void qc.invalidateQueries({ queryKey: ["live-sheet-orders"] })}
               disabled={liveQuery.isFetching}
-              className="text-xs font-bold px-3 py-2.5 rounded-xl border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition"
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition"
             >
-              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh Sheet"}
+              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
             </button>
           </div>
         </div>
 
         {/* Filter & Layout Controls Row */}
         <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#e8dcc8]">
-          {/* View Filter Pills */}
           <div className="flex flex-wrap gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
             <button
               type="button"
               onClick={() => setViewFilter("to_print")}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+              className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
                 viewFilter === "to_print" ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
               }`}
             >
@@ -2979,7 +2972,7 @@ function PrintSheetTab() {
             <button
               type="button"
               onClick={() => setViewFilter("all_highlight")}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+              className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
                 viewFilter === "all_highlight" ? "bg-[#c8362b] text-white" : "text-[#6b5544]"
               }`}
             >
@@ -2988,7 +2981,7 @@ function PrintSheetTab() {
             <button
               type="button"
               onClick={() => setViewFilter("printed_only")}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+              className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
                 viewFilter === "printed_only" ? "bg-green-700 text-white" : "text-green-800"
               }`}
             >
@@ -2996,49 +2989,27 @@ function PrintSheetTab() {
             </button>
           </div>
 
-          {/* Font size, Columns, Driver & Customize */}
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
-              <span className="text-[11px] font-semibold text-[#8b6f4e] px-2">Font:</span>
-              {[14, 16, 18].map((sz) => (
+              <span className="text-[11px] font-semibold text-[#8b6f4e] px-1.5">Calibri:</span>
+              {[13, 14, 15, 16].map((sz) => (
                 <button
                   key={sz}
                   type="button"
                   onClick={() => setFontSizePx(sz)}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
+                  className={`px-2 py-0.5 rounded-lg text-xs font-bold ${
                     fontSizePx === sz ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
                   }`}
                 >
-                  {sz}px
+                  {sz}
                 </button>
               ))}
-            </div>
-
-            <div className="flex items-center gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
-              <button
-                type="button"
-                onClick={() => setColumnsMode(2)}
-                className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
-                  columnsMode === 2 ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
-                }`}
-              >
-                2 Columns
-              </button>
-              <button
-                type="button"
-                onClick={() => setColumnsMode(1)}
-                className={`px-2.5 py-1 rounded-lg text-xs font-bold ${
-                  columnsMode === 1 ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
-                }`}
-              >
-                1 Wide Column
-              </button>
             </div>
 
             <select
               value={driverFilter}
               onChange={(e) => setDriverFilter(e.target.value)}
-              className="bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
+              className="bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2.5 py-1 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
             >
               <option value="__all__">All drivers</option>
               {driverOptions.map((d) => (
@@ -3048,7 +3019,7 @@ function PrintSheetTab() {
               ))}
             </select>
 
-            <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] px-3 py-1.5 rounded-xl border border-[#e8dcc8] bg-[#fdf8f1] cursor-pointer">
+            <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] px-2.5 py-1 rounded-xl border border-[#e8dcc8] bg-[#fdf8f1] cursor-pointer">
               <input
                 type="checkbox"
                 checked={groupByDriver}
@@ -3060,7 +3031,7 @@ function PrintSheetTab() {
             <button
               type="button"
               onClick={() => setShowCustomize((s) => !s)}
-              className="text-xs font-bold px-3 py-1.5 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1]"
+              className="text-xs font-bold px-2.5 py-1 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1]"
             >
               {showCustomize ? "Hide Toggles" : "⚙️ Customize"}
             </button>
@@ -3069,7 +3040,7 @@ function PrintSheetTab() {
 
         {/* Printed & Hidden Customers Bar */}
         {Object.keys(printedSnapshots).length > 0 && (
-          <div className="pt-2 border-t border-[#e8dcc8] flex flex-wrap items-center justify-between gap-2 bg-green-50/60 p-2.5 rounded-xl">
+          <div className="pt-2 border-t border-[#e8dcc8] flex flex-wrap items-center justify-between gap-2 bg-green-50/60 p-2 rounded-xl">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-xs font-bold text-green-900">
                 ✓ Printed & Hidden ({printedCleanCustomers.length}):
@@ -3165,8 +3136,8 @@ function PrintSheetTab() {
         )}
       </div>
 
-      {/* Printable Table (16px font, fixed column widths, clean word-wrap, zero cut-offs) */}
-      <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm p-4 print:border-0 print:shadow-none print:p-0 print:rounded-none">
+      {/* Exact Google Sheets 'print sheet' A1:H38 Grid */}
+      <div className="bg-white rounded-xl border border-[#c0c0c0] shadow-sm p-2 print:border-0 print:shadow-none print:p-0 print:rounded-none overflow-x-auto">
         {liveQuery.isLoading ? (
           <div className="p-8 text-center text-sm text-[#8b6f4e]">
             Loading live orders from Google Sheet…
@@ -3189,51 +3160,51 @@ function PrintSheetTab() {
             )}
           </div>
         ) : (
-          <div className="w-full">
-            <div className="hidden print:flex items-center justify-between text-[14px] font-bold border-b-2 border-black pb-1 mb-2">
-              <span>PORTUGAL BAKERY — ORDER SHEET ({liveQuery.data?.sheetLabel})</span>
-              <span>DELIVERY DATE: {liveQuery.data?.forDate}</span>
-            </div>
-
+          <div className="inline-block print:block">
             <table
               style={{
+                fontFamily: 'Calibri, "Carlito", "Segoe UI", Arial, sans-serif',
                 fontSize: `${fontSizePx}px`,
-                lineHeight: 1.25,
+                fontWeight: 400,
+                lineHeight: "18px",
                 tableLayout: "fixed",
-                width: "100%",
+                width: "768px",
+                borderCollapse: "collapse",
               }}
-              className="w-full border-collapse"
+              className="print:w-full"
             >
-              {columnsMode === 2 ? (
-                <colgroup>
-                  <col style={{ width: "18.5%" }} />
-                  <col style={{ width: "23.5%" }} />
-                  <col style={{ width: "7.5%" }} />
-                  <col style={{ width: "1%" }} />
-                  <col style={{ width: "18.5%" }} />
-                  <col style={{ width: "23.5%" }} />
-                  <col style={{ width: "7.5%" }} />
-                </colgroup>
-              ) : (
-                <colgroup>
-                  <col style={{ width: "36%" }} />
-                  <col style={{ width: "50%" }} />
-                  <col style={{ width: "14%" }} />
-                </colgroup>
-              )}
-              <thead>
-                <tr className="bg-[#2a1810] text-white print:bg-gray-200 print:text-black">
-                  <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Customer</th>
-                  <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Product</th>
-                  <th className="border border-gray-500 px-1.5 py-1 text-right font-bold">Qty</th>
-                  {columnsMode === 2 && (
-                    <>
-                      <th className="border-y border-gray-500 bg-[#e8dcc8] print:bg-gray-400 p-0" />
-                      <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Customer</th>
-                      <th className="border border-gray-500 px-2 py-1 text-left font-bold break-words">Product</th>
-                      <th className="border border-gray-500 px-1.5 py-1 text-right font-bold">Qty</th>
-                    </>
-                  )}
+              <colgroup>
+                {/* Screen-only row index column */}
+                <col className="print:hidden" style={{ width: "28px" }} />
+                {/* Col A: Left Customer */}
+                <col style={{ width: "166px" }} />
+                {/* Col B: Left Product */}
+                <col style={{ width: "160px" }} />
+                {/* Col C: Left Qty */}
+                <col style={{ width: "42px" }} />
+                {/* Col D: Dark center divider */}
+                <col style={{ width: "14px" }} />
+                {/* Col E: Right Customer */}
+                <col style={{ width: "166px" }} />
+                {/* Col F: Right Product */}
+                <col style={{ width: "160px" }} />
+                {/* Col G: Right Qty */}
+                <col style={{ width: "42px" }} />
+                {/* Col H: Dark right border bar */}
+                <col style={{ width: "22px" }} />
+              </colgroup>
+              {/* Screen-only Google Sheets A..H header bar */}
+              <thead className="print:hidden">
+                <tr style={{ height: "19px" }} className="bg-[#f8f9fa] text-[#5f6368] text-[11px] select-none">
+                  <th className="border border-[#c0c0c0] font-normal text-center" />
+                  <th className="border border-[#c0c0c0] font-normal text-center">A</th>
+                  <th className="border border-[#c0c0c0] font-normal text-center">B</th>
+                  <th className="border border-[#c0c0c0] font-normal text-center">C</th>
+                  <th className="border border-[#c0c0c0] font-normal text-center">D</th>
+                  <th className="border border-[#c0c0c0] font-normal text-center">E</th>
+                  <th className="border border-[#c0c0c0] font-normal text-center">F</th>
+                  <th className="border border-[#c0c0c0] font-normal text-center">G</th>
+                  <th className="border border-[#c0c0c0] font-normal text-center">H</th>
                 </tr>
               </thead>
               <tbody>
@@ -3241,14 +3212,39 @@ function PrintSheetTab() {
                   const left = leftLines[idx];
                   const right = rightLines[idx];
                   return (
-                    <tr key={idx} className="break-inside-avoid">
-                      <PrintHalfRowCells line={left} onToggleCustomer={cycleCustomerMode} />
-                      {columnsMode === 2 && (
-                        <>
-                          <td className="border-x border-gray-500 bg-[#e8dcc8]/70 print:bg-gray-400 p-0" />
-                          <PrintHalfRowCells line={right} onToggleCustomer={cycleCustomerMode} />
-                        </>
-                      )}
+                    <tr key={idx} style={{ height: "20px" }}>
+                      <td
+                        className="print:hidden border border-[#c0c0c0] bg-[#f8f9fa] text-[#5f6368] text-[11px] text-center select-none"
+                        style={{ padding: 0, lineHeight: "18px" }}
+                      >
+                        {idx + 1}
+                      </td>
+                      <PrintHalfRowCells
+                        line={left}
+                        fontSizePx={fontSizePx}
+                        onToggleCustomer={cycleCustomerMode}
+                      />
+                      <td
+                        style={{
+                          backgroundColor: "#434343",
+                          borderTop: "1px solid #333333",
+                          borderBottom: "1px solid #333333",
+                          padding: 0,
+                        }}
+                      />
+                      <PrintHalfRowCells
+                        line={right}
+                        fontSizePx={fontSizePx}
+                        onToggleCustomer={cycleCustomerMode}
+                      />
+                      <td
+                        style={{
+                          backgroundColor: "#434343",
+                          borderTop: "1px solid #333333",
+                          borderBottom: "1px solid #333333",
+                          padding: 0,
+                        }}
+                      />
                     </tr>
                   );
                 })}
@@ -3261,31 +3257,94 @@ function PrintSheetTab() {
   );
 }
 
+function fitCellFontSize(text: string, basePx: number, maxChars: number): string {
+  if (text.length > maxChars + 6) return `${Math.max(10, basePx - 2.5)}px`;
+  if (text.length > maxChars) return `${Math.max(11, basePx - 1.5)}px`;
+  return `${basePx}px`;
+}
+
 function PrintHalfRowCells({
   line,
+  fontSizePx,
   onToggleCustomer,
 }: {
   line: PrintLine | undefined;
+  fontSizePx: number;
   onToggleCustomer: (rawCustomerName: string) => void;
 }) {
+  const baseCellStyle: React.CSSProperties = {
+    padding: "0px 4px",
+    height: "20px",
+    lineHeight: "19px",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    fontWeight: 400,
+    color: "#000000",
+  };
+
   if (!line) {
     return (
       <>
-        <td className="border border-gray-300 px-2 py-1" />
-        <td className="border border-gray-300 px-2 py-1" />
-        <td className="border border-gray-300 px-1.5 py-1 text-right" />
+        <td
+          style={{
+            ...baseCellStyle,
+            backgroundColor: "#dfe8f3",
+            border: "1px solid #9e9e9e",
+          }}
+        />
+        <td
+          style={{
+            ...baseCellStyle,
+            backgroundColor: "#ffffff",
+            border: "1px solid #b7b7b7",
+          }}
+        />
+        <td
+          style={{
+            ...baseCellStyle,
+            backgroundColor: "#ffffff",
+            border: "1px solid #b7b7b7",
+          }}
+        />
       </>
     );
   }
 
+  // Driver subtotal line: Blank Col A, Blank Col B, Subtotal in Col C (all #dfe8f3 blue-grey)
   if (line.kind === "driver_subtotal") {
     return (
       <>
-        <td className="border border-gray-500 bg-amber-100/80 print:bg-gray-200 px-2 py-1 font-bold text-[#6b5544] print:text-black break-words whitespace-normal" />
-        <td className="border border-gray-500 bg-amber-100/80 print:bg-gray-200 px-2 py-1 text-right font-bold text-[#6b5544] print:text-black break-words whitespace-normal">
-          {line.driver ? `${line.driver}` : ""}
-        </td>
-        <td className="border border-gray-500 bg-amber-100/80 print:bg-gray-200 px-1.5 py-1 text-right font-extrabold text-[#2a1810] print:text-black whitespace-nowrap">
+        <td
+          style={{
+            ...baseCellStyle,
+            backgroundColor: "#dfe8f3",
+            borderTop: "1px solid #434343",
+            borderBottom: "1px solid #434343",
+            borderLeft: "1px solid #434343",
+            borderRight: "1px solid #9e9e9e",
+          }}
+        />
+        <td
+          style={{
+            ...baseCellStyle,
+            backgroundColor: "#dfe8f3",
+            borderTop: "1px solid #434343",
+            borderBottom: "1px solid #434343",
+            borderLeft: "1px solid #9e9e9e",
+            borderRight: "1px solid #9e9e9e",
+          }}
+        />
+        <td
+          style={{
+            ...baseCellStyle,
+            backgroundColor: "#dfe8f3",
+            borderTop: "1px solid #434343",
+            borderBottom: "1px solid #434343",
+            borderLeft: "1px solid #9e9e9e",
+            borderRight: "1px solid #434343",
+            textAlign: "left",
+          }}
+        >
           {line.quantity}
         </td>
       </>
@@ -3295,36 +3354,51 @@ function PrintHalfRowCells({
   const isPrintedClean = line.printStatus === "printed_clean";
   const isPrintedAdded = line.printStatus === "printed_added";
 
+  // Customer Total row: "[Customer] Total" spanning Col A+B (or showing in Col A with empty Col B), Qty in Col C
   if (line.kind === "customer_total") {
     const baseName = line.rawCustomerName ?? line.customerName.replace(/\s+Total$/i, "");
-    const bgClass = isPrintedClean
-      ? "bg-green-100/90 print:bg-green-100"
+    const rowBg = isPrintedClean
+      ? "#d9ead3" // Google Sheets light green
       : isPrintedAdded
-      ? "bg-amber-100/90 print:bg-amber-100"
-      : "bg-[#fdf8f1] print:bg-gray-100";
+      ? "#fff2cc" // Google Sheets light amber
+      : "#dfe8f3"; // Google Sheets pivot light blue-grey
+
+    const labelText =
+      isPrintedAdded && line.printedQty !== undefined && line.addedQty !== undefined
+        ? `${line.customerName} (P:${line.printedQty} +${line.addedQty})`
+        : isPrintedClean
+        ? `${line.customerName} ✓`
+        : line.customerName;
 
     return (
       <>
         <td
           onClick={() => onToggleCustomer(baseName)}
           title="Click to toggle between Full Items and Total Only"
-          className={`border border-gray-500 ${bgClass} px-2 py-1 font-bold text-[#2a1810] print:text-black cursor-pointer hover:bg-[#e8dcc8]/50 break-words whitespace-normal`}
           colSpan={2}
+          style={{
+            ...baseCellStyle,
+            fontSize: fitCellFontSize(labelText, fontSizePx, 36),
+            backgroundColor: rowBg,
+            borderTop: "1px solid #434343",
+            borderBottom: "1px solid #434343",
+            borderLeft: "1px solid #434343",
+            borderRight: "1px solid #9e9e9e",
+            cursor: "pointer",
+          }}
         >
-          <span>{line.customerName}</span>
-          {isPrintedClean && (
-            <span className="ml-1.5 text-[12px] font-bold text-green-800 print:text-black">
-              [✓ Printed]
-            </span>
-          )}
-          {isPrintedAdded && line.printedQty !== undefined && line.addedQty !== undefined && (
-            <span className="ml-1.5 text-[13px] font-extrabold text-[#c8362b] print:text-black">
-              [Printed: {line.printedQty} | +{line.addedQty} Added]
-            </span>
-          )}
+          {labelText}
         </td>
         <td
-          className={`border border-gray-500 ${bgClass} px-1.5 py-1 text-right font-extrabold text-[#2a1810] print:text-black whitespace-nowrap`}
+          style={{
+            ...baseCellStyle,
+            backgroundColor: rowBg,
+            borderTop: "1px solid #434343",
+            borderBottom: "1px solid #434343",
+            borderLeft: "1px solid #9e9e9e",
+            borderRight: "1px solid #434343",
+            textAlign: "left",
+          }}
         >
           {line.quantity}
         </td>
@@ -3332,59 +3406,64 @@ function PrintHalfRowCells({
     );
   }
 
-  // Regular item line
-  const itemBgClass = isPrintedClean
-    ? "bg-green-50/70 print:bg-green-50"
+  // Regular item row
+  const custBg = isPrintedClean
+    ? "#d9ead3"
+    : isPrintedAdded
+    ? "#fff2cc"
+    : "#dfe8f3";
+
+  const itemBg = isPrintedClean
+    ? "#eef7eb"
     : isPrintedAdded && (line.addedQty ?? 0) > 0
-    ? "bg-amber-50/90 print:bg-amber-50"
-    : "";
+    ? "#fff9e6"
+    : "#ffffff";
+
+  let prodLabel = line.productName;
+  if (isPrintedAdded && line.printedQty !== undefined) {
+    if (line.printedQty > 0 && (line.addedQty ?? 0) > 0) {
+      prodLabel = `${line.productName} (P:${line.printedQty}+${line.addedQty})`;
+    } else if (line.printedQty === 0 && (line.addedQty ?? 0) > 0) {
+      prodLabel = `${line.productName} (+${line.addedQty} NEW)`;
+    }
+  }
 
   return (
     <>
       <td
         onClick={() => line.rawCustomerName && onToggleCustomer(line.rawCustomerName)}
-        className={`border border-gray-400 ${itemBgClass} px-2 py-1 font-bold text-[#2a1810] print:text-black break-words whitespace-normal align-top ${
-          line.customerName ? "cursor-pointer hover:underline" : ""
-        }`}
+        style={{
+          ...baseCellStyle,
+          fontSize: fitCellFontSize(line.customerName, fontSizePx, 20),
+          backgroundColor: custBg,
+          borderTop: line.customerName ? "1px solid #434343" : "1px solid #9e9e9e",
+          borderBottom: "1px solid #9e9e9e",
+          borderLeft: "1px solid #434343",
+          borderRight: "1px solid #9e9e9e",
+          cursor: line.customerName ? "pointer" : "default",
+        }}
       >
         {line.customerName}
-        {line.customerName && isPrintedAdded && (
-          <div className="text-[11px] font-extrabold text-[#c8362b] print:text-black leading-tight mt-0.5">
-            ⚡ UPDATED
-          </div>
-        )}
       </td>
       <td
-        className={`border border-gray-400 ${itemBgClass} px-2 py-1 text-[#2a1810] print:text-black break-words whitespace-normal align-top`}
+        style={{
+          ...baseCellStyle,
+          fontSize: fitCellFontSize(prodLabel, fontSizePx, 21),
+          backgroundColor: itemBg,
+          border: "1px solid #b7b7b7",
+        }}
       >
-        <div>{line.productName}</div>
-        {isPrintedAdded && line.printedQty !== undefined && (
-          <div className="text-[12px] font-bold leading-tight mt-0.5">
-            {line.printedQty > 0 && (line.addedQty ?? 0) > 0 ? (
-              <span className="text-[#c8362b] print:text-black">
-                Printed: {line.printedQty} · <strong>+Added: {line.addedQty}</strong>
-              </span>
-            ) : line.printedQty === 0 && (line.addedQty ?? 0) > 0 ? (
-              <span className="text-[#c8362b] print:text-black">
-                <strong>NEW ADDED +{line.addedQty}</strong>
-              </span>
-            ) : (
-              <span className="text-green-800 print:text-black">
-                ✓ Printed: {line.printedQty}
-              </span>
-            )}
-          </div>
-        )}
+        {prodLabel}
       </td>
       <td
-        className={`border border-gray-400 ${itemBgClass} px-1.5 py-1 text-right font-bold text-[#2a1810] print:text-black whitespace-nowrap align-top`}
+        style={{
+          ...baseCellStyle,
+          backgroundColor: itemBg,
+          border: "1px solid #b7b7b7",
+          textAlign: "left",
+        }}
       >
-        <div>{line.quantity}</div>
-        {isPrintedAdded && (line.addedQty ?? 0) > 0 && (
-          <div className="text-[11px] font-extrabold text-[#c8362b] print:text-black">
-            (+{line.addedQty})
-          </div>
-        )}
+        {line.quantity}
       </td>
     </>
   );
