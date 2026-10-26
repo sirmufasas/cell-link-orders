@@ -9,7 +9,7 @@ import {
   listCustomers, listProducts, listSubmissions, syncAllSheets, analyticsOverview, ensureSeeded,
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
-  autoSyncIfStale, getLiveSheetOrders, adminSaveManualOrder, getHistoryRetentionInfo,
+  autoSyncIfStale, getLiveSheetOrders, getPrintSheetForDate, adminSaveManualOrder, getHistoryRetentionInfo,
   clearOldOrderHistory, savePrintSheetState, type LiveSheetCustomerOrder,
 } from "@/lib/bakery.functions";
 import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
@@ -1997,6 +1997,7 @@ function ManualOrdersTab({
 
   const [entryMode, setEntryMode] = useState<"set" | "addon">("set");
   const [qty, setQty] = useState<Record<string, number>>({});
+  const [rawQtyInput, setRawQtyInput] = useState<Record<string, string>>({});
   const [comment, setComment] = useState("");
   const [productSearch, setProductSearch] = useState("");
   const [showExtraProducts, setShowExtraProducts] = useState(false);
@@ -2045,6 +2046,7 @@ function ManualOrdersTab({
     setFeedback(null);
     setProductSearch("");
     setShowExtraProducts(false);
+    setRawQtyInput({});
     if (!selectedCustomer) {
       setQty({});
       setComment("");
@@ -2089,11 +2091,44 @@ function ManualOrdersTab({
   }, [allProducts, regularProductNamesLower, productSearch, showExtraProducts]);
 
   function setLineQty(key: string, val: number) {
-    setQty((prev) => ({ ...prev, [key]: Math.max(0, val || 0) }));
+    const clean = Math.max(0, Math.round((val || 0) * 1000) / 1000);
+    setQty((prev) => ({ ...prev, [key]: clean }));
+  }
+
+  function handleRawQtyChange(key: string, raw: string) {
+    const normalized = raw.replace(/,/g, ".");
+    if (!/^[0-9]*\.?[0-9]*$/.test(normalized)) return;
+    setRawQtyInput((prev) => ({ ...prev, [key]: normalized }));
+    if (normalized === "" || normalized === ".") {
+      setLineQty(key, 0);
+      return;
+    }
+    const parsed = parseFloat(normalized);
+    if (Number.isFinite(parsed)) {
+      setLineQty(key, parsed);
+    }
+  }
+
+  function displayQtyValue(key: string, val: number): string {
+    if (rawQtyInput[key] !== undefined) return rawQtyInput[key];
+    return val === 0 ? "" : String(val);
+  }
+
+  function clearRawForKey(key: string) {
+    setRawQtyInput((prev) => {
+      if (prev[key] === undefined) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
   }
 
   function adjustLineQty(key: string, delta: number) {
-    setQty((prev) => ({ ...prev, [key]: Math.max(0, (prev[key] ?? 0) + delta) }));
+    clearRawForKey(key);
+    setQty((prev) => {
+      const nextVal = Math.max(0, Math.round(((prev[key] ?? 0) + delta) * 1000) / 1000);
+      return { ...prev, [key]: nextVal };
+    });
   }
 
   function handleRepeatLastOrder() {
@@ -2119,6 +2154,7 @@ function ManualOrdersTab({
         }
       }
     }
+    setRawQtyInput({});
     setQty(next);
     setFeedback({
       type: "ok",
@@ -2134,6 +2170,7 @@ function ManualOrdersTab({
         if (r.quantity > 0) next[`r:${r.sheetRow}`] = r.quantity;
       }
     }
+    setRawQtyInput({});
     setQty(next);
     setFeedback(null);
   }
@@ -2499,7 +2536,10 @@ function ManualOrdersTab({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setQty({})}
+                      onClick={() => {
+                        setQty({});
+                        setRawQtyInput({});
+                      }}
                       className="text-xs font-semibold px-2.5 py-1.5 rounded-lg border border-[#e8dcc8] hover:bg-[#fdf8f1]"
                     >
                       Zero Inputs
@@ -2565,14 +2605,12 @@ function ManualOrdersTab({
                             −
                           </button>
                           <input
-                            type="number"
-                            inputMode="numeric"
-                            min={0}
-                            value={val === 0 ? "" : val}
+                            type="text"
+                            inputMode="decimal"
+                            value={displayQtyValue(k, val)}
                             placeholder="0"
-                            onChange={(e) =>
-                              setLineQty(k, e.target.value === "" ? 0 : parseInt(e.target.value, 10))
-                            }
+                            onChange={(e) => handleRawQtyChange(k, e.target.value)}
+                            onBlur={() => clearRawForKey(k)}
                             className={`w-16 h-8 text-center font-bold border rounded-lg focus:outline-none ${
                               val > 0
                                 ? "border-[#c8362b] bg-white text-[#c8362b]"
@@ -2585,6 +2623,14 @@ function ManualOrdersTab({
                             className="w-8 h-8 rounded-lg bg-[#c8362b] text-white font-bold text-base hover:bg-[#a82a22]"
                           >
                             +
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => adjustLineQty(k, 0.5)}
+                            className="px-2 h-8 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] text-xs font-bold text-[#6b5544] hover:bg-[#e8dcc8]/50"
+                            title="Add 0.5"
+                          >
+                            +0.5
                           </button>
                           <button
                             type="button"
@@ -2649,14 +2695,12 @@ function ManualOrdersTab({
                                     −
                                   </button>
                                   <input
-                                    type="number"
-                                    inputMode="numeric"
-                                    min={0}
-                                    value={val === 0 ? "" : val}
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={displayQtyValue(k, val)}
                                     placeholder="0"
-                                    onChange={(e) =>
-                                      setLineQty(k, e.target.value === "" ? 0 : parseInt(e.target.value, 10))
-                                    }
+                                    onChange={(e) => handleRawQtyChange(k, e.target.value)}
+                                    onBlur={() => clearRawForKey(k)}
                                     className="w-14 h-7 text-center text-xs font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1]"
                                   />
                                   <button
@@ -2665,6 +2709,13 @@ function ManualOrdersTab({
                                     className="w-7 h-7 rounded-lg bg-[#c8362b] text-white font-bold text-sm"
                                   >
                                     +
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => adjustLineQty(k, 0.5)}
+                                    className="px-1.5 h-7 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] text-[10px] font-bold text-[#6b5544]"
+                                  >
+                                    +0.5
                                   </button>
                                 </div>
                               </div>
@@ -2893,10 +2944,28 @@ const DEFAULT_PRINT_LAYOUT: PrintLayoutSettings = {
 };
 
 const PRINT_LAYOUT_STORAGE_KEY = "bakery_print_layout_settings_v1";
+const PRINT_REMOVED_PRODUCTS_STORAGE_KEY = "bakery_print_removed_products_v1";
 
 function PrintSheetTab() {
   const qc = useQueryClient();
   const liveQuery = useQuery(liveSheetOrdersQuery);
+
+  // Delivery date source: "__live__" = Live Google Sheet (Tomorrow), or a YYYY-MM-DD delivery date
+  // (e.g. Today's Delivery after the Google Sheet has already cleared for the next day)
+  const [selectedPrintDate, setSelectedPrintDate] = useState<string>("__live__");
+
+  const savedDateQuery = useQuery({
+    queryKey: ["print-sheet-for-date", selectedPrintDate],
+    queryFn: () => getPrintSheetForDate({ data: { forDate: selectedPrintDate } }),
+    enabled: selectedPrintDate !== "__live__",
+    staleTime: 10_000,
+  });
+
+  const activeDataSource = selectedPrintDate === "__live__" ? liveQuery.data : savedDateQuery.data;
+  const isFetchingSource =
+    selectedPrintDate === "__live__" ? liveQuery.isFetching : savedDateQuery.isFetching;
+  const isLoadingSource =
+    selectedPrintDate === "__live__" ? liveQuery.isLoading : savedDateQuery.isLoading;
 
   const [driverFilter, setDriverFilter] = useState("__all__");
   const [groupByDriver, setGroupByDriver] = useState(true);
@@ -3001,31 +3070,45 @@ function PrintSheetTab() {
     }
   });
 
+  // Individual product lines removed from the print sheet per customer:
+  // { [normPrintKey(customerName)]: [lowerProductName, ...] }
+  const [removedProducts, setRemovedProducts] = useState<Record<string, string[]>>(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = localStorage.getItem(PRINT_REMOVED_PRODUCTS_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as Record<string, string[]>) : {};
+    } catch {
+      return {};
+    }
+  });
+
   // Merge server-persisted print state (from Supabase) with local state whenever
-  // liveQuery finishes loading, and remove snapshots only for customers whose
-  // order on the sheet has been cleared to 0.
+  // liveQuery finishes loading.
   const serverSyncedOnceRef = useRef(false);
   useEffect(() => {
     if (!liveQuery.data) return;
     const serverSnaps = liveQuery.data.printState?.printedSnapshots ?? {};
     const serverModes = liveQuery.data.printState?.customModes ?? {};
+    const serverRemoved = liveQuery.data.printState?.removedProducts ?? {};
     const liveCusts = liveQuery.data.customers ?? [];
+    // Only clear stale snapshots for individual customers if the live sheet is NOT completely blank
+    // (so if the whole sheet clears for the next day, printed state isn't wiped prematurely).
+    const anyActiveOnLiveSheet = liveCusts.some((c) => c.totalQuantity > 0);
 
     setPrintedSnapshots((prev) => {
       const merged: Record<string, PrintedCustomerSnapshot> = { ...serverSnaps, ...prev };
-      // If both server and local have a snapshot for the same customer, keep the newer one
       for (const [k, sSnap] of Object.entries(serverSnaps)) {
         const lSnap = prev[k];
         if (!lSnap || (sSnap.printedAt ?? "") > (lSnap.printedAt ?? "")) {
           merged[k] = sSnap;
         }
       }
-      // If a customer on the live sheet now has totalQuantity === 0 (order cleared),
-      // remove their stale snapshot so their next order appears fresh.
-      for (const c of liveCusts) {
-        const k = normPrintKey(c.name);
-        if (c.totalQuantity === 0 && merged[k]) {
-          delete merged[k];
+      if (anyActiveOnLiveSheet) {
+        for (const c of liveCusts) {
+          const k = normPrintKey(c.name);
+          if (c.totalQuantity === 0 && merged[k]) {
+            delete merged[k];
+          }
         }
       }
       if (typeof window !== "undefined") {
@@ -3053,6 +3136,18 @@ function PrintSheetTab() {
         return mergedModes;
       });
     }
+
+    if (Object.keys(serverRemoved).length > 0) {
+      setRemovedProducts((prev) => {
+        const mergedRemoved = { ...serverRemoved, ...prev };
+        if (typeof window !== "undefined") {
+          try {
+            localStorage.setItem(PRINT_REMOVED_PRODUCTS_STORAGE_KEY, JSON.stringify(mergedRemoved));
+          } catch {}
+        }
+        return mergedRemoved;
+      });
+    }
   }, [liveQuery.data]);
 
   function persistSnapshotsOnly(next: Record<string, PrintedCustomerSnapshot>) {
@@ -3067,6 +3162,34 @@ function PrintSheetTab() {
   function saveSnapshots(next: Record<string, PrintedCustomerSnapshot>) {
     setPrintedSnapshots(next);
     persistSnapshotsOnly(next);
+  }
+
+  function saveRemovedProductsState(next: Record<string, string[]>) {
+    setRemovedProducts(next);
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem(PRINT_REMOVED_PRODUCTS_STORAGE_KEY, JSON.stringify(next));
+      } catch {}
+    }
+    void savePrintSheetState({ data: { removedProducts: next } });
+  }
+
+  function removeSingleProductFromPrint(customerName: string, productName: string) {
+    const cKey = normPrintKey(customerName);
+    const pKey = productName.trim().toLowerCase();
+    const existing = removedProducts[cKey] ?? [];
+    if (existing.includes(pKey)) return;
+    const nextList = [...existing, pKey];
+    const next = { ...removedProducts, [cKey]: nextList };
+    saveRemovedProductsState(next);
+  }
+
+  function restoreRemovedProductsForCustomer(customerName: string) {
+    const cKey = normPrintKey(customerName);
+    if (!removedProducts[cKey]) return;
+    const next = { ...removedProducts };
+    delete next[cKey];
+    saveRemovedProductsState(next);
   }
 
   function modeForCustomer(name: string): PrintCustomerMode {
@@ -3084,11 +3207,8 @@ function PrintSheetTab() {
       void savePrintSheetState({ data: { customModes: next } });
       return next;
     });
-    // If the user is closing ("total_only" or "hidden") a customer that was
-    // previously flagged as "printed_added", update its snapshot to the current
-    // quantities so it stays closed unless another order is added later.
     if (mode === "total_only" || mode === "hidden") {
-      const cust = (liveQuery.data?.customers ?? []).find((c) => normPrintKey(c.name) === k);
+      const cust = (activeDataSource?.customers ?? []).find((c) => normPrintKey(c.name) === k);
       if (cust && printedSnapshots[k]) {
         const nextSnaps = {
           ...printedSnapshots,
@@ -3103,8 +3223,6 @@ function PrintSheetTab() {
     const k = normPrintKey(name);
     const status = customerStatuses.get(k) ?? "unprinted";
     const current = modeForCustomer(name);
-    // If the customer is currently expanded (either mode === "items" or forced open by "printed_added"),
-    // clicking it closes it to "total_only" and snapshots its current quantities.
     const isCurrentlyOpen = current === "items" || status === "printed_added";
     const next: PrintCustomerMode = isCurrentlyOpen ? "total_only" : "items";
     setCustomerMode(name, next);
@@ -3120,7 +3238,7 @@ function PrintSheetTab() {
       return;
     }
     const next: Record<string, PrintCustomerMode> = {};
-    for (const c of liveQuery.data?.customers ?? []) {
+    for (const c of activeDataSource?.customers ?? []) {
       next[normPrintKey(c.name)] = mode;
     }
     setCustomModes(next);
@@ -3130,7 +3248,41 @@ function PrintSheetTab() {
     void savePrintSheetState({ data: { customModes: next } });
   }
 
-  const allCustomers = liveQuery.data?.customers ?? [];
+  // Apply removedProducts to each customer's rows and totalQuantity so removing an item
+  // completely removes that line and recalculates the customer's total (and removes the customer if 0 left).
+  const rawAllCustomers = activeDataSource?.customers ?? [];
+  const allCustomers: LiveSheetCustomerOrder[] = useMemo(() => {
+    return rawAllCustomers.map((c) => {
+      const cKey = normPrintKey(c.name);
+      const removedSet = new Set(removedProducts[cKey] ?? []);
+      if (removedSet.size === 0) return c;
+      const filteredRows = c.rows.filter(
+        (r) => !removedSet.has(r.productName.trim().toLowerCase()),
+      );
+      const nextTotal =
+        Math.round(
+          filteredRows.reduce((sum, r) => sum + (r.quantity > 0 ? r.quantity : 0), 0) * 1000,
+        ) / 1000;
+      return {
+        ...c,
+        rows: filteredRows,
+        totalQuantity: nextTotal,
+      };
+    });
+  }, [rawAllCustomers, removedProducts]);
+
+  // Customers whose orders were completely removed via individual product removal or "hidden" mode
+  const manuallyRemovedCustomers = useMemo(() => {
+    return rawAllCustomers.filter((rawC) => {
+      if (rawC.totalQuantity <= 0) return false;
+      const cKey = normPrintKey(rawC.name);
+      if (modeForCustomer(rawC.name) === "hidden") return true;
+      const afterC = allCustomers.find((x) => normPrintKey(x.name) === cKey);
+      return afterC ? afterC.totalQuantity <= 0 : false;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rawAllCustomers, allCustomers, customModes]);
+
   const activeCustomers = useMemo(
     () =>
       allCustomers.filter((c) => {
@@ -3212,22 +3364,31 @@ function PrintSheetTab() {
     saveSnapshots(next);
   }
 
-  function markSingleCustomerPrintedByName(customerName: string) {
+  // Completely removes a customer from the Print Sheet (instead of collapsing to Total Only).
+  // They stay removed across refreshes and overnight unless a new order is added to them or restored.
+  function removeCustomerFromPrintSheet(customerName: string) {
     const targetKey = normPrintKey(customerName);
-    const found = allCustomers.find((c) => normPrintKey(c.name) === targetKey);
+    const found =
+      allCustomers.find((c) => normPrintKey(c.name) === targetKey) ??
+      rawAllCustomers.find((c) => normPrintKey(c.name) === targetKey);
     if (!found) return;
     markCustomersPrinted([found]);
   }
 
-  function unmarkCustomerPrinted(customerName: string) {
+  function restoreCustomerToPrintSheet(customerName: string) {
     const k = normPrintKey(customerName);
     const next = { ...printedSnapshots };
     delete next[k];
     saveSnapshots(next);
+    restoreRemovedProductsForCustomer(customerName);
+    if (customModes[k] === "hidden") {
+      setCustomerMode(customerName, getDefaultPrintMode(customerName));
+    }
   }
 
   function resetAllPrinted() {
     saveSnapshots({});
+    saveRemovedProductsState({});
   }
 
   // Keep a ref to the current sheetCustomers + printedSnapshots so even if the
@@ -3431,7 +3592,10 @@ function PrintSheetTab() {
             <div className="flex items-center gap-2 flex-wrap">
               <h2 className="font-bold text-sm text-[#2a1810]">Print Sheet (A1:G38 Layout)</h2>
               <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
-                {liveQuery.data?.sheetLabel ?? "…"} · {liveQuery.data?.forDate ?? "Tomorrow"}
+                {activeDataSource?.sheetLabel ?? liveQuery.data?.sheetLabel ?? "…"} ·{" "}
+                {selectedPrintDate === "__live__"
+                  ? liveQuery.data?.forDate ?? "Tomorrow"
+                  : selectedPrintDate}
               </span>
               <span className="text-xs text-[#8b6f4e]">
                 {sheetCustomers.length} customers · {rowCount} rows · {totalSheetWidthPx}px wide
@@ -3450,7 +3614,7 @@ function PrintSheetTab() {
               onClick={handlePrintAndHide}
               disabled={printLines.length === 0}
               className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
-              title="Print this sheet and mark these customers as Printed (hiding them until they add new items)"
+              title="Print this sheet and mark these customers as Printed (removing them until they add new items)"
             >
               🖨️ Print & Hide Printed ({sheetCustomers.length})
             </button>
@@ -3466,13 +3630,82 @@ function PrintSheetTab() {
 
             <button
               type="button"
-              onClick={() => void qc.invalidateQueries({ queryKey: ["live-sheet-orders"] })}
-              disabled={liveQuery.isFetching}
+              onClick={() => {
+                void qc.invalidateQueries({ queryKey: ["live-sheet-orders"] });
+                if (selectedPrintDate !== "__live__") {
+                  void qc.invalidateQueries({ queryKey: ["print-sheet-for-date", selectedPrintDate] });
+                }
+              }}
+              disabled={isFetchingSource}
               className="text-xs font-bold px-3 py-2 rounded-xl border border-[#2a1810] hover:bg-[#2a1810] hover:text-white transition"
             >
-              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
+              {isFetchingSource ? "Refreshing…" : "↻ Refresh"}
             </button>
           </div>
+        </div>
+
+        {/* Delivery Date / Saved Orders Switcher (solves printing after the Google Sheet clears for the next day) */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#e8dcc8] bg-[#fdf8f1]/60 rounded-xl px-2.5 py-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-bold text-[#2a1810]">📅 Delivery Sheet:</span>
+            <button
+              type="button"
+              onClick={() => setSelectedPrintDate("__live__")}
+              className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                selectedPrintDate === "__live__"
+                  ? "bg-[#c8362b] text-white shadow-sm"
+                  : "bg-white border border-[#e8dcc8] text-[#6b5544] hover:bg-[#e8dcc8]/40"
+              }`}
+            >
+              🟢 Live Sheet ({liveQuery.data?.forDate ?? "Tomorrow"})
+            </button>
+            {liveQuery.data?.todayDate && (
+              <button
+                type="button"
+                onClick={() => setSelectedPrintDate(liveQuery.data!.todayDate)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                  selectedPrintDate === liveQuery.data.todayDate
+                    ? "bg-[#2a1810] text-white shadow-sm"
+                    : "bg-white border border-[#e8dcc8] text-[#2a1810] hover:bg-[#e8dcc8]/40"
+                }`}
+                title="Load Today's Delivery orders from saved snapshots & submissions — works even after the Google Sheet clears for the next day!"
+              >
+                📦 Today's Delivery ({liveQuery.data.todayDate} — Saved Orders)
+              </button>
+            )}
+            {liveQuery.data?.forDate && (
+              <button
+                type="button"
+                onClick={() => setSelectedPrintDate(liveQuery.data!.forDate)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                  selectedPrintDate === liveQuery.data.forDate
+                    ? "bg-[#2a1810] text-white shadow-sm"
+                    : "bg-white border border-[#e8dcc8] text-[#6b5544] hover:bg-[#e8dcc8]/40"
+                }`}
+                title="Load Tomorrow's Delivery orders from saved snapshots + submissions even if the Google Sheet was cleared early"
+              >
+                💾 Tomorrow Saved ({liveQuery.data.forDate})
+              </button>
+            )}
+            <label className="flex items-center gap-1 text-xs font-semibold text-[#6b5544] bg-white border border-[#e8dcc8] rounded-lg px-2 py-0.5">
+              <span>Other Date:</span>
+              <input
+                type="date"
+                value={
+                  selectedPrintDate === "__live__"
+                    ? liveQuery.data?.forDate ?? ""
+                    : selectedPrintDate
+                }
+                onChange={(e) => {
+                  if (e.target.value) setSelectedPrintDate(e.target.value);
+                }}
+                className="text-xs font-bold text-[#2a1810] bg-transparent focus:outline-none"
+              />
+            </label>
+          </div>
+          <span className="text-[11px] text-[#8b6f4e]">
+            💡 Click any customer or <b>✕</b> on a row to completely remove it from the Print Sheet
+          </span>
         </div>
 
         {/* Filter & Layout Controls Row */}
@@ -3503,7 +3736,7 @@ function PrintSheetTab() {
                 viewFilter === "printed_only" ? "bg-green-700 text-white" : "text-green-800"
               }`}
             >
-              ✓ Printed & Hidden ({printedCleanCustomers.length})
+              ✓ Printed / Removed ({printedCleanCustomers.length})
             </button>
           </div>
 
@@ -3716,27 +3949,67 @@ function PrintSheetTab() {
           </div>
         )}
 
-        {/* Printed & Hidden Customers Bar */}
-        {Object.keys(printedSnapshots).length > 0 && (
+        {/* Printed & Removed Customers / Products Bar */}
+        {(Object.keys(printedSnapshots).length > 0 ||
+          Object.keys(removedProducts).length > 0 ||
+          manuallyRemovedCustomers.length > 0) && (
           <div className="pt-2 border-t border-[#e8dcc8] flex flex-wrap items-center justify-between gap-2 bg-green-50/60 p-2 rounded-xl">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-xs font-bold text-green-900">
-                ✓ Printed & Hidden ({printedCleanCustomers.length}):
+                ✓ Printed / Removed ({printedCleanCustomers.length + manuallyRemovedCustomers.length}):
               </span>
-              {printedCleanCustomers.length === 0 ? (
-                <span className="text-xs text-green-700">None currently hidden</span>
+              {printedCleanCustomers.length === 0 &&
+              manuallyRemovedCustomers.length === 0 &&
+              Object.keys(removedProducts).length === 0 ? (
+                <span className="text-xs text-green-700">None currently removed</span>
               ) : (
-                printedCleanCustomers.map((c) => (
-                  <button
-                    key={c.slug}
-                    type="button"
-                    onClick={() => unmarkCustomerPrinted(c.name)}
-                    title="Click to unmark as printed and put back on the print sheet"
-                    className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-200/80 text-green-900 hover:bg-red-100 hover:text-red-800 transition"
-                  >
-                    ✓ {c.name} ({c.totalQuantity}) ×
-                  </button>
-                ))
+                <>
+                  {printedCleanCustomers.map((c) => (
+                    <button
+                      key={`printed-${c.slug}`}
+                      type="button"
+                      onClick={() => restoreCustomerToPrintSheet(c.name)}
+                      title="Click to restore this customer back onto the print sheet"
+                      className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-200/80 text-green-900 hover:bg-red-100 hover:text-red-800 transition"
+                    >
+                      ✓ {c.name} ({c.totalQuantity}) ↺
+                    </button>
+                  ))}
+                  {manuallyRemovedCustomers.map((c) => (
+                    <button
+                      key={`removed-${c.slug}`}
+                      type="button"
+                      onClick={() => restoreCustomerToPrintSheet(c.name)}
+                      title="Click to restore this removed customer back onto the print sheet"
+                      className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-200/80 text-amber-900 hover:bg-green-100 hover:text-green-800 transition"
+                    >
+                      ✕ {c.name} ({c.totalQuantity}) ↺
+                    </button>
+                  ))}
+                  {Object.entries(removedProducts).map(([cKey, prodList]) => {
+                    if (!prodList.length) return null;
+                    const matchCust = rawAllCustomers.find((x) => normPrintKey(x.name) === cKey);
+                    // Skip if already listed in manuallyRemovedCustomers
+                    if (
+                      matchCust &&
+                      manuallyRemovedCustomers.some((m) => normPrintKey(m.name) === cKey)
+                    ) {
+                      return null;
+                    }
+                    const label = matchCust?.name ?? cKey;
+                    return (
+                      <button
+                        key={`remprod-${cKey}`}
+                        type="button"
+                        onClick={() => restoreRemovedProductsForCustomer(label)}
+                        title={`Restore removed items for ${label}: ${prodList.join(", ")}`}
+                        className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 border border-amber-300 hover:bg-green-100 transition"
+                      >
+                        ✕ {label}: {prodList.length} item{prodList.length === 1 ? "" : "s"} removed ↺
+                      </button>
+                    );
+                  })}
+                </>
               )}
             </div>
             <button
@@ -3744,7 +4017,7 @@ function PrintSheetTab() {
               onClick={resetAllPrinted}
               className="text-xs font-bold px-2.5 py-1 rounded-lg border border-green-700 text-green-900 hover:bg-green-200 shrink-0"
             >
-              ↺ Reset All Printed
+              ↺ Restore All Printed / Removed
             </button>
           </div>
         )}
@@ -3755,7 +4028,7 @@ function PrintSheetTab() {
               <input
                 value={customizeSearch}
                 onChange={(e) => setCustomizeSearch(e.target.value)}
-                placeholder="Search customer to toggle Items / Total Only / Hide…"
+                placeholder="Search customer to Remove / Expand / Collapse…"
                 className="flex-1 min-w-[220px] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-xs focus:outline-none focus:border-[#c8362b]"
               />
               <div className="flex items-center gap-1.5">
@@ -3804,7 +4077,7 @@ function PrintSheetTab() {
                     >
                       <option value="items">Items + Total</option>
                       <option value="total_only">Total Only</option>
-                      <option value="hidden">Hidden</option>
+                      <option value="hidden">Completely Remove</option>
                     </select>
                   </div>
                 );
@@ -3816,26 +4089,48 @@ function PrintSheetTab() {
 
       {/* Exact Google Sheets 'print sheet' A1:G38 Grid (No dark right column H, no print scrollbars) */}
       <div className="bg-white rounded-xl border border-[#c0c0c0] shadow-sm p-2 print:border-0 print:shadow-none print:p-0 print:rounded-none overflow-x-auto print:overflow-visible">
-        {liveQuery.isLoading ? (
+        {isLoadingSource ? (
           <div className="p-8 text-center text-sm text-[#8b6f4e]">
-            Loading live orders from Google Sheet…
+            Loading orders for Print Sheet…
           </div>
         ) : rowCount === 0 ? (
-          <div className="p-8 text-center text-sm text-[#8b6f4e] space-y-2">
+          <div className="p-8 text-center text-sm text-[#8b6f4e] space-y-3">
             <p>
               {viewFilter === "to_print" && printedCleanCustomers.length > 0
-                ? `All ${printedCleanCustomers.length} active customer orders on the sheet have already been printed and hidden!`
-                : `No orders with quantity > 0 match this view on the active ${liveQuery.data?.sheetLabel} sheet.`}
+                ? `All ${printedCleanCustomers.length} active customer orders on this sheet have already been printed / removed!`
+                : `No orders with quantity > 0 match this view on the ${
+                    activeDataSource?.sheetLabel ?? "active"
+                  } sheet.`}
             </p>
-            {viewFilter === "to_print" && printedCleanCustomers.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setViewFilter("all_highlight")}
-                className="text-xs font-bold px-3 py-1.5 rounded-lg bg-[#c8362b] text-white"
-              >
-                Show All ({activeCustomers.length}) with Printed Highlighted
-              </button>
-            )}
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              {viewFilter === "to_print" && printedCleanCustomers.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setViewFilter("all_highlight")}
+                  className="text-xs font-bold px-3 py-1.5 rounded-lg bg-[#c8362b] text-white"
+                >
+                  Show All ({activeCustomers.length}) with Printed Highlighted
+                </button>
+              )}
+              {selectedPrintDate === "__live__" && liveQuery.data?.todayDate && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedPrintDate(liveQuery.data!.todayDate)}
+                  className="text-xs font-bold px-3 py-1.5 rounded-lg bg-[#2a1810] text-white"
+                >
+                  📦 Did the Google Sheet clear for the next day? Load Today's Delivery ({liveQuery.data.todayDate})
+                </button>
+              )}
+              {selectedPrintDate === "__live__" && liveQuery.data?.forDate && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedPrintDate(liveQuery.data!.forDate)}
+                  className="text-xs font-bold px-3 py-1.5 rounded-lg border border-[#2a1810] text-[#2a1810]"
+                >
+                  💾 Load Tomorrow's Saved Orders ({liveQuery.data.forDate})
+                </button>
+              )}
+            </div>
           </div>
         ) : (
           <div className="inline-block print:block">
@@ -3906,7 +4201,8 @@ function PrintSheetTab() {
                         custColWidth={colWidths[0]}
                         prodColWidth={colWidths[1]}
                         onToggleCustomer={cycleCustomerMode}
-                        onMarkCustomerPrinted={markSingleCustomerPrintedByName}
+                        onRemoveCustomer={removeCustomerFromPrintSheet}
+                        onRemoveProduct={removeSingleProductFromPrint}
                       />
                       <td
                         style={{
@@ -3923,7 +4219,8 @@ function PrintSheetTab() {
                         custColWidth={colWidths[4]}
                         prodColWidth={colWidths[5]}
                         onToggleCustomer={cycleCustomerMode}
-                        onMarkCustomerPrinted={markSingleCustomerPrintedByName}
+                        onRemoveCustomer={removeCustomerFromPrintSheet}
+                        onRemoveProduct={removeSingleProductFromPrint}
                       />
                     </tr>
                   );
@@ -3952,7 +4249,8 @@ function PrintHalfRowCells({
   custColWidth,
   prodColWidth,
   onToggleCustomer,
-  onMarkCustomerPrinted,
+  onRemoveCustomer,
+  onRemoveProduct,
 }: {
   line: PrintLine | undefined;
   fontSizePx: number;
@@ -3960,7 +4258,8 @@ function PrintHalfRowCells({
   custColWidth: number;
   prodColWidth: number;
   onToggleCustomer: (rawCustomerName: string) => void;
-  onMarkCustomerPrinted?: (rawCustomerName: string) => void;
+  onRemoveCustomer?: (rawCustomerName: string) => void;
+  onRemoveProduct?: (rawCustomerName: string, productName: string) => void;
 }) {
   const baseCellStyle: React.CSSProperties = {
     padding: "0px 4px",
@@ -4063,8 +4362,8 @@ function PrintHalfRowCells({
     return (
       <>
         <td
-          onClick={() => onToggleCustomer(baseName)}
-          title="Click to close/open items (Total Only vs Full Items)"
+          onClick={() => (onRemoveCustomer ? onRemoveCustomer(baseName) : onToggleCustomer(baseName))}
+          title="Click to completely remove this customer from the Print Sheet (or use ↕ to collapse/expand)"
           colSpan={2}
           className="group relative"
           style={{
@@ -4079,19 +4378,32 @@ function PrintHalfRowCells({
           }}
         >
           <span>{labelText}</span>
-          {!isPrintedClean && onMarkCustomerPrinted && (
+          <div className="print:hidden opacity-0 group-hover:opacity-100 transition-opacity absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1">
             <button
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
-                onMarkCustomerPrinted(baseName);
+                onToggleCustomer(baseName);
               }}
-              title="Mark this customer as Printed & Hide"
-              className="print:hidden opacity-0 group-hover:opacity-100 transition-opacity absolute right-1 top-1/2 -translate-y-1/2 px-1.5 py-0 rounded bg-green-700 text-white text-[10px] leading-tight font-bold"
+              title="Collapse / Expand items (Total Only vs Items)"
+              className="px-1 py-0 rounded bg-slate-700 text-white text-[10px] leading-tight font-bold"
             >
-              ✓ Hide
+              ↕
             </button>
-          )}
+            {!isPrintedClean && onRemoveCustomer && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemoveCustomer(baseName);
+                }}
+                title="Completely remove this customer from the Print Sheet"
+                className="px-1.5 py-0 rounded bg-[#c8362b] text-white text-[10px] leading-tight font-bold"
+              >
+                ✕ Remove
+              </button>
+            )}
+          </div>
         </td>
         <td
           style={{
@@ -4135,7 +4447,18 @@ function PrintHalfRowCells({
   return (
     <>
       <td
-        onClick={() => line.rawCustomerName && onToggleCustomer(line.rawCustomerName)}
+        onClick={() =>
+          line.rawCustomerName &&
+          (onRemoveCustomer
+            ? onRemoveCustomer(line.rawCustomerName)
+            : onToggleCustomer(line.rawCustomerName))
+        }
+        title={
+          line.customerName
+            ? `Click to completely remove ${line.rawCustomerName} from the Print Sheet`
+            : undefined
+        }
+        className="group relative"
         style={{
           ...baseCellStyle,
           fontSize: fitCellFontSize(line.customerName, fontSizePx, custColWidth),
@@ -4147,9 +4470,23 @@ function PrintHalfRowCells({
           cursor: line.customerName ? "pointer" : "default",
         }}
       >
-        {line.customerName}
+        <span>{line.customerName}</span>
+        {line.customerName && line.rawCustomerName && onRemoveCustomer && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemoveCustomer(line.rawCustomerName!);
+            }}
+            title={`Completely remove ${line.rawCustomerName} from the Print Sheet`}
+            className="print:hidden opacity-0 group-hover:opacity-100 transition-opacity absolute right-1 top-1/2 -translate-y-1/2 px-1 py-0 rounded bg-[#c8362b] text-white text-[10px] leading-tight font-bold"
+          >
+            ✕
+          </button>
+        )}
       </td>
       <td
+        className="group relative"
         style={{
           ...baseCellStyle,
           fontSize: fitCellFontSize(prodLabel, fontSizePx, prodColWidth),
@@ -4157,7 +4494,20 @@ function PrintHalfRowCells({
           border: "1px solid #b7b7b7",
         }}
       >
-        {prodLabel}
+        <span>{prodLabel}</span>
+        {line.rawCustomerName && onRemoveProduct && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onRemoveProduct(line.rawCustomerName!, line.productName);
+            }}
+            title={`Remove only "${line.productName}" from ${line.rawCustomerName}'s print order`}
+            className="print:hidden opacity-0 group-hover:opacity-100 transition-opacity absolute right-1 top-1/2 -translate-y-1/2 px-1 py-0 rounded bg-[#c8362b] text-white text-[10px] leading-tight font-bold"
+          >
+            ✕
+          </button>
+        )}
       </td>
       <td
         style={{

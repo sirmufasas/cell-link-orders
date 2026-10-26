@@ -84,6 +84,13 @@ function tomorrowWeekdayInBakeryTimezone(): number {
   return weekdayOf(tomorrow.getUTCFullYear(), tomorrow.getUTCMonth() + 1, tomorrow.getUTCDate());
 }
 
+/** Today's date (bakery-local) as YYYY-MM-DD. */
+export function todayISOInBakeryTimezone(): string {
+  const { year, month, day } = nowInBakeryTimezone();
+  const today = new Date(Date.UTC(year, month - 1, day));
+  return today.toISOString().slice(0, 10);
+}
+
 /** Tomorrow's date (bakery-local) as YYYY-MM-DD. */
 export function tomorrowISOInBakeryTimezone(): string {
   const { year, month, day } = nowInBakeryTimezone();
@@ -263,6 +270,17 @@ export async function readCustomerRows(
   return (res.data.values as string[][]) ?? [];
 }
 
+function parseSheetNumber(raw: unknown): number {
+  const s = (raw ?? "")
+    .toString()
+    .trim()
+    .replace(/,/g, ".")
+    .replace(/[^0-9.-]/g, "");
+  if (!s) return 0;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? Math.round(n * 1000) / 1000 : 0;
+}
+
 /**
  * Reads columns A..K of "Customer Order Details" on the active (or specified)
  * spreadsheet so Admin Manual Orders and Print Sheet can see live quantities
@@ -303,20 +321,18 @@ export async function readLiveCustomerOrderSheet(
     const customerName = (r[0] ?? "").toString().trim();
     const productName = (r[1] ?? "").toString().trim();
     if (!customerName || !productName) continue;
-    const qtyRaw = (r[2] ?? "").toString().replace(/[^0-9-]/g, "").trim();
-    const quantity = qtyRaw === "" ? 0 : parseInt(qtyRaw, 10);
+    const quantity = parseSheetNumber(r[2]);
     const driver = (r[3] ?? "").toString().trim();
     const comment = (r[9] ?? "").toString().trim();
-    const lateRaw = (r[10] ?? "").toString().replace(/[^0-9-]/g, "").trim();
-    const lateQuantity = lateRaw === "" ? 0 : parseInt(lateRaw, 10);
+    const lateQuantity = parseSheetNumber(r[10]);
     out.push({
       row: i + 1,
       customerName,
       productName,
-      quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 0,
+      quantity: quantity > 0 ? quantity : 0,
       driver,
       comment,
-      lateQuantity: Number.isFinite(lateQuantity) && lateQuantity > 0 ? lateQuantity : 0,
+      lateQuantity: lateQuantity > 0 ? lateQuantity : 0,
     });
   }
 
@@ -365,10 +381,8 @@ export async function readSectionRows(
     const r = rows[i] ?? [];
     const name = (r[0] ?? "").trim();
     if (!name) continue;
-    const stockRaw = (r[5] ?? "").toString().trim(); // column F
-    const estimateRaw = (r[6] ?? "").toString().trim(); // column G
-    const stock = stockRaw === "" ? 0 : parseInt(stockRaw, 10);
-    const estimate = estimateRaw === "" ? 0 : parseInt(estimateRaw, 10);
+    const stock = parseSheetNumber(r[5]); // column F
+    const estimate = parseSheetNumber(r[6]); // column G
     out.push({
       row: i + 1, // 1-based sheet row
       name,
@@ -545,8 +559,8 @@ export async function addLateOrderQuantityToRow(
     range: `${TAB_CUSTOMERS}!K${row}`,
   });
   const currentRaw = (res.data.values?.[0]?.[0] ?? "").toString().trim();
-  const current = currentRaw === "" ? 0 : parseInt(currentRaw, 10);
-  const newTotal = (Number.isFinite(current) ? current : 0) + quantity;
+  const current = parseSheetNumber(currentRaw);
+  const newTotal = Math.round(((Number.isFinite(current) ? current : 0) + quantity) * 1000) / 1000;
   await writeCells([
     { range: `${TAB_CUSTOMERS}!K${row}`, value: String(newTotal) },
   ]);

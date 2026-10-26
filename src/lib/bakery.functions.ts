@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { tomorrowISOInBakeryTimezone, bakeryMinutesNow } from "@/lib/sheets.server";
+import { todayISOInBakeryTimezone, tomorrowISOInBakeryTimezone, bakeryMinutesNow } from "@/lib/sheets.server";
 
 function slugify(s: string) {
   const base = s
@@ -18,6 +18,10 @@ function slugify(s: string) {
  */
 function normCustomerKey(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function todayISO(): string {
+  return todayISOInBakeryTimezone();
 }
 
 function tomorrowISO(): string {
@@ -275,7 +279,7 @@ const SubmitItem = z.object({
   sheetRow: z.number().int().min(0),
   productName: z.string().min(1),
   productId: z.string().uuid().nullable().optional(),
-  quantity: z.number().int().min(0),
+  quantity: z.number().min(0),
 });
 
 const SubmitOrderInput = z.object({
@@ -1760,6 +1764,7 @@ export type PersistedPrintSheetState = {
   updatedAt: string;
   printedSnapshots: Record<string, PersistedPrintedCustomerSnapshot>;
   customModes: Record<string, "items" | "total_only" | "hidden">;
+  removedProducts?: Record<string, string[]>; // normCustomerKey -> list of norm product names removed from print
 };
 
 const PRINT_STATE_SLUG = "__print_sheet_state_v2__";
@@ -1778,12 +1783,18 @@ async function readServerPrintSheetState(): Promise<PersistedPrintSheetState> {
         updatedAt: parsed.updatedAt ?? new Date().toISOString(),
         printedSnapshots: parsed.printedSnapshots ?? {},
         customModes: parsed.customModes ?? {},
+        removedProducts: parsed.removedProducts ?? {},
       };
     }
   } catch {
     // non-fatal
   }
-  return { updatedAt: new Date().toISOString(), printedSnapshots: {}, customModes: {} };
+  return {
+    updatedAt: new Date().toISOString(),
+    printedSnapshots: {},
+    customModes: {},
+    removedProducts: {},
+  };
 }
 
 async function writeServerPrintSheetState(state: PersistedPrintSheetState): Promise<void> {
@@ -1810,10 +1821,67 @@ async function writeServerPrintSheetState(state: PersistedPrintSheetState): Prom
   }
 }
 
+type ArchivedDateCustomerOrder = {
+  name: string;
+  slug: string;
+  driver: string;
+  sortOrder: number;
+  comment: string;
+  totalQuantity: number;
+  items: Array<{ productName: string; quantity: number; lateQuantity?: number }>;
+};
+
+function archiveSlugForDate(forDate: string): string {
+  return `__sheet_archive_${forDate}__`;
+}
+
+async function readSheetArchiveForDate(
+  forDate: string,
+): Promise<Record<string, ArchivedDateCustomerOrder>> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("name")
+      .eq("slug", archiveSlugForDate(forDate))
+      .maybeSingle();
+    if (data?.name) {
+      return JSON.parse(data.name) as Record<string, ArchivedDateCustomerOrder>;
+    }
+  } catch {
+    // non-fatal
+  }
+  return {};
+}
+
+async function writeSheetArchiveForDate(
+  forDate: string,
+  archive: Record<string, ArchivedDateCustomerOrder>,
+): Promise<void> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const slug = archiveSlugForDate(forDate);
+    const payload = JSON.stringify(archive);
+    const { data: existing } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("id")
+      .eq("slug", slug)
+      .maybeSingle();
+    if (existing?.id) {
+      await supabaseAdmin.from("sheet_groups").update({ name: payload }).eq("id", existing.id);
+    } else {
+      await supabaseAdmin.from("sheet_groups").insert({ slug, name: payload });
+    }
+  } catch {
+    // non-fatal
+  }
+}
+
 export const savePrintSheetState = createServerFn({ method: "POST" })
   .validator((d: {
     printedSnapshots?: Record<string, PersistedPrintedCustomerSnapshot>;
     customModes?: Record<string, "items" | "total_only" | "hidden">;
+    removedProducts?: Record<string, string[]>;
   }) =>
     z
       .object({
@@ -1828,6 +1896,7 @@ export const savePrintSheetState = createServerFn({ method: "POST" })
           )
           .optional(),
         customModes: z.record(z.string(), z.enum(["items", "total_only", "hidden"])).optional(),
+        removedProducts: z.record(z.string(), z.array(z.string())).optional(),
       })
       .parse(d),
   )
@@ -1837,6 +1906,7 @@ export const savePrintSheetState = createServerFn({ method: "POST" })
       updatedAt: new Date().toISOString(),
       printedSnapshots: data.printedSnapshots ?? current.printedSnapshots,
       customModes: data.customModes ?? current.customModes,
+      removedProducts: data.removedProducts ?? current.removedProducts ?? {},
     };
     await writeServerPrintSheetState(next);
     return { ok: true, printState: next };
@@ -1850,19 +1920,29 @@ export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(asyn
     getActiveSheetUrl,
   } = await import("@/lib/sheets.server");
 
-  const [sheetRows, { data: dbCustomers }, { data: dbProducts }, { data: recentSubs }, serverPrintState] =
-    await Promise.all([
-      readLiveCustomerOrderSheet(),
-      supabaseAdmin.from("customers").select("id, slug, name, driver, sort_order"),
-      supabaseAdmin.from("products").select("id, name"),
-      supabaseAdmin
-        .from("order_submissions")
-        .select("customer_id, for_date, total_items, created_at, items:order_submission_items(product_id, product_name, quantity)")
-        .gt("total_items", 0)
-        .order("created_at", { ascending: false })
-        .limit(400),
-      readServerPrintSheetState(),
-    ]);
+  const activeForDate = tomorrowISO();
+  const currentTodayDate = todayISO();
+
+  const [
+    sheetRows,
+    { data: dbCustomers },
+    { data: dbProducts },
+    { data: recentSubs },
+    serverPrintState,
+    existingArchive,
+  ] = await Promise.all([
+    readLiveCustomerOrderSheet(),
+    supabaseAdmin.from("customers").select("id, slug, name, driver, sort_order"),
+    supabaseAdmin.from("products").select("id, name"),
+    supabaseAdmin
+      .from("order_submissions")
+      .select("customer_id, for_date, total_items, created_at, order_type, message, items:order_submission_items(product_id, product_name, quantity)")
+      .gt("total_items", 0)
+      .order("created_at", { ascending: false })
+      .limit(600),
+    readServerPrintSheetState(),
+    readSheetArchiveForDate(activeForDate),
+  ]);
 
   const customerByKey = new Map<
     string,
@@ -1925,7 +2005,7 @@ export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(asyn
     }
     if (!entry.driver && r.driver) entry.driver = r.driver;
     if (!entry.comment && r.comment) entry.comment = r.comment;
-    entry.totalQuantity += r.quantity;
+    entry.totalQuantity = Math.round((entry.totalQuantity + r.quantity) * 1000) / 1000;
     entry.rows.push({
       sheetRow: r.row,
       productId: productIdByName.get(r.productName.toLowerCase()) ?? null,
@@ -1935,32 +2015,267 @@ export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(asyn
     });
   }
 
-  // If a customer on the active sheet now has totalQuantity === 0 (i.e. their
-  // order on the sheet was cleared/reset for the next day), automatically
-  // remove their old printed snapshot so their next order appears fresh in
-  // "To Print". Customers who still have totalQuantity > 0 keep their snapshot
-  // across refreshes and overnight into the morning print!
-  let cleanedAnyZeroSnapshot = false;
-  const activeSnapshots = { ...serverPrintState.printedSnapshots };
+  // Automatically back up every active order on the live sheet into the
+  // delivery-date archive (__sheet_archive_<activeForDate>__) in Supabase so
+  // when the Google Sheet later clears for the next day, that day's orders
+  // remain saved and printable!
+  let archiveChanged = false;
+  const nextArchive: Record<string, ArchivedDateCustomerOrder> = { ...existingArchive };
   for (const [cKey, entry] of byCustomerKey.entries()) {
-    if (entry.totalQuantity === 0 && activeSnapshots[cKey]) {
-      delete activeSnapshots[cKey];
-      cleanedAnyZeroSnapshot = true;
+    if (entry.totalQuantity > 0) {
+      const positiveItems = entry.rows
+        .filter((r) => r.quantity > 0)
+        .map((r) => ({
+          productName: r.productName,
+          quantity: r.quantity,
+          lateQuantity: r.lateQuantity,
+        }));
+      const prev = nextArchive[cKey];
+      if (!prev || prev.totalQuantity !== entry.totalQuantity || prev.items.length !== positiveItems.length) {
+        nextArchive[cKey] = {
+          name: entry.name,
+          slug: entry.slug,
+          driver: entry.driver,
+          sortOrder: entry.sortOrder,
+          comment: entry.comment,
+          totalQuantity: entry.totalQuantity,
+          items: positiveItems,
+        };
+        archiveChanged = true;
+      }
     }
   }
-  if (cleanedAnyZeroSnapshot) {
-    serverPrintState.printedSnapshots = activeSnapshots;
-    await writeServerPrintSheetState(serverPrintState);
+  if (archiveChanged) {
+    await writeSheetArchiveForDate(activeForDate, nextArchive);
   }
 
   return {
     sheetLabel: getActiveSheetLabel(),
     sheetUrl: getActiveSheetUrl(),
-    forDate: tomorrowISO(),
+    todayDate: currentTodayDate,
+    forDate: activeForDate,
     customers: Array.from(byCustomerKey.values()),
     printState: serverPrintState,
   };
 });
+
+/**
+ * Reconstructs the complete Print Sheet customer orders for ANY delivery date
+ * (`forDate`, e.g. Today's Delivery after the Google Sheet has already cleared
+ * for tomorrow's orders, or any past/current date).
+ * Combines:
+ *   1. The saved Google Sheet archive (`__sheet_archive_<forDate>__`) captured
+ *      before the sheet cleared.
+ *   2. All Supabase `order_submissions` + `order_submission_items` for `for_date = forDate`
+ *      (including manual orders, customer link orders, and add-ons).
+ *   3. Live Google Sheet quantities if `forDate === tomorrowISO()` and the live
+ *      sheet currently has orders.
+ */
+export const getPrintSheetForDate = createServerFn({ method: "GET" })
+  .validator((d: { forDate: string }) =>
+    z.object({ forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }).parse(d),
+  )
+  .handler(async ({ data }) => {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const {
+      readLiveCustomerOrderSheet,
+      getActiveSheetLabel,
+      getActiveSheetUrl,
+    } = await import("@/lib/sheets.server");
+
+    const targetForDate = data.forDate;
+    const isCurrentLiveTarget = targetForDate === tomorrowISO();
+
+    const [
+      archive,
+      { data: dbCustomers },
+      { data: dateSubs },
+      liveRows,
+    ] = await Promise.all([
+      readSheetArchiveForDate(targetForDate),
+      supabaseAdmin
+        .from("customers")
+        .select("id, slug, name, driver, sort_order")
+        .order("sort_order", { ascending: true }),
+      supabaseAdmin
+        .from("order_submissions")
+        .select(
+          "id, customer_id, for_date, total_items, created_at, order_type, message, customer:customers(id, name, slug, driver, sort_order), items:order_submission_items(product_id, product_name, quantity, sheet_row)",
+        )
+        .eq("for_date", targetForDate)
+        .gt("total_items", 0)
+        .order("created_at", { ascending: true }),
+      isCurrentLiveTarget ? readLiveCustomerOrderSheet() : Promise.resolve([]),
+    ]);
+
+    const customerByKey = new Map<
+      string,
+      { id: string; slug: string; name: string; driver: string | null; sort_order: number }
+    >();
+    for (const c of dbCustomers ?? []) {
+      const k = normCustomerKey(c.name);
+      if (!customerByKey.has(k) || !c.slug.endsWith("-2")) {
+        customerByKey.set(k, c);
+      }
+    }
+
+    const resultMap = new Map<string, LiveSheetCustomerOrder>();
+
+    // 1. Seed from `order_submissions` for `targetForDate` (chronological order:
+    //    "new" / "late" / "changed" sets the base items; "added" adds onto them).
+    const subsByCustKey = new Map<string, any[]>();
+    for (const s of dateSubs ?? []) {
+      const cName = (s as any).customer?.name;
+      if (!cName) continue;
+      const cKey = normCustomerKey(cName);
+      const list = subsByCustKey.get(cKey) ?? [];
+      list.push(s);
+      subsByCustKey.set(cKey, list);
+    }
+
+    let orderIdx = 0;
+    for (const [cKey, subs] of subsByCustKey.entries()) {
+      const dbCust = customerByKey.get(cKey) ?? (subs[0] as any).customer;
+      const prodQtyMap = new Map<string, { productName: string; productId: string | null; quantity: number }>();
+      let latestComment = "";
+
+      for (let i = 0; i < subs.length; i++) {
+        const s = subs[i];
+        const isFirst = i === 0;
+        const isAddOn = !isFirst && s.order_type === "added";
+        if (!isAddOn) {
+          prodQtyMap.clear();
+        }
+        if (s.message) latestComment = s.message;
+        for (const it of (s as any).items ?? []) {
+          const pName = (it.product_name ?? "").trim();
+          if (!pName || (it.quantity ?? 0) <= 0) continue;
+          const pKey = pName.toLowerCase();
+          const prev = prodQtyMap.get(pKey);
+          if (isAddOn && prev) {
+            prev.quantity = Math.round((prev.quantity + it.quantity) * 1000) / 1000;
+          } else {
+            prodQtyMap.set(pKey, {
+              productName: pName,
+              productId: it.product_id ?? null,
+              quantity: it.quantity,
+            });
+          }
+        }
+      }
+
+      const rows = Array.from(prodQtyMap.values()).map((it, idx) => ({
+        sheetRow: idx + 1,
+        productId: it.productId,
+        productName: it.productName,
+        quantity: it.quantity,
+        lateQuantity: 0,
+      }));
+      const totalQuantity = Math.round(rows.reduce((a, b) => a + b.quantity, 0) * 1000) / 1000;
+      if (totalQuantity > 0) {
+        orderIdx += 1;
+        resultMap.set(cKey, {
+          id: dbCust?.id ?? null,
+          slug: dbCust?.slug ?? slugify(dbCust?.name ?? cKey),
+          name: dbCust?.name ?? cKey,
+          driver: dbCust?.driver || "Collection",
+          sortOrder: dbCust?.sort_order || orderIdx,
+          totalQuantity,
+          comment: latestComment,
+          rows,
+          lastOrder: null,
+        });
+      }
+    }
+
+    // 2. Overlay saved Google Sheet archive (`__sheet_archive_<targetForDate>__`)
+    //    which also captures orders typed directly on the Google Sheet before it cleared
+    //    and preserves exact decimal quantities.
+    for (const [cKey, arch] of Object.entries(archive)) {
+      if (!arch || arch.totalQuantity <= 0) continue;
+      const dbCust = customerByKey.get(cKey);
+      const existing = resultMap.get(cKey);
+      // Use whichever has more up-to-date items or if not in submissions yet
+      if (!existing || arch.totalQuantity >= existing.totalQuantity) {
+        resultMap.set(cKey, {
+          id: dbCust?.id ?? existing?.id ?? null,
+          slug: arch.slug || dbCust?.slug || existing?.slug || slugify(arch.name),
+          name: arch.name || dbCust?.name || existing?.name || cKey,
+          driver: arch.driver || dbCust?.driver || existing?.driver || "Collection",
+          sortOrder: arch.sortOrder || dbCust?.sort_order || existing?.sortOrder || 999,
+          totalQuantity: arch.totalQuantity,
+          comment: arch.comment || existing?.comment || "",
+          rows: arch.items.map((it, idx) => ({
+            sheetRow: idx + 1,
+            productId: null,
+            productName: it.productName,
+            quantity: it.quantity,
+            lateQuantity: it.lateQuantity ?? 0,
+          })),
+          lastOrder: null,
+        });
+      }
+    }
+
+    // 3. If this is the active live target date (`tomorrowISO()`) and the live
+    //    sheet currently has non-zero orders for a customer, use the live sheet's
+    //    current rows & driver for that customer.
+    if (isCurrentLiveTarget && liveRows.length > 0) {
+      const liveByCust = new Map<string, LiveSheetCustomerOrder>();
+      let cOrder = 0;
+      for (const r of liveRows) {
+        const cKey = normCustomerKey(r.customerName);
+        let entry = liveByCust.get(cKey);
+        if (!entry) {
+          cOrder += 1;
+          const dbCust = customerByKey.get(cKey);
+          entry = {
+            id: dbCust?.id ?? null,
+            slug: dbCust?.slug ?? slugify(r.customerName),
+            name: dbCust?.name ?? r.customerName,
+            driver: r.driver || dbCust?.driver || "Collection",
+            sortOrder: cOrder,
+            totalQuantity: 0,
+            comment: "",
+            rows: [],
+            lastOrder: null,
+          };
+          liveByCust.set(cKey, entry);
+        }
+        if (!entry.driver && r.driver) entry.driver = r.driver;
+        if (!entry.comment && r.comment) entry.comment = r.comment;
+        entry.totalQuantity = Math.round((entry.totalQuantity + r.quantity) * 1000) / 1000;
+        entry.rows.push({
+          sheetRow: r.row,
+          productId: null,
+          productName: r.productName,
+          quantity: r.quantity,
+          lateQuantity: r.lateQuantity,
+        });
+      }
+
+      for (const [cKey, liveEntry] of liveByCust.entries()) {
+        if (liveEntry.totalQuantity > 0) {
+          resultMap.set(cKey, liveEntry);
+        } else if (resultMap.has(cKey)) {
+          // Keep driver from live sheet if missing
+          const saved = resultMap.get(cKey)!;
+          if (liveEntry.driver) saved.driver = liveEntry.driver;
+        }
+      }
+    }
+
+    const customers = Array.from(resultMap.values()).sort(
+      (a, b) => (a.sortOrder ?? 999) - (b.sortOrder ?? 999) || a.name.localeCompare(b.name),
+    );
+
+    return {
+      sheetLabel: getActiveSheetLabel(),
+      sheetUrl: getActiveSheetUrl(),
+      forDate: targetForDate,
+      customers,
+    };
+  });
 
 const AdminManualOrderInput = z.object({
   customerName: z.string().min(1),
@@ -2017,11 +2332,17 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
           ]),
         );
       }
+      // Also remove this customer from the saved archive for tomorrowISO()
+      const currentArch = await readSheetArchiveForDate(tomorrowISO());
+      if (currentArch[targetKey]) {
+        delete currentArch[targetKey];
+        await writeSheetArchiveForDate(tomorrowISO(), currentArch);
+      }
       return { ok: true, totalItems: 0, mode: "clear" as const };
     }
 
     const positive = data.items.filter((i) => i.quantity > 0);
-    const totalItems = positive.reduce((a, b) => a + b.quantity, 0);
+    const totalItems = Math.round(positive.reduce((a, b) => a + b.quantity, 0) * 1000) / 1000;
     if (positive.length === 0 || totalItems <= 0) {
       throw new Error("Please enter a quantity for at least 1 product (or use 'Clear Sheet Order' to zero out).");
     }
@@ -2076,6 +2397,13 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
     if (customer?.id) {
       const targetDate = tomorrowISO();
       const activeGroupId = await groupIdBySlug(activeSheetGroupSlug());
+      // Postgres integer columns in order_submissions / order_submission_items
+      // require integer values if the DB column is INT; round/ceil safely for DB
+      // while the Google Sheet and sheet archive store exact decimals.
+      const dbTotalItems = Number.isInteger(totalItems)
+        ? totalItems
+        : Math.max(1, Math.round(totalItems));
+      const toDbQty = (q: number) => (Number.isInteger(q) ? q : Math.max(1, Math.round(q)));
 
       if (data.mode === "set") {
         // Check if there is already an existing submission for this customer & delivery date.
@@ -2096,7 +2424,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
           await supabaseAdmin
             .from("order_submissions")
             .update({
-              total_items: totalItems,
+              total_items: dbTotalItems,
               message: fullComment,
             })
             .eq("id", latestAdminSub.id);
@@ -2109,7 +2437,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
               submission_id: latestAdminSub.id,
               product_id: i.productId ?? null,
               product_name: i.productName,
-              quantity: i.quantity,
+              quantity: toDbQty(i.quantity),
               sheet_row: i.sheetRow,
             })),
           );
@@ -2123,7 +2451,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
             customer_id: customer.id,
             ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
             for_date: targetDate,
-            total_items: totalItems,
+            total_items: dbTotalItems,
             synced_to_sheet: true,
             order_type: hasPriorToday ? "changed" : "new",
             message: fullComment,
@@ -2136,7 +2464,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
               submission_id: submission.id,
               product_id: i.productId ?? null,
               product_name: i.productName,
-              quantity: i.quantity,
+              quantity: toDbQty(i.quantity),
               sheet_row: i.sheetRow,
             })),
           );
@@ -2149,7 +2477,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
             customer_id: customer.id,
             ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
             for_date: targetDate,
-            total_items: totalItems,
+            total_items: dbTotalItems,
             synced_to_sheet: true,
             order_type: "added",
             message: fullComment,
@@ -2162,7 +2490,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
               submission_id: submission.id,
               product_id: i.productId ?? null,
               product_name: i.productName,
-              quantity: i.quantity,
+              quantity: toDbQty(i.quantity),
               sheet_row: i.sheetRow,
             })),
           );
