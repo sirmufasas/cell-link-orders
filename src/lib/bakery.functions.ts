@@ -1850,6 +1850,75 @@ async function writeServerPrintSheetState(state: PersistedPrintSheetState): Prom
   }
 }
 
+// ============================== CUSTOMER INVOICE TYPES ==============================
+// Which customers get a PRINTED invoice (🖨️) vs a hand-WRITTEN one (✍️).
+// Stored as a JSON map { [slug]: "printer" | "written" } in sheet_groups —
+// exactly the same pattern as the print-sheet state, so no DB migration is
+// needed and it survives refreshes / devices.
+const INVOICE_TYPES_SLUG = "__customer_invoice_types__";
+
+export type CustomerInvoiceType = "printer" | "written";
+
+async function readServerInvoiceTypes(): Promise<Record<string, CustomerInvoiceType>> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("name")
+      .eq("slug", INVOICE_TYPES_SLUG)
+      .maybeSingle();
+    if (data?.name) {
+      const parsed = JSON.parse(data.name) as Record<string, unknown>;
+      if (parsed && typeof parsed === "object") {
+        const clean: Record<string, CustomerInvoiceType> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v === "printer" || v === "written") clean[k] = v;
+        }
+        return clean;
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+  return {};
+}
+
+async function writeServerInvoiceTypes(map: Record<string, CustomerInvoiceType>): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const payload = JSON.stringify(map);
+  const { data: existing } = await supabaseAdmin
+    .from("sheet_groups")
+    .select("id")
+    .eq("slug", INVOICE_TYPES_SLUG)
+    .maybeSingle();
+  if (existing?.id) {
+    await supabaseAdmin.from("sheet_groups").update({ name: payload }).eq("id", existing.id);
+  } else {
+    await supabaseAdmin.from("sheet_groups").insert({ slug: INVOICE_TYPES_SLUG, name: payload });
+  }
+}
+
+export const getCustomerInvoiceTypes = createServerFn({ method: "GET" }).handler(async () => {
+  return readServerInvoiceTypes();
+});
+
+export const setCustomerInvoiceType = createServerFn({ method: "POST" })
+  .validator((d) =>
+    z
+      .object({
+        slug: z.string().min(1),
+        invoiceType: z.enum(["printer", "written"]).nullable(),
+      })
+      .parse(d),
+  )
+  .handler(async ({ data }) => {
+    const current = await readServerInvoiceTypes();
+    if (data.invoiceType === null) delete current[data.slug];
+    else current[data.slug] = data.invoiceType;
+    await writeServerInvoiceTypes(current);
+    return current;
+  });
+
 type ArchivedDateCustomerOrder = {
   name: string;
   slug: string;

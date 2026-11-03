@@ -11,6 +11,7 @@ import {
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
   autoSyncIfStale, getLiveSheetOrders, getPrintSheetForDate, adminSaveManualOrder, getHistoryRetentionInfo,
   clearOldOrderHistory, savePrintSheetState, createCustomerInSheet, type LiveSheetCustomerOrder,
+  getCustomerInvoiceTypes, setCustomerInvoiceType,
 } from "@/lib/bakery.functions";
 import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
 
@@ -27,6 +28,11 @@ const liveSheetOrdersQuery = queryOptions({
   queryKey: ["live-sheet-orders"],
   queryFn: () => getLiveSheetOrders(),
   staleTime: 15_000,
+});
+const invoiceTypesQuery = queryOptions({
+  queryKey: ["invoice-types"],
+  queryFn: () => getCustomerInvoiceTypes(),
+  staleTime: 30_000,
 });
 
 // New-order sound alert preference. The actual siren + shouted-voice sound
@@ -55,7 +61,17 @@ export const Route = createFileRoute("/admin")({
 
 type Bucket = "day" | "week" | "month";
 type Dim = "items" | "products" | "customers";
-type AdminTab = "customers" | "manual" | "print" | "history" | "analytics" | "estimates" | "stocks" | "drivers";
+type AdminTab =
+  | "customers"
+  | "manual"
+  | "linked"
+  | "print"
+  | "kota"
+  | "history"
+  | "analytics"
+  | "estimates"
+  | "stocks"
+  | "drivers";
 
 // ---------------------------------------------------------------------------
 // Simple password gate
@@ -71,7 +87,17 @@ type AdminTab = "customers" | "manual" | "print" | "history" | "analytics" | "es
 
 const ADMIN_PASSWORD = "portugalbakery";
 const UNLOCK_STORAGE_KEY = "bakery_admin_unlocked";
-const PROTECTED_TABS: AdminTab[] = ["customers", "manual", "print", "analytics", "estimates", "stocks", "drivers"];
+const PROTECTED_TABS: AdminTab[] = [
+  "customers",
+  "manual",
+  "linked",
+  "print",
+  "kota",
+  "analytics",
+  "estimates",
+  "stocks",
+  "drivers",
+];
 const MANUAL_REGULARS_STORAGE_KEY = "bakery_manual_regulars_v1";
 const PRINT_MODES_STORAGE_KEY = "bakery_print_customer_modes_v1";
 
@@ -162,6 +188,45 @@ function dateLabel(iso: string) {
   return new Date(iso).toLocaleDateString(undefined, {
     weekday: "long", year: "numeric", month: "long", day: "numeric",
   });
+}
+
+// Tomorrow's date (YYYY-MM-DD) in the bakery's timezone — must match the
+// server's tomorrowISO() so "today's orders" line up with the active sheet.
+function saTomorrowISO(): string {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Johannesburg" });
+    return fmt.format(new Date(Date.now() + 24 * 60 * 60 * 1000));
+  } catch {
+    return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  }
+}
+
+// Admin manual saves stamp their submission message with an "Admin…" prefix
+// (see adminSaveManualOrder) — anything WITHOUT it came from the customer's
+// own order link. That's how we split Manual vs Linked orders.
+function isAdminOrderMessage(msg?: string | null): boolean {
+  return (msg ?? "").trim().toLowerCase().startsWith("admin");
+}
+
+type LinkedLatestInfo = {
+  type: string | null;
+  at: string;
+  message: string | null;
+  totalItems: number;
+};
+
+type LinkedOrderInfo = {
+  byId: Set<string>;
+  bySlug: Set<string>;
+  latestBySlug: Map<string, LinkedLatestInfo>;
+};
+
+function isLinkedCustomer(
+  c: { id: string | null; slug: string },
+  linked: LinkedOrderInfo,
+): boolean {
+  if (c.id && linked.byId.has(c.id)) return true;
+  return linked.bySlug.has(c.slug);
 }
 
 function orderTypeTag(type?: string | null) {
@@ -349,7 +414,21 @@ function AdminPage() {
   const [tab, setTabState] = useState<AdminTab>(() => {
     if (typeof window === "undefined") return "customers";
     const saved = sessionStorage.getItem("bakery_admin_active_tab") as AdminTab | null;
-    if (saved && ["customers", "manual", "print", "history", "analytics", "estimates", "stocks", "drivers"].includes(saved)) {
+    if (
+      saved &&
+      [
+        "customers",
+        "manual",
+        "linked",
+        "print",
+        "kota",
+        "history",
+        "analytics",
+        "estimates",
+        "stocks",
+        "drivers",
+      ].includes(saved)
+    ) {
       return saved;
     }
     return "customers";
@@ -366,6 +445,8 @@ function AdminPage() {
   const [search, setSearch] = useState("");
   const [customerDriverFilter, setCustomerDriverFilter] = useState("__all__");
   const [customerStatusFilter, setCustomerStatusFilter] = useState<"all" | "ordered" | "pending" | "pinned">("all");
+  const [customerInvoiceFilter, setCustomerInvoiceFilter] = useState<"all" | "printer" | "written">("all");
+  const [savingInvoiceSlug, setSavingInvoiceSlug] = useState<string | null>(null);
   const [manualSelectedSlug, setManualSelectedSlug] = useState<string | null>(null);
   const [copiedSlug, setCopiedSlug] = useState<string | null>(null);
   const [historySearch, setHistorySearch] = useState("");
@@ -380,6 +461,52 @@ function AdminPage() {
 
   const { data: liveSheetData } = useQuery(liveSheetOrdersQuery);
   const { data: retentionInfo } = useQuery(historyRetentionQuery);
+
+  // ── LINKED ORDERS ── Customers whose order for the current sheet came in
+  // from their own /order/<slug> link (submission NOT stamped "Admin…").
+  // They are hidden from Manual Orders and shown on the Linked Orders tab
+  // instead, so the manual list only contains customers you still need to type.
+  const [revealLinkedSlug, setRevealLinkedSlug] = useState<string | null>(null);
+  const linkedOrderInfo = useMemo<LinkedOrderInfo>(() => {
+    const byId = new Set<string>();
+    const bySlug = new Set<string>();
+    const latestBySlug = new Map<string, LinkedLatestInfo>();
+    const tomorrowKey = saTomorrowISO();
+    for (const sub of submissions ?? []) {
+      if (sub.for_date !== tomorrowKey) continue;
+      if (!(sub.total_items > 0)) continue;
+      if (isAdminOrderMessage(sub.message)) continue;
+      if (sub.customer?.id) byId.add(sub.customer.id);
+      if (sub.customer?.slug) {
+        bySlug.add(sub.customer.slug);
+        if (!latestBySlug.has(sub.customer.slug)) {
+          latestBySlug.set(sub.customer.slug, {
+            type: sub.order_type ?? null,
+            at: sub.created_at,
+            message: sub.message,
+            totalItems: sub.total_items,
+          });
+        }
+      }
+    }
+    return { byId, bySlug, latestBySlug };
+  }, [submissions]);
+
+  // 🖨️ Printer vs ✍️ Written invoice marking per customer
+  const invoiceTypesQ = useQuery(invoiceTypesQuery);
+  const invoiceTypes = invoiceTypesQ.data ?? {};
+
+  async function setInvoiceTypeFor(slug: string, invoiceType: "printer" | "written" | null) {
+    setSavingInvoiceSlug(slug);
+    try {
+      await setCustomerInvoiceType({ data: { slug, invoiceType } });
+      await qc.invalidateQueries({ queryKey: ["invoice-types"] });
+    } catch (e) {
+      alert(`Could not save invoice type: ${(e as Error).message}`);
+    } finally {
+      setSavingInvoiceSlug(null);
+    }
+  }
   const [showClearHistoryModal, setShowClearHistoryModal] = useState(false);
   const [clearingHistory, setClearingHistory] = useState(false);
   const [clearHistoryFeedback, setClearHistoryFeedback] = useState<string | null>(null);
@@ -657,9 +784,12 @@ function AdminPage() {
       if (customerStatusFilter === "ordered" && onSheetQty <= 0) return false;
       if (customerStatusFilter === "pending" && onSheetQty > 0) return false;
       if (customerStatusFilter === "pinned" && !manualRegulars.includes(c.slug)) return false;
+      if (customerInvoiceFilter !== "all" && invoiceTypes[c.slug] !== customerInvoiceFilter) {
+        return false;
+      }
       return true;
     });
-  }, [search, customers, customerDriverFilter, customerStatusFilter, sheetQtyBySlug, manualRegulars]);
+  }, [search, customers, customerDriverFilter, customerStatusFilter, sheetQtyBySlug, manualRegulars, customerInvoiceFilter, invoiceTypes]);
 
   // Group submissions by created_at date (local) — same grouping as the
   // customer-facing HistoryModal, just across all customers.
@@ -846,7 +976,7 @@ function AdminPage() {
         </section>
 
         <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 w-fit flex-wrap print:hidden">
-          {(["customers", "manual", "print", "history", "analytics", "estimates", "stocks", "drivers"] as const).map((t) => (
+          {(["customers", "manual", "linked", "print", "kota", "history", "analytics", "estimates", "stocks", "drivers"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -858,8 +988,12 @@ function AdminPage() {
                 ? "Customers"
                 : t === "manual"
                 ? "⚡ Manual Orders"
+                : t === "linked"
+                ? "🔗 Linked Orders"
                 : t === "print"
                 ? "🖨️ Print Sheet"
+                : t === "kota"
+                ? "🔥 Kota Joe"
                 : t === "history"
                 ? "Order History"
                 : t === "analytics"
@@ -928,6 +1062,23 @@ function AdminPage() {
                   <option key={d} value={d}>{d}</option>
                 ))}
               </select>
+              <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 flex-wrap">
+                {([
+                  { id: "all", label: `All (${customers.length})` },
+                  { id: "printer", label: `🖨️ Printer (${Object.values(invoiceTypes).filter((v) => v === "printer").length})` },
+                  { id: "written", label: `✍️ Written (${Object.values(invoiceTypes).filter((v) => v === "written").length})` },
+                ] as const).map((f) => (
+                  <button
+                    key={f.id}
+                    onClick={() => setCustomerInvoiceFilter(f.id)}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold ${
+                      customerInvoiceFilter === f.id ? "bg-[#2a1810] text-white" : "text-[#6b5544] hover:bg-[#fdf8f1]"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <div className="bg-white rounded-2xl border border-[#e8dcc8] divide-y divide-[#e8dcc8] shadow-sm overflow-hidden">
@@ -968,6 +1119,43 @@ function AdminPage() {
                       </div>
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
+                      <div
+                        className="flex items-center rounded-lg border border-[#e8dcc8] overflow-hidden"
+                        title="How this customer gets their invoice — 🖨️ printed or ✍️ hand-written. Click to set / clear."
+                      >
+                        <button
+                          onClick={() =>
+                            void setInvoiceTypeFor(
+                              c.slug,
+                              invoiceTypes[c.slug] === "printer" ? null : "printer",
+                            )
+                          }
+                          disabled={savingInvoiceSlug === c.slug}
+                          className={`px-2 py-1.5 text-xs font-bold transition ${
+                            invoiceTypes[c.slug] === "printer"
+                              ? "bg-[#2a1810] text-white"
+                              : "text-[#8b6f4e] hover:bg-[#fdf8f1]"
+                          }`}
+                        >
+                          🖨️
+                        </button>
+                        <button
+                          onClick={() =>
+                            void setInvoiceTypeFor(
+                              c.slug,
+                              invoiceTypes[c.slug] === "written" ? null : "written",
+                            )
+                          }
+                          disabled={savingInvoiceSlug === c.slug}
+                          className={`px-2 py-1.5 text-xs font-bold transition border-l border-[#e8dcc8] ${
+                            invoiceTypes[c.slug] === "written"
+                              ? "bg-[#c8362b] text-white"
+                              : "text-[#8b6f4e] hover:bg-[#fdf8f1]"
+                          }`}
+                        >
+                          ✍️
+                        </button>
+                      </div>
                       <button
                         onClick={() => {
                           setManualSelectedSlug(c.slug);
@@ -1008,10 +1196,26 @@ function AdminPage() {
             onToggleManualRegular={toggleManualRegular}
             onCopyLink={copyCustomerLink}
             copiedSlug={copiedSlug}
+            linkedOrderInfo={linkedOrderInfo}
+            revealSlug={revealLinkedSlug}
+            onRevealHandled={() => setRevealLinkedSlug(null)}
+          />
+        )}
+
+        {tab === "linked" && (
+          <LinkedOrdersTab
+            linkedOrderInfo={linkedOrderInfo}
+            onEditInManual={(slug) => {
+              setRevealLinkedSlug(slug);
+              setManualSelectedSlug(slug);
+              setTab("manual");
+            }}
           />
         )}
 
         {tab === "print" && <PrintSheetTab />}
+
+        {tab === "kota" && <KotaJoeTab />}
 
         {tab === "history" && (
           <section className="space-y-4">
@@ -2305,6 +2509,466 @@ function NewCustomerPanel({
   );
 }
 
+// ============================================================================
+// LINKED ORDERS TAB — customers whose order came in from their own /order
+// link today. They are hidden from Manual Orders so that list only contains
+// the customers you still need to type in manually.
+// ============================================================================
+
+function LinkedOrdersTab({
+  linkedOrderInfo,
+  onEditInManual,
+}: {
+  linkedOrderInfo: LinkedOrderInfo;
+  onEditInManual: (slug: string) => void;
+}) {
+  const liveQuery = useQuery(liveSheetOrdersQuery);
+
+  const linkedCustomers = useMemo(() => {
+    const list = (liveQuery.data?.customers ?? []).filter((c) =>
+      isLinkedCustomer(c, linkedOrderInfo),
+    );
+    return [...list].sort((a, b) => a.name.localeCompare(b.name));
+  }, [liveQuery.data?.customers, linkedOrderInfo]);
+
+  // Linked submissions that aren't on the live sheet yet (sheet read lag)
+  const waitingForSheet = useMemo(() => {
+    const onSheet = new Set(linkedCustomers.map((c) => c.slug));
+    return Array.from(linkedOrderInfo.bySlug).filter((slug) => !onSheet.has(slug));
+  }, [linkedCustomers, linkedOrderInfo]);
+
+  const totalQty = useMemo(
+    () =>
+      Math.round(
+        linkedCustomers.reduce((sum, c) => sum + (c.totalQuantity > 0 ? c.totalQuantity : 0), 0) *
+          1000,
+      ) / 1000,
+    [linkedCustomers],
+  );
+
+  if (liveQuery.isLoading) {
+    return (
+      <section className="space-y-4">
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e]">
+          Loading linked orders…
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="space-y-4">
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm space-y-1.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="font-bold text-[#2a1810]">🔗 Linked Orders — came in from the customer links</h2>
+            <p className="text-xs text-[#8b6f4e] mt-0.5">
+              These customers submitted their own order today, so they are hidden from ⚡ Manual Orders
+              (toggle there if you ever need to edit one).
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-[#2a1810] text-white">
+              {linkedCustomers.length} customer{linkedCustomers.length === 1 ? "" : "s"}
+            </span>
+            <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
+              {fmtQty(totalQty)} items total
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                void liveQuery.refetch()
+              }
+              disabled={liveQuery.isFetching}
+              className="text-xs font-bold px-3 py-1.5 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1] transition"
+            >
+              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {linkedCustomers.length === 0 && waitingForSheet.length === 0 && (
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center">
+          <p className="text-sm font-semibold text-[#2a1810]">No linked orders yet today</p>
+          <p className="text-xs text-[#8b6f4e] mt-1">
+            As soon as a customer submits from their own order link, they appear here and disappear
+            from Manual Orders.
+          </p>
+        </div>
+      )}
+
+      <div className="grid gap-3 md:grid-cols-2">
+        {linkedCustomers.map((c) => {
+          const latest = linkedOrderInfo.latestBySlug.get(c.slug);
+          const tag = orderTypeTag(latest?.type);
+          const positiveRows = c.rows
+            .filter((r) => r.quantity > 0)
+            .sort((a, b) => a.productName.localeCompare(b.productName));
+          return (
+            <div key={c.slug} className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm p-4 space-y-2.5">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-bold text-[#2a1810] truncate">{c.name}</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${tag.className}`}>
+                      {tag.label}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-[#8b6f4e] mt-0.5">
+                    🚚 {c.driver}
+                    {latest?.at
+                      ? ` · submitted ${new Date(latest.at).toLocaleTimeString(undefined, {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}`
+                      : ""}
+                  </div>
+                </div>
+                <span className="text-sm font-black text-[#c8362b] whitespace-nowrap">
+                  {fmtQty(c.totalQuantity)} items
+                </span>
+              </div>
+
+              {positiveRows.length > 0 && (
+                <div className="bg-[#fdf8f1] rounded-xl border border-[#e8dcc8] divide-y divide-[#f0e7d8] max-h-56 overflow-y-auto">
+                  {positiveRows.map((r) => (
+                    <div key={r.sheetRow} className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                      <span className="text-xs font-medium truncate">{r.productName}</span>
+                      <span className="text-xs font-bold text-[#2a1810]">{fmtQty(r.quantity)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {c.comment && (
+                <p className="text-[11px] text-[#6b5544] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2.5 py-1.5">
+                  💬 {c.comment}
+                </p>
+              )}
+
+              <div className="flex items-center justify-end gap-1.5 pt-0.5">
+                <button
+                  type="button"
+                  onClick={() => onEditInManual(c.slug)}
+                  className="text-xs font-bold px-3 py-1.5 rounded-lg bg-[#c8362b]/10 text-[#c8362b] hover:bg-[#c8362b] hover:text-white transition"
+                  title="Show this customer in Manual Orders (even while linked ones are hidden)"
+                >
+                  ⚡ Edit in Manual
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {waitingForSheet.length > 0 && (
+        <div className="bg-amber-50 border border-amber-300 text-amber-900 rounded-2xl p-3 text-xs font-semibold">
+          {waitingForSheet.length} linked order{waitingForSheet.length === 1 ? "" : "s"} not on the live
+          sheet yet — hit Refresh in a moment.
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ============================================================================
+// KOTA JOE TAB — combined order for all Kota Joe stores (Alberton, Boksburg,
+// Pretoria, Roadhouse) from the live sheet, with a crate calculation
+// (14 kotas per crate) and print support.
+// ============================================================================
+
+const KOTAS_PER_CRATE = 14;
+
+function fmtQty(n: number): string {
+  const rounded = Math.round(n * 1000) / 1000;
+  return Number.isInteger(rounded) ? String(rounded) : String(rounded);
+}
+
+function KotaJoeTab() {
+  const liveQuery = useQuery(liveSheetOrdersQuery);
+
+  const stores = useMemo(() => {
+    return (liveQuery.data?.customers ?? [])
+      .filter((c) => c.name.toLowerCase().replace(/[^a-z0-9]/g, "").includes("kotajoe"))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [liveQuery.data?.customers]);
+
+  const storeShort = (name: string) => name.replace(/kota\s*joe\s*/i, "").trim() || name;
+
+  const productRows = useMemo(() => {
+    // productName (display) -> per-store qty keyed by store slug
+    const byKey = new Map<string, { name: string; qtyByStore: Map<string, number>; total: number }>();
+    for (const st of stores) {
+      for (const r of st.rows) {
+        if (!(r.quantity > 0)) continue;
+        const key = r.productName.trim().toLowerCase();
+        let entry = byKey.get(key);
+        if (!entry) {
+          entry = { name: r.productName, qtyByStore: new Map(), total: 0 };
+          byKey.set(key, entry);
+        }
+        entry.qtyByStore.set(st.slug, (entry.qtyByStore.get(st.slug) ?? 0) + r.quantity);
+        entry.total = Math.round((entry.total + r.quantity) * 1000) / 1000;
+      }
+    }
+    return Array.from(byKey.values()).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  }, [stores]);
+
+  const storeTotals = useMemo(() => {
+    return stores.map((st) => ({
+      slug: st.slug,
+      total: Math.round(st.rows.reduce((sum, r) => sum + (r.quantity > 0 ? r.quantity : 0), 0) * 1000) / 1000,
+    }));
+  }, [stores]);
+
+  const grandTotal = Math.round(storeTotals.reduce((a, b) => a + b.total, 0) * 1000) / 1000;
+
+  const kotaRow = productRows.find((r) => r.name.trim().toLowerCase() === "kota");
+  const totalKotas = kotaRow?.total ?? 0;
+  const fullCrates = Math.floor(Math.round(totalKotas * 1000) / 1000 / KOTAS_PER_CRATE);
+  const looseKotas =
+    Math.round((Math.round(totalKotas * 1000) / 1000 - fullCrates * KOTAS_PER_CRATE) * 1000) / 1000;
+  const cratesToTake = Math.ceil(Math.round(totalKotas * 1000) / 1000 / KOTAS_PER_CRATE);
+
+  if (liveQuery.isLoading) {
+    return (
+      <section className="space-y-4">
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e]">
+          Loading Kota Joe orders…
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="space-y-3 print:space-y-0">
+      <style>{`
+        @media print {
+          @page { size: A4 portrait; margin: 10mm; }
+          html, body, #root, main, section, div {
+            overflow: visible !important;
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+          }
+          *::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
+          body { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+        }
+      `}</style>
+
+      {/* Screen-only toolbar */}
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] p-3.5 shadow-sm space-y-2 print:hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="font-bold text-sm text-[#2a1810]">🔥 Kota Joe — Combined Order</h2>
+            <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
+              {liveQuery.data?.sheetLabel ?? ""} · {liveQuery.data?.forDate ?? ""}
+            </span>
+            <span className="text-xs text-[#8b6f4e]">
+              {stores.length} stores · {productRows.length} products · {fmtQty(grandTotal)} items
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void liveQuery.refetch()}
+              disabled={liveQuery.isFetching}
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1] transition"
+            >
+              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
+            </button>
+            <button
+              type="button"
+              onClick={() => window.print()}
+              disabled={productRows.length === 0}
+              className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
+            >
+              🖨️ Print Kota Joe List
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {stores.length === 0 ? (
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
+          <p className="text-sm font-semibold text-[#2a1810]">No Kota Joe stores found on the live sheet</p>
+          <p className="text-xs text-[#8b6f4e] mt-1">
+            Looked for customers whose name contains “Kota Joe”. Once they have their regular products
+            on the sheet they will show up here.
+          </p>
+        </div>
+      ) : productRows.length === 0 ? (
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
+          <p className="text-sm font-semibold text-[#2a1810]">No Kota Joe orders on today’s sheet yet</p>
+          <p className="text-xs text-[#8b6f4e] mt-1">
+            Quantities will appear here as soon as any Kota Joe store has items on the sheet.
+          </p>
+        </div>
+      ) : (
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden print:rounded-none print:border-0 print:shadow-none">
+          <div className="overflow-x-auto print:overflow-visible">
+            <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ background: "#dfe8f3" }}>
+                  <th
+                    style={{
+                      border: "1px solid #434343",
+                      padding: "6px 10px",
+                      textAlign: "left",
+                      fontSize: 14,
+                      fontWeight: 700,
+                    }}
+                  >
+                    PRODUCT
+                  </th>
+                  {stores.map((st) => (
+                    <th
+                      key={st.slug}
+                      style={{
+                        border: "1px solid #434343",
+                        padding: "6px 8px",
+                        textAlign: "center",
+                        fontSize: 14,
+                        fontWeight: 700,
+                      }}
+                    >
+                      {storeShort(st.name)}
+                    </th>
+                  ))}
+                  <th
+                    style={{
+                      border: "1px solid #434343",
+                      padding: "6px 8px",
+                      textAlign: "center",
+                      fontSize: 14,
+                      fontWeight: 700,
+                      background: "#c8362b",
+                      color: "#fff",
+                    }}
+                  >
+                    TOTAL
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {productRows.map((r) => (
+                  <tr key={r.name}>
+                    <td
+                      style={{
+                        border: "1px solid #434343",
+                        padding: "5px 10px",
+                        fontSize: 14,
+                        fontWeight: r.name.trim().toLowerCase() === "kota" ? 700 : 400,
+                      }}
+                    >
+                      {r.name}
+                    </td>
+                    {stores.map((st) => {
+                      const q = r.qtyByStore.get(st.slug) ?? 0;
+                      return (
+                        <td
+                          key={st.slug}
+                          style={{
+                            border: "1px solid #434343",
+                            padding: "5px 8px",
+                            textAlign: "center",
+                            fontSize: 14,
+                            color: q > 0 ? "#000" : "#b9b9b9",
+                          }}
+                        >
+                          {q > 0 ? fmtQty(q) : "–"}
+                        </td>
+                      );
+                    })}
+                    <td
+                      style={{
+                        border: "1px solid #434343",
+                        padding: "5px 8px",
+                        textAlign: "center",
+                        fontSize: 14,
+                        fontWeight: 700,
+                        background: "#fdf3f2",
+                      }}
+                    >
+                      {fmtQty(r.total)}
+                    </td>
+                  </tr>
+                ))}
+                <tr style={{ background: "#dfe8f3" }}>
+                  <td style={{ border: "1px solid #434343", padding: "6px 10px", fontSize: 14, fontWeight: 700 }}>
+                    SUBTOTAL
+                  </td>
+                  {storeTotals.map((st) => (
+                    <td
+                      key={st.slug}
+                      style={{
+                        border: "1px solid #434343",
+                        padding: "6px 8px",
+                        textAlign: "center",
+                        fontSize: 14,
+                        fontWeight: 700,
+                      }}
+                    >
+                      {fmtQty(st.total)}
+                    </td>
+                  ))}
+                  <td
+                    style={{
+                      border: "1px solid #434343",
+                      padding: "6px 8px",
+                      textAlign: "center",
+                      fontSize: 15,
+                      fontWeight: 900,
+                      background: "#c8362b",
+                      color: "#fff",
+                    }}
+                  >
+                    {fmtQty(grandTotal)}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          {/* Crates section */}
+          <div
+            className="p-4 space-y-1"
+            style={{ background: "#dfe8f3", borderTop: "2px solid #434343" }}
+          >
+            <div
+              style={{
+                fontSize: 16,
+                fontWeight: 900,
+                color: "#2a1810",
+                textTransform: "uppercase",
+                letterSpacing: 0.5,
+              }}
+            >
+              🧺 Crates to take for the Kotas ({KOTAS_PER_CRATE} kotas per crate)
+            </div>
+            {totalKotas > 0 ? (
+              <>
+                <div style={{ fontSize: 15, fontWeight: 700, color: "#c8362b" }}>
+                  {fmtQty(totalKotas)} kotas → take {fmtQty(cratesToTake)} crate
+                  {cratesToTake === 1 ? "" : "s"}
+                </div>
+                <div style={{ fontSize: 13, color: "#434343" }}>
+                  {fmtQty(fullCrates)} full crate{fullCrates === 1 ? "" : "s"}
+                  {looseKotas > 0 ? ` + ${fmtQty(looseKotas)} kota${looseKotas === 1 ? "" : "s"} extra` : " exactly"}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize: 13, color: "#434343" }}>
+                No KOTAs on today’s sheet — nothing to pack.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function ManualOrdersTab({
   selectedSlug,
   onSelectSlug,
@@ -2312,6 +2976,9 @@ function ManualOrdersTab({
   onToggleManualRegular,
   onCopyLink,
   copiedSlug,
+  linkedOrderInfo,
+  revealSlug,
+  onRevealHandled,
 }: {
   selectedSlug: string | null;
   onSelectSlug: (slug: string) => void;
@@ -2319,6 +2986,9 @@ function ManualOrdersTab({
   onToggleManualRegular: (slug: string) => void;
   onCopyLink: (slug: string) => void;
   copiedSlug: string | null;
+  linkedOrderInfo: LinkedOrderInfo;
+  revealSlug: string | null;
+  onRevealHandled: () => void;
 }) {
   const qc = useQueryClient();
   const liveQuery = useQuery(liveSheetOrdersQuery);
@@ -2328,6 +2998,10 @@ function ManualOrdersTab({
   const [statusFilter, setStatusFilter] = useState<"all" | "pinned" | "pending" | "ordered">("all");
   const [driverFilter, setDriverFilter] = useState("__all__");
   const [showNewCustomer, setShowNewCustomer] = useState(false);
+  // Customers whose order already came in via their own link are hidden from
+  // this list by default (they live on the Linked Orders tab). Toggle off to
+  // still edit one of them here.
+  const [hideLinked, setHideLinked] = useState(true);
 
   const [entryMode, setEntryMode] = useState<"set" | "addon">("set");
   const [qty, setQty] = useState<Record<string, number>>({});
@@ -2360,9 +3034,15 @@ function ManualOrdersTab({
       if (statusFilter === "pinned" && !manualRegulars.includes(c.slug)) return false;
       if (statusFilter === "pending" && c.totalQuantity > 0) return false;
       if (statusFilter === "ordered" && c.totalQuantity <= 0) return false;
+      if (hideLinked && c.slug !== revealSlug && isLinkedCustomer(c, linkedOrderInfo)) return false;
       return true;
     });
-  }, [customers, customerSearch, driverFilter, statusFilter, manualRegulars]);
+  }, [customers, customerSearch, driverFilter, statusFilter, manualRegulars, hideLinked, revealSlug, linkedOrderInfo]);
+
+  const linkedOnSheetCount = useMemo(
+    () => customers.filter((c) => isLinkedCustomer(c, linkedOrderInfo)).length,
+    [customers, linkedOrderInfo],
+  );
 
   // Default to first customer in list if none selected yet
   useEffect(() => {
@@ -2370,6 +3050,20 @@ function ManualOrdersTab({
       onSelectSlug(filteredCustomers[0].slug);
     }
   }, [selectedSlug, filteredCustomers, onSelectSlug]);
+
+  // "Edit in Manual" from the Linked Orders tab: select that customer and keep
+  // them visible in the list (even while linked customers are hidden) until
+  // the admin moves on to a different customer.
+  useEffect(() => {
+    if (revealSlug && customers.some((c) => c.slug === revealSlug)) {
+      onSelectSlug(revealSlug);
+    }
+  }, [revealSlug, customers, onSelectSlug]);
+  useEffect(() => {
+    if (revealSlug && selectedSlug && selectedSlug !== revealSlug) {
+      onRevealHandled();
+    }
+  }, [revealSlug, selectedSlug, onRevealHandled]);
 
   const selectedCustomer: LiveSheetCustomerOrder | null = useMemo(
     () => customers.find((c) => c.slug === selectedSlug) ?? null,
@@ -2749,6 +3443,23 @@ function ManualOrdersTab({
                   </button>
                 ))}
               </div>
+
+              {linkedOnSheetCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setHideLinked((v) => !v)}
+                  className={`w-full text-left text-[11px] font-bold px-2.5 py-1.5 rounded-xl border transition ${
+                    hideLinked
+                      ? "bg-[#2a1810] text-white border-[#2a1810]"
+                      : "bg-white border-[#2a1810] text-[#2a1810] hover:bg-[#fdf8f1]"
+                  }`}
+                  title="Customers whose order already came in from their own link are hidden here and shown on the Linked Orders tab"
+                >
+                  🔗 {hideLinked ? "Hiding" : "Showing"} {linkedOnSheetCount} linked order
+                  {linkedOnSheetCount === 1 ? "" : "s"} — view them on the Linked Orders tab
+                  {hideLinked ? "" : " (click to hide again)"}
+                </button>
+              )}
 
               <div className="flex items-center gap-1.5">
                 <select
@@ -3424,6 +4135,11 @@ function PrintSheetTab() {
   const [driverFilter, setDriverFilter] = useState("__all__");
   const [groupByDriver, setGroupByDriver] = useState(true);
   const [viewFilter, setViewFilter] = useState<"to_print" | "all_highlight" | "printed_only">("to_print");
+  // 🖨️ Printer vs ✍️ Written invoice filter — lets you print only the
+  // customers that get printed invoices (the written ones are done by hand).
+  const [invoiceFilter, setInvoiceFilter] = useState<"all" | "printer" | "written">("all");
+  const invoiceTypesQ = useQuery(invoiceTypesQuery);
+  const invoiceTypes = invoiceTypesQ.data ?? {};
   const [showCustomize, setShowCustomize] = useState(false);
   const [showLayoutControls, setShowLayoutControls] = useState(true);
   const [customizeSearch, setCustomizeSearch] = useState("");
@@ -3790,7 +4506,9 @@ function PrintSheetTab() {
         : viewFilter === "printed_only"
         ? printedCleanCustomers
         : activeCustomers;
-    return pool.filter((c) => modeForCustomer(c.name) !== "hidden");
+    const invoiceFiltered =
+      invoiceFilter === "all" ? pool : pool.filter((c) => invoiceTypes[c.slug] === invoiceFilter);
+    return invoiceFiltered.filter((c) => modeForCustomer(c.name) !== "hidden");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     viewFilter,
@@ -3798,7 +4516,18 @@ function PrintSheetTab() {
     printedCleanCustomers,
     activeCustomers,
     customModes,
+    invoiceFilter,
+    invoiceTypes,
   ]);
+
+  const printerCount = useMemo(
+    () => activeCustomers.filter((c) => invoiceTypes[c.slug] === "printer").length,
+    [activeCustomers, invoiceTypes],
+  );
+  const writtenCount = useMemo(
+    () => activeCustomers.filter((c) => invoiceTypes[c.slug] === "written").length,
+    [activeCustomers, invoiceTypes],
+  );
 
   function buildUpdatedSnapshotsForList(
     custList: LiveSheetCustomerOrder[],
@@ -4207,6 +4936,32 @@ function PrintSheetTab() {
                 </option>
               ))}
             </select>
+
+            <div className="flex gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1">
+              {([
+                { id: "all", label: `All (${activeCustomers.length})` },
+                { id: "printer", label: `🖨️ Printer (${printerCount})` },
+                { id: "written", label: `✍️ Written (${writtenCount})` },
+              ] as const).map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setInvoiceFilter(f.id)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-bold transition ${
+                    invoiceFilter === f.id ? "bg-[#2a1810] text-white" : "text-[#6b5544]"
+                  }`}
+                  title={
+                    f.id === "printer"
+                      ? "Only customers marked 🖨️ Printer in the Customers tab"
+                      : f.id === "written"
+                      ? "Only customers marked ✍️ Written in the Customers tab"
+                      : "Show every customer"
+                  }
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
 
             <label className="flex items-center gap-1.5 text-xs font-semibold text-[#6b5544] px-2.5 py-1 rounded-xl border border-[#e8dcc8] bg-[#fdf8f1] cursor-pointer">
               <input
