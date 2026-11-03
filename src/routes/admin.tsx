@@ -2709,6 +2709,24 @@ function LinkedOrdersTab({
 // snapshot so QUANTITY = new since your last print and SUBTOTAL = full total.
 // ============================================================================
 
+// Persisted layout for the Production Lists (columns, font, margins, subtotal
+// toggle) — same idea as the Print Sheet layout controls.
+const PRODUCTION_LAYOUT_KEY = "bakery_production_lists_layout_v1";
+type ProductionListLayout = {
+  colWidths: [number, number, number]; // product | quantity | subtotal
+  fontSizePx: number;
+  marginTopBottomMm: number;
+  marginLeftRightMm: number;
+  showSubtotal: boolean;
+};
+const DEFAULT_PRODUCTION_LAYOUT: ProductionListLayout = {
+  colWidths: [340, 110, 120],
+  fontSizePx: 14,
+  marginTopBottomMm: 10,
+  marginLeftRightMm: 10,
+  showSubtotal: true,
+};
+
 function ProductionListsTab() {
   const qc = useQueryClient();
   const liveQuery = useQuery(liveSheetOrdersQuery);
@@ -2717,6 +2735,63 @@ function ProductionListsTab() {
 
   const [subView, setSubView] = useState<"freezer" | "bakery">("freezer");
   const [savingSnapshot, setSavingSnapshot] = useState(false);
+
+  const [layout, setLayout] = useState<ProductionListLayout>(() => {
+    if (typeof window === "undefined") return DEFAULT_PRODUCTION_LAYOUT;
+    try {
+      const raw = localStorage.getItem(PRODUCTION_LAYOUT_KEY);
+      if (!raw) return DEFAULT_PRODUCTION_LAYOUT;
+      const parsed = JSON.parse(raw) as Partial<ProductionListLayout>;
+      return {
+        ...DEFAULT_PRODUCTION_LAYOUT,
+        ...parsed,
+        showSubtotal: typeof parsed.showSubtotal === "boolean" ? parsed.showSubtotal : true,
+        colWidths:
+          Array.isArray(parsed.colWidths) && parsed.colWidths.length === 3
+            ? (parsed.colWidths as [number, number, number])
+            : DEFAULT_PRODUCTION_LAYOUT.colWidths,
+      };
+    } catch {
+      return DEFAULT_PRODUCTION_LAYOUT;
+    }
+  });
+
+  function updateLayout(patch: Partial<ProductionListLayout>) {
+    setLayout((prev) => {
+      const next = { ...prev, ...patch };
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem(PRODUCTION_LAYOUT_KEY, JSON.stringify(next));
+        } catch {}
+      }
+      return next;
+    });
+  }
+
+  function setColWidth(colIdx: number, rawPx: number) {
+    const minPx = colIdx === 0 ? 80 : 36;
+    const maxPx = colIdx === 0 ? 900 : 300;
+    const clamped = Math.max(minPx, Math.min(maxPx, Math.round(rawPx)));
+    const nextCols = [...layout.colWidths] as [number, number, number];
+    nextCols[colIdx] = clamped;
+    updateLayout({ colWidths: nextCols });
+  }
+
+  function startColResize(colIdx: number, e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = layout.colWidths[colIdx];
+    const onMove = (ev: MouseEvent) => {
+      setColWidth(colIdx, startW + (ev.clientX - startX));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
 
   const customers = liveQuery.data?.customers ?? [];
   const forDate = liveQuery.data?.forDate ?? "";
@@ -2748,8 +2823,10 @@ function ProductionListsTab() {
   const isFreezerProduct = (name: string) =>
     categoryByLower.get(name.trim().toLowerCase()) === "FREEZER";
 
-  const freezerSnapshot = useMemo(() => {
-    return freezerStateQ.data?.printedByDate?.[forDate] ?? {};
+  const snapshots = useMemo(() => {
+    return (
+      freezerStateQ.data?.printedByDate?.[forDate] ?? { freezer: {}, bakery: {} }
+    );
   }, [freezerStateQ.data, forDate]);
 
   type Row = { name: string; total: number; sincePrint: number };
@@ -2758,39 +2835,46 @@ function ProductionListsTab() {
     for (const [name, total] of productTotals) {
       if (!isFreezerProduct(name)) continue;
       if (!(total > 0)) continue;
-      const printed = freezerSnapshot[name.trim().toLowerCase()] ?? 0;
+      const printed = snapshots.freezer[name.trim().toLowerCase()] ?? 0;
       const sincePrint = Math.max(0, Math.round((total - printed) * 1000) / 1000);
       rows.push({ name, total, sincePrint });
     }
     return rows.sort((a, b) => a.name.localeCompare(b.name));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [productTotals, categoryByLower, freezerSnapshot]);
+  }, [productTotals, categoryByLower, snapshots]);
 
   const bakeryRows = useMemo(() => {
     const rows: Row[] = [];
     for (const [name, total] of productTotals) {
       if (isFreezerProduct(name)) continue;
       if (!(total > 0)) continue;
-      rows.push({ name, total, sincePrint: 0 });
+      const printed = snapshots.bakery[name.trim().toLowerCase()] ?? 0;
+      const sincePrint = Math.max(0, Math.round((total - printed) * 1000) / 1000);
+      rows.push({ name, total, sincePrint });
     }
     return rows.sort((a, b) => a.name.localeCompare(b.name));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [productTotals, categoryByLower]);
+  }, [productTotals, categoryByLower, snapshots]);
 
-  const freezerNewCount = freezerRows.filter((r) => r.sincePrint > 0).length;
-  const freezerTotQty = Math.round(freezerRows.reduce((a, b) => a + b.sincePrint, 0) * 1000) / 1000;
-  const freezerTotSub = Math.round(freezerRows.reduce((a, b) => a + b.total, 0) * 1000) / 1000;
-  const bakeryTotSub = Math.round(bakeryRows.reduce((a, b) => a + b.total, 0) * 1000) / 1000;
+  const rows = subView === "freezer" ? freezerRows : bakeryRows;
+  const newCount = rows.filter((r) => r.sincePrint > 0).length;
+  const totQty = Math.round(rows.reduce((a, b) => a + b.sincePrint, 0) * 1000) / 1000;
+  const totSub = Math.round(rows.reduce((a, b) => a + b.total, 0) * 1000) / 1000;
 
-  async function persistFreezerSnapshot() {
+  async function persistPrintSnapshot() {
     if (!forDate) return;
     const totals: Record<string, number> = {};
     for (const [name, total] of productTotals) {
-      if (isFreezerProduct(name) && total > 0) totals[name.trim().toLowerCase()] = total;
+      if (!(total > 0)) continue;
+      if (subView === "freezer" ? isFreezerProduct(name) : !isFreezerProduct(name)) {
+        totals[name.trim().toLowerCase()] = total;
+      }
     }
     setSavingSnapshot(true);
     try {
-      await saveFreezerListState({ data: { forDate, printedTotals: totals } });
+      await saveFreezerListState({
+        data: { forDate, list: subView, printedTotals: totals },
+      });
       await qc.invalidateQueries({ queryKey: ["freezer-list-state"] });
     } catch {
       // non-fatal — the list still prints
@@ -2799,23 +2883,23 @@ function ProductionListsTab() {
     }
   }
 
-  async function handlePrintFreezer() {
+  async function handlePrint() {
     // Save the snapshot FIRST so even a refresh right after printing keeps it
-    await persistFreezerSnapshot();
+    await persistPrintSnapshot();
     window.print();
   }
 
-  async function resetFreezerSnapshot() {
+  async function resetPrintSnapshot() {
     if (
       !window.confirm(
-        "Reset today's printed snapshot? QUANTITY will show the full totals again as if never printed.",
+        `Reset today's printed ${subView === "freezer" ? "Freezer" : "Bakery"} list? QUANTITY will show the full totals again as if never printed.`,
       )
     )
       return;
     if (!forDate) return;
     setSavingSnapshot(true);
     try {
-      await saveFreezerListState({ data: { forDate, printedTotals: {} } });
+      await saveFreezerListState({ data: { forDate, list: subView, printedTotals: {} } });
       await qc.invalidateQueries({ queryKey: ["freezer-list-state"] });
     } catch {
       // non-fatal
@@ -2824,12 +2908,12 @@ function ProductionListsTab() {
     }
   }
 
-  // Ctrl+P / Cmd+P on the Freezer view also saves the snapshot, so the
-  // QUANTITY column resets no matter how you print.
+  // Ctrl+P / Cmd+P also saves the snapshot of whichever list is on screen, so
+  // the QUANTITY column resets no matter how you print.
   useEffect(() => {
-    if (typeof window === "undefined" || subView !== "freezer") return;
+    if (typeof window === "undefined") return;
     const onBeforePrint = () => {
-      void persistFreezerSnapshot();
+      void persistPrintSnapshot();
     };
     window.addEventListener("beforeprint", onBeforePrint);
     return () => window.removeEventListener("beforeprint", onBeforePrint);
@@ -2846,23 +2930,47 @@ function ProductionListsTab() {
     );
   }
 
+  const fontSize = layout.fontSizePx;
   const thStyle: React.CSSProperties = {
     border: "1px solid #434343",
-    padding: "6px 10px",
-    fontSize: 14,
+    padding: "6px 8px",
+    fontSize,
     fontWeight: 700,
+    position: "relative",
   };
   const tdStyle: React.CSSProperties = {
     border: "1px solid #434343",
-    padding: "5px 10px",
-    fontSize: 14,
+    padding: "5px 8px",
+    fontSize,
+    wordBreak: "break-word",
   };
+  const visibleCols = layout.showSubtotal ? layout.colWidths : [layout.colWidths[0], layout.colWidths[1]];
+  const tableWidthPx = visibleCols.reduce((s, w) => s + w, 0);
+
+  const ResizableTh = ({
+    colIdx,
+    label,
+    align,
+  }: {
+    colIdx: number;
+    label: string;
+    align: "left" | "center";
+  }) => (
+    <th style={{ ...thStyle, textAlign: align, width: visibleCols[colIdx] }}>
+      {label}
+      <span
+        onMouseDown={(e) => startColResize(colIdx, e)}
+        className="print:hidden absolute right-0 top-0 h-full w-2 cursor-col-resize bg-transparent hover:bg-[#c8362b]/50"
+        title="Drag to resize this column"
+      />
+    </th>
+  );
 
   return (
     <section className="space-y-3 print:space-y-0">
       <style>{`
         @media print {
-          @page { size: A4 portrait; margin: 10mm; }
+          @page { size: A4 portrait; margin: ${layout.marginTopBottomMm}mm ${layout.marginLeftRightMm}mm; }
           html, body, #root, main, section, div {
             overflow: visible !important;
             scrollbar-width: none !important;
@@ -2881,15 +2989,10 @@ function ProductionListsTab() {
             <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
               {liveQuery.data?.sheetLabel ?? ""} · {forDate || "…"}
             </span>
-            {subView === "freezer" ? (
-              <span className="text-xs text-[#8b6f4e]">
-                {freezerRows.length} products · {freezerNewCount} new since last print · Q {fmtQty(freezerTotQty)} / Subtotal {fmtQty(freezerTotSub)}
-              </span>
-            ) : (
-              <span className="text-xs text-[#8b6f4e]">
-                {bakeryRows.length} products · Subtotal {fmtQty(bakeryTotSub)}
-              </span>
-            )}
+            <span className="text-xs text-[#8b6f4e]">
+              {rows.length} products · {newCount} new since last print · Q {fmtQty(totQty)}
+              {layout.showSubtotal ? ` / Subtotal ${fmtQty(totSub)}` : ""}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -2900,36 +3003,23 @@ function ProductionListsTab() {
             >
               {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
             </button>
-            {subView === "freezer" ? (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void resetFreezerSnapshot()}
-                  disabled={savingSnapshot}
-                  className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1] transition"
-                  title="Make QUANTITY show the full totals again (as if you never printed today)"
-                >
-                  ↺ Reset Print
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handlePrintFreezer()}
-                  disabled={freezerRows.length === 0}
-                  className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
-                >
-                  🖨️ Print Freezer List
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={() => window.print()}
-                disabled={bakeryRows.length === 0}
-                className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
-              >
-                🖨️ Print Bakery List
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => void resetPrintSnapshot()}
+              disabled={savingSnapshot}
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1] transition"
+              title="Make QUANTITY show the full totals again (as if you never printed today)"
+            >
+              ↺ Reset Print
+            </button>
+            <button
+              type="button"
+              onClick={() => void handlePrint()}
+              disabled={rows.length === 0}
+              className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
+            >
+              🖨️ Print {subView === "freezer" ? "Freezer" : "Bakery"} List
+            </button>
           </div>
         </div>
 
@@ -2951,100 +3041,162 @@ function ProductionListsTab() {
           ))}
         </div>
 
-        {subView === "freezer" && (
-          <p className="text-[11px] text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2.5 py-1.5">
-            <strong>QUANTITY</strong> = new since your last print (prints save the snapshot) ·{" "}
-            <strong>SUBTOTAL</strong> = full total on the sheet · zero rows hidden ·{" "}
-            {freezerNewCount > 0
-              ? `🔴 ${freezerNewCount} product${freezerNewCount === 1 ? "" : "s"} got new orders since the last print`
-              : "nothing new since the last print"}
-          </p>
-        )}
+        {/* Layout controls: subtotal toggle, font size, margins, reset */}
+        <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-[#e8dcc8]">
+          <button
+            type="button"
+            onClick={() => updateLayout({ showSubtotal: !layout.showSubtotal })}
+            className={`text-xs font-bold px-3 py-1.5 rounded-xl border transition ${
+              layout.showSubtotal
+                ? "bg-[#2a1810] text-white border-[#2a1810]"
+                : "bg-white border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1]"
+            }`}
+            title="Show or hide the SUBTOTAL column (prints and screen)"
+          >
+            {layout.showSubtotal ? "✓ Subtotal shown" : "Subtotal hidden"}
+          </button>
+
+          <div className="flex items-center gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-1.5 py-1">
+            <span className="text-[11px] font-bold text-[#6b5544]">Font</span>
+            <button
+              type="button"
+              onClick={() => updateLayout({ fontSizePx: Math.max(10, layout.fontSizePx - 1) })}
+              className="w-6 h-6 rounded-lg bg-white border border-[#e8dcc8] font-bold text-xs"
+            >
+              −
+            </button>
+            <span className="text-xs font-bold w-7 text-center">{fontSize}px</span>
+            <button
+              type="button"
+              onClick={() => updateLayout({ fontSizePx: Math.min(26, layout.fontSizePx + 1) })}
+              className="w-6 h-6 rounded-lg bg-white border border-[#e8dcc8] font-bold text-xs"
+            >
+              +
+            </button>
+          </div>
+
+          <label className="flex items-center gap-1 text-[11px] font-bold text-[#6b5544] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2 py-1">
+            <span title="Top & bottom print margins">↕ margins</span>
+            <input
+              type="number"
+              min={0}
+              max={40}
+              value={layout.marginTopBottomMm}
+              onChange={(e) =>
+                updateLayout({
+                  marginTopBottomMm: Math.max(0, Math.min(40, Number(e.target.value) || 0)),
+                })
+              }
+              className="w-12 text-xs font-bold text-[#2a1810] bg-transparent focus:outline-none"
+            />
+            <span>mm</span>
+          </label>
+          <label className="flex items-center gap-1 text-[11px] font-bold text-[#6b5544] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2 py-1">
+            <span title="Left & right print margins">↔ margins</span>
+            <input
+              type="number"
+              min={0}
+              max={40}
+              value={layout.marginLeftRightMm}
+              onChange={(e) =>
+                updateLayout({
+                  marginLeftRightMm: Math.max(0, Math.min(40, Number(e.target.value) || 0)),
+                })
+              }
+              className="w-12 text-xs font-bold text-[#2a1810] bg-transparent focus:outline-none"
+            />
+            <span>mm</span>
+          </label>
+
+          <button
+            type="button"
+            onClick={() => {
+              if (window.confirm("Reset the layout (column widths, font, margins) back to default?"))
+                updateLayout({ ...DEFAULT_PRODUCTION_LAYOUT, showSubtotal: layout.showSubtotal });
+            }}
+            className="text-xs font-semibold px-3 py-1.5 rounded-xl border border-[#e8dcc8] text-[#8b6f4e] hover:bg-[#fdf8f1] transition"
+            title="Reset column widths, font size and margins to default"
+          >
+            ↺ Reset layout
+          </button>
+
+          <span className="text-[11px] text-[#8b6f4e]">
+            💡 drag the right edge of any column header to resize it
+          </span>
+        </div>
+
+        <p className="text-[11px] text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2.5 py-1.5">
+          <strong>QUANTITY</strong> = new since your last print (printing saves it) ·{" "}
+          <strong>SUBTOTAL</strong> = full total on the sheet · zero rows hidden ·{" "}
+          {newCount > 0
+            ? `🔴 ${newCount} product${newCount === 1 ? "" : "s"} got new orders since the last print`
+            : "nothing new since the last print"}
+        </p>
       </div>
 
-      {subView === "freezer" ? (
-        freezerRows.length === 0 ? (
-          <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
-            <p className="text-sm font-semibold text-[#2a1810]">No freezer products ordered yet</p>
-            <p className="text-xs text-[#8b6f4e] mt-1">
-              As soon as a freezer product has a quantity on the sheet it appears here.
-            </p>
-          </div>
-        ) : (
-          <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden print:rounded-none print:border-0 print:shadow-none">
-            <div className="overflow-x-auto print:overflow-visible">
-              <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
-                <thead>
-                  <tr style={{ background: "#dfe8f3" }}>
-                    <th style={{ ...thStyle, textAlign: "left" }}>PRODUCT NAME FOR FREEZER</th>
-                    <th style={{ ...thStyle, textAlign: "center", width: 90 }}>QUANTITY</th>
-                    <th style={{ ...thStyle, textAlign: "center", width: 100 }}>SUBTOTAL</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {freezerRows.map((r) => (
-                    <tr key={r.name} style={r.sincePrint > 0 ? { background: "#fdecea" } : undefined}>
-                      <td style={tdStyle}>{r.name}</td>
-                      <td
-                        style={{
-                          ...tdStyle,
-                          textAlign: "center",
-                          fontWeight: r.sincePrint > 0 ? 700 : 400,
-                          color: r.sincePrint > 0 ? "#c8362b" : "#000",
-                        }}
-                      >
-                        {fmtQty(r.sincePrint)}
-                      </td>
-                      <td style={{ ...tdStyle, textAlign: "center", fontWeight: 700 }}>
-                        {fmtQty(r.total)}
-                      </td>
-                    </tr>
-                  ))}
-                  <tr style={{ background: "#dfe8f3" }}>
-                    <td style={{ ...tdStyle, fontWeight: 700 }}>TOTAL</td>
-                    <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: 15 }}>
-                      {fmtQty(freezerTotQty)}
-                    </td>
-                    <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: 15 }}>
-                      {fmtQty(freezerTotSub)}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )
-      ) : bakeryRows.length === 0 ? (
+      {rows.length === 0 ? (
         <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
-          <p className="text-sm font-semibold text-[#2a1810]">No bakery products ordered yet</p>
+          <p className="text-sm font-semibold text-[#2a1810]">
+            No {subView === "freezer" ? "freezer" : "bakery"} products ordered yet
+          </p>
           <p className="text-xs text-[#8b6f4e] mt-1">
-            As soon as a bakery product has a quantity on the sheet it appears here.
+            As soon as a product has a quantity on the sheet it appears here.
           </p>
         </div>
       ) : (
         <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden print:rounded-none print:border-0 print:shadow-none">
           <div className="overflow-x-auto print:overflow-visible">
-            <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
+            <table
+              className="text-sm"
+              style={{ borderCollapse: "collapse", tableLayout: "fixed", width: tableWidthPx }}
+            >
+              <colgroup>
+                <col style={{ width: visibleCols[0] }} />
+                <col style={{ width: visibleCols[1] }} />
+                {layout.showSubtotal && <col style={{ width: visibleCols[2] }} />}
+              </colgroup>
               <thead>
                 <tr style={{ background: "#dfe8f3" }}>
-                  <th style={{ ...thStyle, textAlign: "left" }}>PRODUCT</th>
-                  <th style={{ ...thStyle, textAlign: "center", width: 110 }}>SUBTOTAL</th>
+                  <ResizableTh
+                    colIdx={0}
+                    label={subView === "freezer" ? "PRODUCT NAME FOR FREEZER" : "PRODUCT"}
+                    align="left"
+                  />
+                  <ResizableTh colIdx={1} label="QUANTITY" align="center" />
+                  {layout.showSubtotal && <ResizableTh colIdx={2} label="SUBTOTAL" align="center" />}
                 </tr>
               </thead>
               <tbody>
-                {bakeryRows.map((r) => (
-                  <tr key={r.name}>
+                {rows.map((r) => (
+                  <tr key={r.name} style={r.sincePrint > 0 ? { background: "#fdecea" } : undefined}>
                     <td style={tdStyle}>{r.name}</td>
-                    <td style={{ ...tdStyle, textAlign: "center", fontWeight: 700 }}>
-                      {fmtQty(r.total)}
+                    <td
+                      style={{
+                        ...tdStyle,
+                        textAlign: "center",
+                        fontWeight: r.sincePrint > 0 ? 700 : 400,
+                        color: r.sincePrint > 0 ? "#c8362b" : "#000",
+                      }}
+                    >
+                      {fmtQty(r.sincePrint)}
                     </td>
+                    {layout.showSubtotal && (
+                      <td style={{ ...tdStyle, textAlign: "center", fontWeight: 700 }}>
+                        {fmtQty(r.total)}
+                      </td>
+                    )}
                   </tr>
                 ))}
                 <tr style={{ background: "#dfe8f3" }}>
                   <td style={{ ...tdStyle, fontWeight: 700 }}>TOTAL</td>
-                  <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: 15 }}>
-                    {fmtQty(bakeryTotSub)}
+                  <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: fontSize + 1 }}>
+                    {fmtQty(totQty)}
                   </td>
+                  {layout.showSubtotal && (
+                    <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: fontSize + 1 }}>
+                      {fmtQty(totSub)}
+                    </td>
+                  )}
                 </tr>
               </tbody>
             </table>

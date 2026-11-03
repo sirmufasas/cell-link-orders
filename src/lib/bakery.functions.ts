@@ -1919,17 +1919,41 @@ export const setCustomerInvoiceType = createServerFn({ method: "POST" })
     return current;
   });
 
-// ============================== FREEZER LIST STATE ==============================
-// Snapshot of the per-product FREEZER totals at the moment the Freezer List
-// was printed, keyed by delivery date. Lets the Freezer List show
+// ============================== PRODUCTION LIST STATE ==============================
+// Snapshots of the per-product totals at the moment each Production list
+// (Freezer / Bakery) was printed, keyed by delivery date. Lets the lists show
 // QUANTITY = new since your last print, and SUBTOTAL = full current total.
 // Same sheet_groups JSON pattern as the print-sheet state / invoice types.
 const FREEZER_STATE_SLUG = "__freezer_list_state_v1__";
 
+export type ProductionListSnapshots = {
+  freezer: Record<string, number>;
+  bakery: Record<string, number>;
+};
+
 export type PersistedFreezerListState = {
   updatedAt: string;
-  printedByDate: Record<string, Record<string, number>>;
+  printedByDate: Record<string, ProductionListSnapshots>;
 };
+
+// The very first deployed shape stored a FLAT Record<productName, number>
+// (freezer only). Migrate those entries to the per-list shape.
+function normalizeSnapshots(raw: unknown): ProductionListSnapshots {
+  const pick = (x: unknown) => {
+    const out: Record<string, number> = {};
+    if (x && typeof x === "object") {
+      for (const [k, v] of Object.entries(x as Record<string, unknown>)) {
+        if (typeof v === "number") out[k] = v;
+      }
+    }
+    return out;
+  };
+  if (raw && typeof raw === "object" && !("freezer" in raw) && !("bakery" in raw)) {
+    return { freezer: pick(raw), bakery: {} };
+  }
+  const obj = (raw ?? {}) as { freezer?: unknown; bakery?: unknown };
+  return { freezer: pick(obj.freezer), bakery: pick(obj.bakery) };
+}
 
 async function readServerFreezerListState(): Promise<PersistedFreezerListState> {
   try {
@@ -1940,10 +1964,16 @@ async function readServerFreezerListState(): Promise<PersistedFreezerListState> 
       .eq("slug", FREEZER_STATE_SLUG)
       .maybeSingle();
     if (data?.name) {
-      const parsed = JSON.parse(data.name) as Partial<PersistedFreezerListState>;
+      const parsed = JSON.parse(data.name) as Partial<PersistedFreezerListState> & {
+        printedByDate?: Record<string, unknown>;
+      };
+      const printedByDate: Record<string, ProductionListSnapshots> = {};
+      for (const [date, entry] of Object.entries(parsed.printedByDate ?? {})) {
+        printedByDate[date] = normalizeSnapshots(entry);
+      }
       return {
         updatedAt: parsed.updatedAt ?? new Date().toISOString(),
-        printedByDate: parsed.printedByDate ?? {},
+        printedByDate,
       };
     }
   } catch {
@@ -1976,13 +2006,18 @@ export const saveFreezerListState = createServerFn({ method: "POST" })
     z
       .object({
         forDate: z.string().min(1),
+        list: z.enum(["freezer", "bakery"]),
         printedTotals: z.record(z.string(), z.number()),
       })
       .parse(d),
   )
   .handler(async ({ data }) => {
     const current = await readServerFreezerListState();
-    current.printedByDate[data.forDate] = data.printedTotals;
+    const prev = current.printedByDate[data.forDate] ?? { freezer: {}, bakery: {} };
+    current.printedByDate[data.forDate] = {
+      ...prev,
+      [data.list]: data.printedTotals,
+    };
     current.updatedAt = new Date().toISOString();
     await writeServerFreezerListState(current);
     return current;
