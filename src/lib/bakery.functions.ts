@@ -1519,7 +1519,10 @@ export const setProductImageUrl = createServerFn({ method: "POST" })
 const NewCustomerInput = z.object({
   name: z.string().min(1),
   driver: z.string().default("Collection"),
-  productIds: z.array(z.string().uuid()).min(1),
+  // Starter / regular products for the sheet. Optional: a customer can be
+  // created with no regular products and get their rows appended the first
+  // time an extra product is added for them from the Manual Orders tab.
+  productIds: z.array(z.string().uuid()).default([]),
 });
 
 export const createCustomerInSheet = createServerFn({ method: "POST" })
@@ -1528,19 +1531,43 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { appendCustomerRows } = await import("@/lib/sheets.server");
 
-    const { data: products, error: pErr } = await supabaseAdmin
-      .from("products")
-      .select("id, name")
-      .in("id", data.productIds);
-    if (pErr) throw pErr;
-    if (!products?.length) throw new Error("No products selected");
+    const cleanName = data.name.replace(/\s+/g, " ").trim();
+    if (!cleanName) throw new Error("Customer name is required");
 
-    const startRow = await appendCustomerRows(
-      products.map((p) => ({ customer: data.name, product: p.name, driver: data.driver })),
-    );
-    if (!startRow) throw new Error("Sheet did not return inserted row range");
+    // Guard against creating a duplicate of an existing customer
+    // (same name once punctuation/case/spacing is normalised).
+    const { data: allCusts } = await supabaseAdmin.from("customers").select("id, name, slug");
+    const dupe = (allCusts ?? []).find((c) => normCustomerKey(c.name) === normCustomerKey(cleanName));
+    if (dupe) {
+      throw new Error(
+        `A customer called "${dupe.name}" already exists — pick them from the list instead of creating a duplicate.`,
+      );
+    }
 
-    let slug = slugify(data.name);
+    let products: Array<{ id: string; name: string }> = [];
+    if (data.productIds.length) {
+      const { data: prods, error: pErr } = await supabaseAdmin
+        .from("products")
+        .select("id, name")
+        .in("id", data.productIds);
+      if (pErr) throw pErr;
+      // Keep the order the admin picked them in (grouped by category order sent from UI)
+      const byId = new Map((prods ?? []).map((p) => [p.id, p]));
+      products = data.productIds.map((id) => byId.get(id)).filter(Boolean) as Array<{
+        id: string;
+        name: string;
+      }>;
+    }
+
+    let startRow = 0;
+    if (products.length) {
+      startRow = await appendCustomerRows(
+        products.map((p) => ({ customer: cleanName, product: p.name, driver: data.driver })),
+      );
+      if (!startRow) throw new Error("Sheet did not return inserted row range");
+    }
+
+    let slug = slugify(cleanName);
     const base = slug;
     let i = 2;
     while (true) {
@@ -1555,7 +1582,7 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
 
     const { data: newCustomer, error: cErr } = await supabaseAdmin
       .from("customers")
-      .insert({ name: data.name, slug, driver: data.driver, sort_order: 9999 })
+      .insert({ name: cleanName, slug, driver: data.driver, sort_order: 9999 })
       .select("id, slug")
       .single();
     if (cErr) throw cErr;
@@ -1575,15 +1602,17 @@ export const createCustomerInSheet = createServerFn({ method: "POST" })
         });
     }
 
-    const cpRows = products.map((p, idx) => ({
-      customer_id: newCustomer.id,
-      product_id: p.id,
-      sheet_row: startRow + idx,
-      sort_order: idx + 1,
-      ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
-    }));
-    const { error: cpErr } = await supabaseAdmin.from("customer_products").insert(cpRows);
-    if (cpErr) throw cpErr;
+    if (products.length) {
+      const cpRows = products.map((p, idx) => ({
+        customer_id: newCustomer.id,
+        product_id: p.id,
+        sheet_row: startRow + idx,
+        sort_order: idx + 1,
+        ...(activeGroupId ? { sheet_group_id: activeGroupId } : {}),
+      }));
+      const { error: cpErr } = await supabaseAdmin.from("customer_products").insert(cpRows);
+      if (cpErr) throw cpErr;
+    }
 
     return { ok: true, slug: newCustomer.slug, startRow, count: products.length };
   });
@@ -2315,7 +2344,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
 
     const { data: customer } = await supabaseAdmin
       .from("customers")
-      .select("id, name, slug")
+      .select("id, name, slug, driver")
       .eq("slug", data.slug)
       .maybeSingle();
 
@@ -2361,6 +2390,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
             customerName: canonicalName,
             productName: item.productName,
             quantity: item.quantity,
+            driver: customer?.driver ?? undefined,
           });
         }
       }
@@ -2375,6 +2405,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
             customerName: canonicalName,
             productName: item.productName,
             quantity: 0,
+            driver: customer?.driver ?? undefined,
           });
         }
         await addOnQuantityToRow(item.sheetRow, item.quantity);

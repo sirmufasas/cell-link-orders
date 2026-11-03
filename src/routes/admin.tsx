@@ -10,7 +10,7 @@ import {
   getSubmissionDetail, getEstimateProducts, saveEstimates, getProductStocks, saveProductStocks,
   getActiveSheetInfo, getDriverAssignments, saveCustomerDriver, exportOrdersForDate,
   autoSyncIfStale, getLiveSheetOrders, getPrintSheetForDate, adminSaveManualOrder, getHistoryRetentionInfo,
-  clearOldOrderHistory, savePrintSheetState, type LiveSheetCustomerOrder,
+  clearOldOrderHistory, savePrintSheetState, createCustomerInSheet, type LiveSheetCustomerOrder,
 } from "@/lib/bakery.functions";
 import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
 
@@ -1972,6 +1972,339 @@ function ChartCard({ title, children }: { title: string; children: React.ReactEl
 // MANUAL ORDERS TAB (Live Sheet Reader + Fast Admin Order Entry)
 // ============================================================================
 
+type AdminProduct = { id: string; name: string; category: string | null };
+
+type ProductCategoryKey = "PRODUCTION" | "FREEZER" | "OTHER";
+
+function productCategoryKey(category: string | null | undefined): ProductCategoryKey {
+  const c = (category ?? "").trim().toUpperCase();
+  if (c === "PRODUCTION") return "PRODUCTION";
+  if (c === "FREEZER") return "FREEZER";
+  return "OTHER";
+}
+
+const PRODUCT_CATEGORY_ORDER: ProductCategoryKey[] = ["PRODUCTION", "FREEZER", "OTHER"];
+
+/** Full, searchable product picker — shows EVERY product in the bakery list
+ *  (Production + Freezer + uncategorised), grouped by category. */
+function ProductPicker({
+  products,
+  selectedIds,
+  onToggle,
+  onSelectMany,
+  search,
+  onSearch,
+  category,
+  onCategory,
+  emptyText = "No products match your search.",
+}: {
+  products: AdminProduct[];
+  selectedIds: string[];
+  onToggle: (id: string) => void;
+  onSelectMany?: (ids: string[], select: boolean) => void;
+  search: string;
+  onSearch: (v: string) => void;
+  category: ProductCategoryKey | "__all__";
+  onCategory: (c: ProductCategoryKey | "__all__") => void;
+  emptyText?: string;
+}) {
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { __all__: products.length };
+    for (const p of products) {
+      const k = productCategoryKey(p.category);
+      c[k] = (c[k] ?? 0) + 1;
+    }
+    return c;
+  }, [products]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return products.filter((p) => {
+      if (category !== "__all__" && productCategoryKey(p.category) !== category) return false;
+      if (!q) return true;
+      return p.name.toLowerCase().includes(q);
+    });
+  }, [products, search, category]);
+
+  return (
+    <div className="space-y-2">
+      <div className="relative">
+        <input
+          value={search}
+          onChange={(e) => onSearch(e.target.value)}
+          placeholder={`Search all ${products.length} products (freezer + production)…`}
+          className="w-full bg-white border border-[#e8dcc8] rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+        />
+        {search && (
+          <button
+            type="button"
+            onClick={() => onSearch("")}
+            className="absolute right-3 top-1/2 -translate-y-1/2 text-[#8b6f4e] hover:text-[#2a1810] font-bold"
+          >
+            ×
+          </button>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-1">
+        {(["__all__", ...PRODUCT_CATEGORY_ORDER] as const).map((c) => {
+          const label =
+            c === "__all__" ? `All (${counts.__all__ ?? 0})` : `${c === "OTHER" ? "Other" : c.charAt(0) + c.slice(1).toLowerCase()} (${counts[c] ?? 0})`;
+          const activeChip = category === c;
+          return (
+            <button
+              key={c}
+              type="button"
+              onClick={() => onCategory(c)}
+              className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition ${
+                activeChip
+                  ? "bg-[#c8362b] text-white"
+                  : "bg-white border border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1]"
+              }`}
+            >
+              {c === "FREEZER" ? "🧊 " : c === "PRODUCTION" ? "🏭 " : ""}
+              {label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="border border-[#e8dcc8] rounded-xl bg-white max-h-72 overflow-y-auto">
+        {filtered.length === 0 && (
+          <div className="p-4 text-center text-xs text-[#8b6f4e]">{emptyText}</div>
+        )}
+        {PRODUCT_CATEGORY_ORDER.map((cat) => {
+          const list = filtered.filter((p) => productCategoryKey(p.category) === cat);
+          if (!list.length) return null;
+          const allSelected = list.every((p) => selectedSet.has(p.id));
+          return (
+            <div key={cat}>
+              <div className="sticky top-0 z-10 px-2.5 py-1 bg-[#fdf8f1] border-y border-[#e8dcc8] flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-[#8b6f4e]">
+                  {cat === "OTHER" ? "Other / Uncategorised" : cat} · {list.length}
+                </span>
+                {onSelectMany && (
+                  <button
+                    type="button"
+                    onClick={() => onSelectMany(list.map((p) => p.id), !allSelected)}
+                    className="text-[10px] font-bold text-[#c8362b] hover:underline"
+                  >
+                    {allSelected ? "Clear this category" : "Select all in this category"}
+                  </button>
+                )}
+              </div>
+              <div className="divide-y divide-[#f0e7d8]">
+                {list.map((p) => {
+                  const on = selectedSet.has(p.id);
+                  return (
+                    <label
+                      key={p.id}
+                      className={`flex items-center gap-2 px-2.5 py-1.5 cursor-pointer text-xs ${
+                        on ? "bg-[#c8362b]/[0.06]" : "hover:bg-[#fdf8f1]/70"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        onChange={() => onToggle(p.id)}
+                        className="accent-[#c8362b] w-3.5 h-3.5"
+                      />
+                      <span className="truncate font-medium">{p.name}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Create a brand-new customer (and, optionally, their regular product rows)
+ *  directly from the Manual Orders tab. */
+function NewCustomerPanel({
+  driverOptions,
+  onClose,
+  onCreated,
+}: {
+  driverOptions: string[];
+  onClose: () => void;
+  onCreated: (slug: string, name: string, productCount: number) => void;
+}) {
+  const productsQ = useQuery(productsQuery);
+  const products = (productsQ.data ?? []) as AdminProduct[];
+
+  const [name, setName] = useState("");
+  const [driver, setDriver] = useState(driverOptions[0] ?? "Collection");
+  const [selected, setSelected] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const [category, setCategory] = useState<ProductCategoryKey | "__all__">("__all__");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function toggle(id: string) {
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  function selectMany(ids: string[], select: boolean) {
+    setSelected((prev) => {
+      if (select) return Array.from(new Set([...prev, ...ids]));
+      const drop = new Set(ids);
+      return prev.filter((x) => !drop.has(x));
+    });
+  }
+
+  async function handleCreate() {
+    if (!name.trim()) {
+      setError("Enter the customer's name.");
+      return;
+    }
+    if (selected.length === 0) {
+      setError("Tick at least one product — that is what creates the customer's rows on Google Sheet.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await createCustomerInSheet({
+        data: { name: name.trim(), driver: driver.trim() || "Collection", productIds: selected },
+      });
+      onCreated(res.slug, name.trim(), res.count);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-3 sm:p-6 overflow-y-auto"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white rounded-2xl border border-[#e8dcc8] shadow-xl w-full max-w-2xl my-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between p-4 border-b border-[#e8dcc8]">
+          <div>
+            <h3 className="text-base font-bold text-[#2a1810]">➕ New Customer</h3>
+            <p className="text-[11px] text-[#8b6f4e]">
+              Adds the customer (and any regular products you tick) to the active Google Sheet so you can
+              type their order straight away.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-2xl leading-none text-[#8b6f4e] hover:text-[#2a1810] px-2"
+            title="Close"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="p-4 space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <label className="block">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-[#8b6f4e]">
+                Customer Name *
+              </span>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g. Sunrise Bakery"
+                autoFocus
+                className="mt-1 w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-[#8b6f4e]">
+                Driver
+              </span>
+              <input
+                value={driver}
+                onChange={(e) => setDriver(e.target.value)}
+                list="manual-new-customer-drivers"
+                placeholder="Collection"
+                className="mt-1 w-full bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
+              />
+              <datalist id="manual-new-customer-drivers">
+                {driverOptions.map((d) => (
+                  <option key={d} value={d} />
+                ))}
+              </datalist>
+            </label>
+          </div>
+
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-[#8b6f4e]">
+              Regular Products (optional) · {selected.length} selected
+            </span>
+            {selected.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setSelected([])}
+                className="text-[11px] font-semibold text-[#c8362b] hover:underline"
+              >
+                Clear selection
+              </button>
+            )}
+          </div>
+
+          <ProductPicker
+            products={products}
+            selectedIds={selected}
+            onToggle={toggle}
+            onSelectMany={selectMany}
+            search={search}
+            onSearch={setSearch}
+            category={category}
+            onCategory={setCategory}
+            emptyText={
+              productsQ.isLoading ? "Loading products…" : "No products match your search."
+            }
+          />
+
+          <p className="text-[11px] text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-2.5">
+            Tip: tick at least one product — that is what creates the customer's rows on the Google Sheet.
+            The more you tick now, the fewer you will need to add later; anything else can still be entered
+            from <strong>All Products</strong> when you take their order.
+          </p>
+
+          {error && (
+            <div className="text-xs font-semibold px-3 py-2 rounded-xl border bg-red-50 border-red-200 text-red-700">
+              {error}
+            </div>
+          )}
+        </div>
+
+        <div className="p-4 border-t border-[#e8dcc8] flex items-center justify-end gap-2 bg-[#fdf8f1] rounded-b-2xl">
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs font-semibold px-3 py-2 rounded-xl border border-[#e8dcc8] bg-white hover:bg-[#fdf8f1]"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleCreate()}
+            disabled={saving || !name.trim() || selected.length === 0}
+            className="text-xs font-bold px-4 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white transition disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e]"
+          >
+            {saving ? "Creating…" : `Create Customer${selected.length ? ` + ${selected.length} products` : ""}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ManualOrdersTab({
   selectedSlug,
   onSelectSlug,
@@ -1994,6 +2327,7 @@ function ManualOrdersTab({
   const [customerSearch, setCustomerSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "pinned" | "pending" | "ordered">("all");
   const [driverFilter, setDriverFilter] = useState("__all__");
+  const [showNewCustomer, setShowNewCustomer] = useState(false);
 
   const [entryMode, setEntryMode] = useState<"set" | "addon">("set");
   const [qty, setQty] = useState<Record<string, number>>({});
@@ -2001,6 +2335,7 @@ function ManualOrdersTab({
   const [comment, setComment] = useState("");
   const [productSearch, setProductSearch] = useState("");
   const [showExtraProducts, setShowExtraProducts] = useState(false);
+  const [extraCategory, setExtraCategory] = useState<ProductCategoryKey | "__all__">("__all__");
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
@@ -2083,12 +2418,34 @@ function ManualOrdersTab({
   const extraProducts = useMemo(() => {
     const s = productSearch.trim().toLowerCase();
     if (!showExtraProducts && !s) return [];
-    return allProducts.filter((p) => {
+    return (allProducts as AdminProduct[]).filter((p) => {
       if (regularProductNamesLower.has(p.name.trim().toLowerCase())) return false;
       if (!s) return true;
       return p.name.toLowerCase().includes(s);
     });
   }, [allProducts, regularProductNamesLower, productSearch, showExtraProducts]);
+
+  const extraCategoryCounts = useMemo(() => {
+    const counts: Record<string, number> = { __all__: extraProducts.length };
+    for (const p of extraProducts) {
+      const k = productCategoryKey(p.category);
+      counts[k] = (counts[k] ?? 0) + 1;
+    }
+    return counts;
+  }, [extraProducts]);
+
+  const extraProductsByCategory = useMemo(() => {
+    const out: Record<ProductCategoryKey, AdminProduct[]> = {
+      PRODUCTION: [],
+      FREEZER: [],
+      OTHER: [],
+    };
+    for (const p of extraProducts) {
+      if (extraCategory !== "__all__" && productCategoryKey(p.category) !== extraCategory) continue;
+      out[productCategoryKey(p.category)].push(p);
+    }
+    return out;
+  }, [extraProducts, extraCategory]);
 
   function setLineQty(key: string, val: number) {
     const clean = Math.max(0, Math.round((val || 0) * 1000) / 1000);
@@ -2287,6 +2644,24 @@ function ManualOrdersTab({
     }
   }
 
+  async function handleCustomerCreated(slug: string, name: string, productCount: number) {
+    setShowNewCustomer(false);
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["live-sheet-orders"] }),
+      qc.invalidateQueries({ queryKey: ["customers"] }),
+      qc.invalidateQueries({ queryKey: ["print-sheet-for-date"] }),
+    ]);
+    onSelectSlug(slug);
+    setFeedback({
+      type: "ok",
+      text: `${name} created on the active sheet with ${productCount} regular product${
+        productCount === 1 ? "" : "s"
+      }. Enter their quantities below and click Save to Sheet.`,
+    });
+    setCustomerSearch("");
+    setStatusFilter("all");
+  }
+
   const orderedCount = customers.filter((c) => c.totalQuantity > 0).length;
   const pendingCount = customers.length - orderedCount;
 
@@ -2375,18 +2750,28 @@ function ManualOrdersTab({
                 ))}
               </div>
 
-              <select
-                value={driverFilter}
-                onChange={(e) => setDriverFilter(e.target.value)}
-                className="w-full bg-white border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
-              >
-                <option value="__all__">All drivers</option>
-                {driverOptions.map((d) => (
-                  <option key={d} value={d}>
-                    Driver: {d}
-                  </option>
-                ))}
-              </select>
+              <div className="flex items-center gap-1.5">
+                <select
+                  value={driverFilter}
+                  onChange={(e) => setDriverFilter(e.target.value)}
+                  className="flex-1 min-w-0 bg-white border border-[#e8dcc8] rounded-xl px-3 py-1.5 text-xs font-semibold focus:outline-none focus:border-[#c8362b]"
+                >
+                  <option value="__all__">All drivers</option>
+                  {driverOptions.map((d) => (
+                    <option key={d} value={d}>
+                      Driver: {d}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => setShowNewCustomer(true)}
+                  className="shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-xl bg-[#2a1810] text-white hover:bg-black transition"
+                  title="Add a brand-new customer to the active sheet"
+                >
+                  ➕ New Customer
+                </button>
+              </div>
             </div>
 
             <div className="divide-y divide-[#e8dcc8] max-h-[640px] overflow-y-auto">
@@ -2553,7 +2938,7 @@ function ManualOrdersTab({
                     <input
                       value={productSearch}
                       onChange={(e) => setProductSearch(e.target.value)}
-                      placeholder="Filter regular products or type any product name to add extra…"
+                      placeholder="Search their regular products — or type to find ANY product (freezer + production)…"
                       className="w-full bg-white border border-[#e8dcc8] rounded-xl px-3.5 py-2 text-sm focus:outline-none focus:border-[#c8362b]"
                     />
                     {productSearch && (
@@ -2661,13 +3046,13 @@ function ManualOrdersTab({
                         onClick={() => setShowExtraProducts(true)}
                         className="w-full py-2 rounded-xl border border-dashed border-[#c8362b]/50 text-xs font-bold text-[#c8362b] hover:bg-[#c8362b]/5"
                       >
-                        + Add Extra Product (from full bakery list)
+                        + Show All Products (Freezer + Production) — add any to this order
                       </button>
                     ) : (
                       <div className="space-y-2">
-                        <div className="flex items-center justify-between">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
                           <span className="text-xs font-bold uppercase tracking-wider text-[#8b6f4e]">
-                            Extra Products ({extraProducts.length}) — inserts into sheet automatically
+                            All Products ({extraProducts.length}) — inserts into the sheet automatically
                           </span>
                           {showExtraProducts && (
                             <button
@@ -2675,48 +3060,109 @@ function ManualOrdersTab({
                               onClick={() => setShowExtraProducts(false)}
                               className="text-xs font-semibold text-[#c8362b] hover:underline"
                             >
-                              Hide extra
+                              Hide product list
                             </button>
                           )}
                         </div>
-                        <div className="divide-y divide-[#e8dcc8] bg-white rounded-xl border border-[#e8dcc8] max-h-60 overflow-y-auto">
-                          {extraProducts.slice(0, 60).map((p) => {
-                            const k = `x:${p.id}`;
-                            const val = qty[k] ?? 0;
+
+                        {/* Category filter: All / Production / Freezer / Other */}
+                        <div className="flex flex-wrap gap-1">
+                          {(["__all__", ...PRODUCT_CATEGORY_ORDER] as const).map((c) => {
+                            const activeChip = extraCategory === c;
+                            const label =
+                              c === "__all__"
+                                ? `All (${extraCategoryCounts.__all__ ?? 0})`
+                                : `${
+                                    c === "FREEZER"
+                                      ? "🧊 Freezer"
+                                      : c === "PRODUCTION"
+                                      ? "🏭 Production"
+                                      : "Other"
+                                  } (${extraCategoryCounts[c] ?? 0})`;
                             return (
-                              <div key={p.id} className="p-2.5 flex items-center justify-between gap-2">
-                                <span className="text-xs font-medium truncate">{p.name}</span>
-                                <div className="flex items-center gap-1 shrink-0">
-                                  <button
-                                    type="button"
-                                    onClick={() => adjustLineQty(k, -1)}
-                                    className="w-7 h-7 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] font-bold text-sm"
-                                  >
-                                    −
-                                  </button>
-                                  <input
-                                    type="text"
-                                    inputMode="decimal"
-                                    value={displayQtyValue(k, val)}
-                                    placeholder="0"
-                                    onChange={(e) => handleRawQtyChange(k, e.target.value)}
-                                    onBlur={() => clearRawForKey(k)}
-                                    className="w-14 h-7 text-center text-xs font-bold border border-[#e8dcc8] rounded-lg bg-[#fdf8f1]"
-                                  />
-                                  <button
-                                    type="button"
-                                    onClick={() => adjustLineQty(k, 1)}
-                                    className="w-7 h-7 rounded-lg bg-[#c8362b] text-white font-bold text-sm"
-                                  >
-                                    +
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => adjustLineQty(k, 0.5)}
-                                    className="px-1.5 h-7 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] text-[10px] font-bold text-[#6b5544]"
-                                  >
-                                    +0.5
-                                  </button>
+                              <button
+                                key={c}
+                                type="button"
+                                onClick={() => setExtraCategory(c)}
+                                className={`px-2 py-0.5 rounded-lg text-[11px] font-bold transition ${
+                                  activeChip
+                                    ? "bg-[#2a1810] text-white"
+                                    : "bg-white border border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1]"
+                                }`}
+                              >
+                                {label}
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        <div className="bg-white rounded-xl border border-[#e8dcc8] max-h-80 overflow-y-auto">
+                          {extraProducts.length === 0 && (
+                            <div className="p-4 text-center text-xs text-[#8b6f4e]">
+                              {productsQ.isLoading
+                                ? "Loading all products…"
+                                : "No products match your search."}
+                            </div>
+                          )}
+                          {PRODUCT_CATEGORY_ORDER.map((cat) => {
+                            const list = extraProductsByCategory[cat];
+                            if (!list.length) return null;
+                            return (
+                              <div key={cat}>
+                                <div className="sticky top-0 z-10 px-2.5 py-1 bg-[#fdf8f1] border-y border-[#e8dcc8] text-[10px] font-bold uppercase tracking-wider text-[#8b6f4e]">
+                                  {cat === "OTHER" ? "Other / Uncategorised" : cat} · {list.length}
+                                </div>
+                                <div className="divide-y divide-[#f0e7d8]">
+                                  {list.map((p) => {
+                                    const k = `x:${p.id}`;
+                                    const val = qty[k] ?? 0;
+                                    return (
+                                      <div
+                                        key={p.id}
+                                        className={`p-2.5 flex items-center justify-between gap-2 ${
+                                          val > 0 ? "bg-[#c8362b]/[0.05]" : ""
+                                        }`}
+                                      >
+                                        <span className="text-xs font-medium truncate">{p.name}</span>
+                                        <div className="flex items-center gap-1 shrink-0">
+                                          <button
+                                            type="button"
+                                            onClick={() => adjustLineQty(k, -1)}
+                                            className="w-7 h-7 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] font-bold text-sm"
+                                          >
+                                            −
+                                          </button>
+                                          <input
+                                            type="text"
+                                            inputMode="decimal"
+                                            value={displayQtyValue(k, val)}
+                                            placeholder="0"
+                                            onChange={(e) => handleRawQtyChange(k, e.target.value)}
+                                            onBlur={() => clearRawForKey(k)}
+                                            className={`w-14 h-7 text-center text-xs font-bold border rounded-lg ${
+                                              val > 0
+                                                ? "border-[#c8362b] bg-white text-[#c8362b]"
+                                                : "border-[#e8dcc8] bg-[#fdf8f1]"
+                                            }`}
+                                          />
+                                          <button
+                                            type="button"
+                                            onClick={() => adjustLineQty(k, 1)}
+                                            className="w-7 h-7 rounded-lg bg-[#c8362b] text-white font-bold text-sm"
+                                          >
+                                            +
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => adjustLineQty(k, 0.5)}
+                                            className="px-1.5 h-7 rounded-lg bg-[#fdf8f1] border border-[#e8dcc8] text-[10px] font-bold text-[#6b5544]"
+                                          >
+                                            +0.5
+                                          </button>
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
                                 </div>
                               </div>
                             );
@@ -2800,6 +3246,14 @@ function ManualOrdersTab({
       )}
 
       {saving && <CenterLoader title="Updating Google Sheet…" subtitle={selectedCustomer?.name} />}
+
+      {showNewCustomer && (
+        <NewCustomerPanel
+          driverOptions={driverOptions}
+          onClose={() => setShowNewCustomer(false)}
+          onCreated={handleCustomerCreated}
+        />
+      )}
     </section>
   );
 }

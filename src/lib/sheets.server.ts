@@ -779,6 +779,9 @@ export async function insertCustomerProductRow(opts: {
   customerName: string;
   productName: string;
   quantity: number;
+  /** Driver to stamp into column D when this customer has no rows at all yet
+   *  (brand-new customer). Defaults to "Collection" like the old behaviour. */
+  driver?: string;
 }): Promise<number> {
   const all = await readCustomerRows();
   const target = normCustomerKey(opts.customerName);
@@ -792,7 +795,7 @@ export async function insertCustomerProductRow(opts: {
       {
         customer: opts.customerName,
         product: opts.productName,
-        driver: "Collection",
+        driver: (opts.driver ?? "").trim() || "Collection",
       },
     ]);
     if (opts.quantity > 0)
