@@ -445,7 +445,9 @@ function AdminPage() {
   const [search, setSearch] = useState("");
   const [customerDriverFilter, setCustomerDriverFilter] = useState("__all__");
   const [customerStatusFilter, setCustomerStatusFilter] = useState<"all" | "ordered" | "pending" | "pinned">("all");
-  const [customerInvoiceFilter, setCustomerInvoiceFilter] = useState<"all" | "printer" | "written">("all");
+  const [customerInvoiceFilter, setCustomerInvoiceFilter] = useState<
+    "all" | "printer" | "written" | "none"
+  >("all");
   const [savingInvoiceSlug, setSavingInvoiceSlug] = useState<string | null>(null);
   const [manualSelectedSlug, setManualSelectedSlug] = useState<string | null>(null);
   const [copiedSlug, setCopiedSlug] = useState<string | null>(null);
@@ -784,9 +786,9 @@ function AdminPage() {
       if (customerStatusFilter === "ordered" && onSheetQty <= 0) return false;
       if (customerStatusFilter === "pending" && onSheetQty > 0) return false;
       if (customerStatusFilter === "pinned" && !manualRegulars.includes(c.slug)) return false;
-      if (customerInvoiceFilter !== "all" && invoiceTypes[c.slug] !== customerInvoiceFilter) {
-        return false;
-      }
+      if (customerInvoiceFilter === "printer" && invoiceTypes[c.slug] !== "printer") return false;
+      if (customerInvoiceFilter === "written" && invoiceTypes[c.slug] !== "written") return false;
+      if (customerInvoiceFilter === "none" && invoiceTypes[c.slug]) return false;
       return true;
     });
   }, [search, customers, customerDriverFilter, customerStatusFilter, sheetQtyBySlug, manualRegulars, customerInvoiceFilter, invoiceTypes]);
@@ -1067,6 +1069,7 @@ function AdminPage() {
                   { id: "all", label: `All (${customers.length})` },
                   { id: "printer", label: `🖨️ Printer (${Object.values(invoiceTypes).filter((v) => v === "printer").length})` },
                   { id: "written", label: `✍️ Written (${Object.values(invoiceTypes).filter((v) => v === "written").length})` },
+                  { id: "none", label: `⬜ None (${customers.filter((c) => !invoiceTypes[c.slug]).length})` },
                 ] as const).map((f) => (
                   <button
                     key={f.id}
@@ -1121,7 +1124,7 @@ function AdminPage() {
                     <div className="flex items-center gap-1.5 shrink-0">
                       <div
                         className="flex items-center rounded-lg border border-[#e8dcc8] overflow-hidden"
-                        title="How this customer gets their invoice — 🖨️ printed or ✍️ hand-written. Click to set / clear."
+                        title="How this customer gets their invoice — 🖨️ printed, ✍️ hand-written, or ⬜ neither"
                       >
                         <button
                           onClick={() =>
@@ -1136,6 +1139,7 @@ function AdminPage() {
                               ? "bg-[#2a1810] text-white"
                               : "text-[#8b6f4e] hover:bg-[#fdf8f1]"
                           }`}
+                          title="Printer — gets a printed invoice"
                         >
                           🖨️
                         </button>
@@ -1152,8 +1156,21 @@ function AdminPage() {
                               ? "bg-[#c8362b] text-white"
                               : "text-[#8b6f4e] hover:bg-[#fdf8f1]"
                           }`}
+                          title="Written — hand-written invoice"
                         >
                           ✍️
+                        </button>
+                        <button
+                          onClick={() => void setInvoiceTypeFor(c.slug, null)}
+                          disabled={savingInvoiceSlug === c.slug}
+                          className={`px-2 py-1.5 text-xs font-bold transition border-l border-[#e8dcc8] ${
+                            !invoiceTypes[c.slug]
+                              ? "bg-[#e8dcc8] text-[#2a1810]"
+                              : "text-[#8b6f4e] hover:bg-[#fdf8f1]"
+                          }`}
+                          title="None — neither printed nor written"
+                        >
+                          ⬜
                         </button>
                       </div>
                       <button
@@ -4137,7 +4154,7 @@ function PrintSheetTab() {
   const [viewFilter, setViewFilter] = useState<"to_print" | "all_highlight" | "printed_only">("to_print");
   // 🖨️ Printer vs ✍️ Written invoice filter — lets you print only the
   // customers that get printed invoices (the written ones are done by hand).
-  const [invoiceFilter, setInvoiceFilter] = useState<"all" | "printer" | "written">("all");
+  const [invoiceFilter, setInvoiceFilter] = useState<"all" | "printer" | "written" | "none">("all");
   const invoiceTypesQ = useQuery(invoiceTypesQuery);
   const invoiceTypes = invoiceTypesQ.data ?? {};
   const [showCustomize, setShowCustomize] = useState(false);
@@ -4507,7 +4524,11 @@ function PrintSheetTab() {
         ? printedCleanCustomers
         : activeCustomers;
     const invoiceFiltered =
-      invoiceFilter === "all" ? pool : pool.filter((c) => invoiceTypes[c.slug] === invoiceFilter);
+      invoiceFilter === "all"
+        ? pool
+        : invoiceFilter === "none"
+        ? pool.filter((c) => !invoiceTypes[c.slug])
+        : pool.filter((c) => invoiceTypes[c.slug] === invoiceFilter);
     return invoiceFiltered.filter((c) => modeForCustomer(c.name) !== "hidden");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
@@ -4526,6 +4547,10 @@ function PrintSheetTab() {
   );
   const writtenCount = useMemo(
     () => activeCustomers.filter((c) => invoiceTypes[c.slug] === "written").length,
+    [activeCustomers, invoiceTypes],
+  );
+  const noneCount = useMemo(
+    () => activeCustomers.filter((c) => !invoiceTypes[c.slug]).length,
     [activeCustomers, invoiceTypes],
   );
 
@@ -4942,6 +4967,7 @@ function PrintSheetTab() {
                 { id: "all", label: `All (${activeCustomers.length})` },
                 { id: "printer", label: `🖨️ Printer (${printerCount})` },
                 { id: "written", label: `✍️ Written (${writtenCount})` },
+                { id: "none", label: `⬜ None (${noneCount})` },
               ] as const).map((f) => (
                 <button
                   key={f.id}
@@ -4955,6 +4981,8 @@ function PrintSheetTab() {
                       ? "Only customers marked 🖨️ Printer in the Customers tab"
                       : f.id === "written"
                       ? "Only customers marked ✍️ Written in the Customers tab"
+                      : f.id === "none"
+                      ? "Only customers not marked yet — neither 🖨️ Printer nor ✍️ Written"
                       : "Show every customer"
                   }
                 >
