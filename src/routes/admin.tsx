@@ -12,6 +12,7 @@ import {
   autoSyncIfStale, getLiveSheetOrders, getPrintSheetForDate, adminSaveManualOrder, getHistoryRetentionInfo,
   clearOldOrderHistory, savePrintSheetState, createCustomerInSheet, type LiveSheetCustomerOrder,
   getCustomerInvoiceTypes, setCustomerInvoiceType,
+  getFreezerListState, saveFreezerListState,
 } from "@/lib/bakery.functions";
 import { primeAlertAudio, shoutAlert } from "@/lib/alertSound";
 
@@ -33,6 +34,11 @@ const invoiceTypesQuery = queryOptions({
   queryKey: ["invoice-types"],
   queryFn: () => getCustomerInvoiceTypes(),
   staleTime: 30_000,
+});
+const freezerListStateQuery = queryOptions({
+  queryKey: ["freezer-list-state"],
+  queryFn: () => getFreezerListState(),
+  staleTime: 10_000,
 });
 
 // New-order sound alert preference. The actual siren + shouted-voice sound
@@ -67,6 +73,7 @@ type AdminTab =
   | "linked"
   | "print"
   | "kota"
+  | "production"
   | "history"
   | "analytics"
   | "estimates"
@@ -93,6 +100,7 @@ const PROTECTED_TABS: AdminTab[] = [
   "linked",
   "print",
   "kota",
+  "production",
   "analytics",
   "estimates",
   "stocks",
@@ -422,6 +430,7 @@ function AdminPage() {
         "linked",
         "print",
         "kota",
+        "production",
         "history",
         "analytics",
         "estimates",
@@ -978,7 +987,7 @@ function AdminPage() {
         </section>
 
         <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1 w-fit flex-wrap print:hidden">
-          {(["customers", "manual", "linked", "print", "kota", "history", "analytics", "estimates", "stocks", "drivers"] as const).map((t) => (
+          {(["customers", "manual", "linked", "print", "kota", "production", "history", "analytics", "estimates", "stocks", "drivers"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -996,6 +1005,8 @@ function AdminPage() {
                 ? "🖨️ Print Sheet"
                 : t === "kota"
                 ? "🔥 Kota Joe"
+                : t === "production"
+                ? "🏭 Production"
                 : t === "history"
                 ? "Order History"
                 : t === "analytics"
@@ -1233,6 +1244,8 @@ function AdminPage() {
         {tab === "print" && <PrintSheetTab />}
 
         {tab === "kota" && <KotaJoeTab />}
+
+        {tab === "production" && <ProductionListsTab />}
 
         {tab === "history" && (
           <section className="space-y-4">
@@ -2683,6 +2696,359 @@ function LinkedOrdersTab({
         <div className="bg-amber-50 border border-amber-300 text-amber-900 rounded-2xl p-3 text-xs font-semibold">
           {waitingForSheet.length} linked order{waitingForSheet.length === 1 ? "" : "s"} not on the live
           sheet yet — hit Refresh in a moment.
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ============================================================================
+// PRODUCTION LISTS TAB — printable Freezer + Bakery production lists, read
+// live from the Google Sheet. Products with 0 quantity are hidden (decimal
+// quantities like 0.5 still show). The Freezer list keeps a per-date printed
+// snapshot so QUANTITY = new since your last print and SUBTOTAL = full total.
+// ============================================================================
+
+function ProductionListsTab() {
+  const qc = useQueryClient();
+  const liveQuery = useQuery(liveSheetOrdersQuery);
+  const productsQ = useQuery(productsQuery);
+  const freezerStateQ = useQuery(freezerListStateQuery);
+
+  const [subView, setSubView] = useState<"freezer" | "bakery">("freezer");
+  const [savingSnapshot, setSavingSnapshot] = useState(false);
+
+  const customers = liveQuery.data?.customers ?? [];
+  const forDate = liveQuery.data?.forDate ?? "";
+
+  // Per-product totals straight off the live sheet (column C = full quantity
+  // incl. add-ons and late additions — same numbers the rest of the app uses)
+  const productTotals = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const c of customers) {
+      for (const r of c.rows) {
+        if (!(r.quantity > 0)) continue;
+        const key = r.productName.trim();
+        map.set(key, Math.round(((map.get(key) ?? 0) + r.quantity) * 1000) / 1000);
+      }
+    }
+    return map;
+  }, [customers]);
+
+  // DB category per product (lower-cased name). Sheet-only products (not in
+  // the DB) count as bakery/production.
+  const categoryByLower = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const p of (productsQ.data ?? []) as Array<{ name: string; category: string | null }>) {
+      m.set(p.name.trim().toLowerCase(), (p.category ?? "").trim().toUpperCase());
+    }
+    return m;
+  }, [productsQ.data]);
+
+  const isFreezerProduct = (name: string) =>
+    categoryByLower.get(name.trim().toLowerCase()) === "FREEZER";
+
+  const freezerSnapshot = useMemo(() => {
+    return freezerStateQ.data?.printedByDate?.[forDate] ?? {};
+  }, [freezerStateQ.data, forDate]);
+
+  type Row = { name: string; total: number; sincePrint: number };
+  const freezerRows = useMemo(() => {
+    const rows: Row[] = [];
+    for (const [name, total] of productTotals) {
+      if (!isFreezerProduct(name)) continue;
+      if (!(total > 0)) continue;
+      const printed = freezerSnapshot[name.trim().toLowerCase()] ?? 0;
+      const sincePrint = Math.max(0, Math.round((total - printed) * 1000) / 1000);
+      rows.push({ name, total, sincePrint });
+    }
+    return rows.sort((a, b) => a.name.localeCompare(b.name));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [productTotals, categoryByLower, freezerSnapshot]);
+
+  const bakeryRows = useMemo(() => {
+    const rows: Row[] = [];
+    for (const [name, total] of productTotals) {
+      if (isFreezerProduct(name)) continue;
+      if (!(total > 0)) continue;
+      rows.push({ name, total, sincePrint: 0 });
+    }
+    return rows.sort((a, b) => a.name.localeCompare(b.name));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [productTotals, categoryByLower]);
+
+  const freezerNewCount = freezerRows.filter((r) => r.sincePrint > 0).length;
+  const freezerTotQty = Math.round(freezerRows.reduce((a, b) => a + b.sincePrint, 0) * 1000) / 1000;
+  const freezerTotSub = Math.round(freezerRows.reduce((a, b) => a + b.total, 0) * 1000) / 1000;
+  const bakeryTotSub = Math.round(bakeryRows.reduce((a, b) => a + b.total, 0) * 1000) / 1000;
+
+  async function persistFreezerSnapshot() {
+    if (!forDate) return;
+    const totals: Record<string, number> = {};
+    for (const [name, total] of productTotals) {
+      if (isFreezerProduct(name) && total > 0) totals[name.trim().toLowerCase()] = total;
+    }
+    setSavingSnapshot(true);
+    try {
+      await saveFreezerListState({ data: { forDate, printedTotals: totals } });
+      await qc.invalidateQueries({ queryKey: ["freezer-list-state"] });
+    } catch {
+      // non-fatal — the list still prints
+    } finally {
+      setSavingSnapshot(false);
+    }
+  }
+
+  async function handlePrintFreezer() {
+    // Save the snapshot FIRST so even a refresh right after printing keeps it
+    await persistFreezerSnapshot();
+    window.print();
+  }
+
+  async function resetFreezerSnapshot() {
+    if (
+      !window.confirm(
+        "Reset today's printed snapshot? QUANTITY will show the full totals again as if never printed.",
+      )
+    )
+      return;
+    if (!forDate) return;
+    setSavingSnapshot(true);
+    try {
+      await saveFreezerListState({ data: { forDate, printedTotals: {} } });
+      await qc.invalidateQueries({ queryKey: ["freezer-list-state"] });
+    } catch {
+      // non-fatal
+    } finally {
+      setSavingSnapshot(false);
+    }
+  }
+
+  // Ctrl+P / Cmd+P on the Freezer view also saves the snapshot, so the
+  // QUANTITY column resets no matter how you print.
+  useEffect(() => {
+    if (typeof window === "undefined" || subView !== "freezer") return;
+    const onBeforePrint = () => {
+      void persistFreezerSnapshot();
+    };
+    window.addEventListener("beforeprint", onBeforePrint);
+    return () => window.removeEventListener("beforeprint", onBeforePrint);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subView, productTotals, forDate]);
+
+  if (liveQuery.isLoading) {
+    return (
+      <section className="space-y-4">
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e]">
+          Loading production lists…
+        </div>
+      </section>
+    );
+  }
+
+  const thStyle: React.CSSProperties = {
+    border: "1px solid #434343",
+    padding: "6px 10px",
+    fontSize: 14,
+    fontWeight: 700,
+  };
+  const tdStyle: React.CSSProperties = {
+    border: "1px solid #434343",
+    padding: "5px 10px",
+    fontSize: 14,
+  };
+
+  return (
+    <section className="space-y-3 print:space-y-0">
+      <style>{`
+        @media print {
+          @page { size: A4 portrait; margin: 10mm; }
+          html, body, #root, main, section, div {
+            overflow: visible !important;
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+          }
+          *::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
+          body { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+        }
+      `}</style>
+
+      {/* Screen-only toolbar */}
+      <div className="bg-white rounded-2xl border border-[#e8dcc8] p-3.5 shadow-sm space-y-2 print:hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="font-bold text-sm text-[#2a1810]">🏭 Production Lists</h2>
+            <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
+              {liveQuery.data?.sheetLabel ?? ""} · {forDate || "…"}
+            </span>
+            {subView === "freezer" ? (
+              <span className="text-xs text-[#8b6f4e]">
+                {freezerRows.length} products · {freezerNewCount} new since last print · Q {fmtQty(freezerTotQty)} / Subtotal {fmtQty(freezerTotSub)}
+              </span>
+            ) : (
+              <span className="text-xs text-[#8b6f4e]">
+                {bakeryRows.length} products · Subtotal {fmtQty(bakeryTotSub)}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void liveQuery.refetch()}
+              disabled={liveQuery.isFetching}
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1] transition"
+            >
+              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
+            </button>
+            {subView === "freezer" ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void resetFreezerSnapshot()}
+                  disabled={savingSnapshot}
+                  className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1] transition"
+                  title="Make QUANTITY show the full totals again (as if you never printed today)"
+                >
+                  ↺ Reset Print
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handlePrintFreezer()}
+                  disabled={freezerRows.length === 0}
+                  className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
+                >
+                  🖨️ Print Freezer List
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => window.print()}
+                disabled={bakeryRows.length === 0}
+                className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
+              >
+                🖨️ Print Bakery List
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="flex gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1 w-fit">
+          {([
+            { id: "freezer", label: `🧊 Freezer List (${freezerRows.length})` },
+            { id: "bakery", label: `🍞 Bakery List (${bakeryRows.length})` },
+          ] as const).map((v) => (
+            <button
+              key={v.id}
+              type="button"
+              onClick={() => setSubView(v.id)}
+              className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
+                subView === v.id ? "bg-[#2a1810] text-white" : "text-[#6b5544] hover:bg-white"
+              }`}
+            >
+              {v.label}
+            </button>
+          ))}
+        </div>
+
+        {subView === "freezer" && (
+          <p className="text-[11px] text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2.5 py-1.5">
+            <strong>QUANTITY</strong> = new since your last print (prints save the snapshot) ·{" "}
+            <strong>SUBTOTAL</strong> = full total on the sheet · zero rows hidden ·{" "}
+            {freezerNewCount > 0
+              ? `🔴 ${freezerNewCount} product${freezerNewCount === 1 ? "" : "s"} got new orders since the last print`
+              : "nothing new since the last print"}
+          </p>
+        )}
+      </div>
+
+      {subView === "freezer" ? (
+        freezerRows.length === 0 ? (
+          <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
+            <p className="text-sm font-semibold text-[#2a1810]">No freezer products ordered yet</p>
+            <p className="text-xs text-[#8b6f4e] mt-1">
+              As soon as a freezer product has a quantity on the sheet it appears here.
+            </p>
+          </div>
+        ) : (
+          <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden print:rounded-none print:border-0 print:shadow-none">
+            <div className="overflow-x-auto print:overflow-visible">
+              <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ background: "#dfe8f3" }}>
+                    <th style={{ ...thStyle, textAlign: "left" }}>PRODUCT NAME FOR FREEZER</th>
+                    <th style={{ ...thStyle, textAlign: "center", width: 90 }}>QUANTITY</th>
+                    <th style={{ ...thStyle, textAlign: "center", width: 100 }}>SUBTOTAL</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {freezerRows.map((r) => (
+                    <tr key={r.name} style={r.sincePrint > 0 ? { background: "#fdecea" } : undefined}>
+                      <td style={tdStyle}>{r.name}</td>
+                      <td
+                        style={{
+                          ...tdStyle,
+                          textAlign: "center",
+                          fontWeight: r.sincePrint > 0 ? 700 : 400,
+                          color: r.sincePrint > 0 ? "#c8362b" : "#000",
+                        }}
+                      >
+                        {fmtQty(r.sincePrint)}
+                      </td>
+                      <td style={{ ...tdStyle, textAlign: "center", fontWeight: 700 }}>
+                        {fmtQty(r.total)}
+                      </td>
+                    </tr>
+                  ))}
+                  <tr style={{ background: "#dfe8f3" }}>
+                    <td style={{ ...tdStyle, fontWeight: 700 }}>TOTAL</td>
+                    <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: 15 }}>
+                      {fmtQty(freezerTotQty)}
+                    </td>
+                    <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: 15 }}>
+                      {fmtQty(freezerTotSub)}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )
+      ) : bakeryRows.length === 0 ? (
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
+          <p className="text-sm font-semibold text-[#2a1810]">No bakery products ordered yet</p>
+          <p className="text-xs text-[#8b6f4e] mt-1">
+            As soon as a bakery product has a quantity on the sheet it appears here.
+          </p>
+        </div>
+      ) : (
+        <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden print:rounded-none print:border-0 print:shadow-none">
+          <div className="overflow-x-auto print:overflow-visible">
+            <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ background: "#dfe8f3" }}>
+                  <th style={{ ...thStyle, textAlign: "left" }}>PRODUCT</th>
+                  <th style={{ ...thStyle, textAlign: "center", width: 110 }}>SUBTOTAL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bakeryRows.map((r) => (
+                  <tr key={r.name}>
+                    <td style={tdStyle}>{r.name}</td>
+                    <td style={{ ...tdStyle, textAlign: "center", fontWeight: 700 }}>
+                      {fmtQty(r.total)}
+                    </td>
+                  </tr>
+                ))}
+                <tr style={{ background: "#dfe8f3" }}>
+                  <td style={{ ...tdStyle, fontWeight: 700 }}>TOTAL</td>
+                  <td style={{ ...tdStyle, textAlign: "center", fontWeight: 900, fontSize: 15 }}>
+                    {fmtQty(bakeryTotSub)}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </section>

@@ -1919,6 +1919,75 @@ export const setCustomerInvoiceType = createServerFn({ method: "POST" })
     return current;
   });
 
+// ============================== FREEZER LIST STATE ==============================
+// Snapshot of the per-product FREEZER totals at the moment the Freezer List
+// was printed, keyed by delivery date. Lets the Freezer List show
+// QUANTITY = new since your last print, and SUBTOTAL = full current total.
+// Same sheet_groups JSON pattern as the print-sheet state / invoice types.
+const FREEZER_STATE_SLUG = "__freezer_list_state_v1__";
+
+export type PersistedFreezerListState = {
+  updatedAt: string;
+  printedByDate: Record<string, Record<string, number>>;
+};
+
+async function readServerFreezerListState(): Promise<PersistedFreezerListState> {
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const { data } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("name")
+      .eq("slug", FREEZER_STATE_SLUG)
+      .maybeSingle();
+    if (data?.name) {
+      const parsed = JSON.parse(data.name) as Partial<PersistedFreezerListState>;
+      return {
+        updatedAt: parsed.updatedAt ?? new Date().toISOString(),
+        printedByDate: parsed.printedByDate ?? {},
+      };
+    }
+  } catch {
+    // non-fatal
+  }
+  return { updatedAt: new Date().toISOString(), printedByDate: {} };
+}
+
+async function writeServerFreezerListState(state: PersistedFreezerListState): Promise<void> {
+  const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+  const payload = JSON.stringify(state);
+  const { data: existing } = await supabaseAdmin
+    .from("sheet_groups")
+    .select("id")
+    .eq("slug", FREEZER_STATE_SLUG)
+    .maybeSingle();
+  if (existing?.id) {
+    await supabaseAdmin.from("sheet_groups").update({ name: payload }).eq("id", existing.id);
+  } else {
+    await supabaseAdmin.from("sheet_groups").insert({ slug: FREEZER_STATE_SLUG, name: payload });
+  }
+}
+
+export const getFreezerListState = createServerFn({ method: "GET" }).handler(async () => {
+  return readServerFreezerListState();
+});
+
+export const saveFreezerListState = createServerFn({ method: "POST" })
+  .validator((d) =>
+    z
+      .object({
+        forDate: z.string().min(1),
+        printedTotals: z.record(z.string(), z.number()),
+      })
+      .parse(d),
+  )
+  .handler(async ({ data }) => {
+    const current = await readServerFreezerListState();
+    current.printedByDate[data.forDate] = data.printedTotals;
+    current.updatedAt = new Date().toISOString();
+    await writeServerFreezerListState(current);
+    return current;
+  });
+
 type ArchivedDateCustomerOrder = {
   name: string;
   slug: string;
