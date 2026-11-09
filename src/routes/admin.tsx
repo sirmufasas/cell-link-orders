@@ -5087,6 +5087,13 @@ function PrintSheetTab() {
   } = layout;
   const totalSheetWidthPx = colWidths.reduce((s, w) => s + w, 0);
 
+  // Which delivery date the user is currently looking at — snapshots are
+  // scoped to it, so printing for one day never hides another day's invoices.
+  // NOTE: must be declared BEFORE the refs below that read it, otherwise it's
+  // a "Cannot access ... before initialization" crash (TDZ).
+  const viewForDate =
+    selectedPrintDate === "__live__" ? liveQuery.data?.forDate ?? "" : selectedPrintDate;
+
   const [printedSnapshotsByDate, setPrintedSnapshotsByDate] = useState<
     Record<string, Record<string, PrintedCustomerSnapshot>>
   >(() => loadInitialPrintedSnapshotsByDate());
@@ -5094,11 +5101,6 @@ function PrintSheetTab() {
   printedByDateRef.current = printedSnapshotsByDate;
   const viewForDateRef = useRef(viewForDate);
   viewForDateRef.current = viewForDate;
-
-  // Which delivery date the user is currently looking at — snapshots are
-  // scoped to it, so printing for one day never hides another day's invoices.
-  const viewForDate =
-    selectedPrintDate === "__live__" ? liveQuery.data?.forDate ?? "" : selectedPrintDate;
   const printedSnapshots = useMemo(
     () => printedSnapshotsByDate[viewForDate] ?? {},
     [printedSnapshotsByDate, viewForDate],
