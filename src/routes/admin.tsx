@@ -66,7 +66,6 @@ export const Route = createFileRoute("/admin")({
 });
 
 type Bucket = "day" | "week" | "month";
-type Dim = "items" | "products" | "customers";
 type AdminTab =
   | "customers"
   | "manual"
@@ -465,7 +464,6 @@ function AdminPage() {
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [bucket, setBucket] = useState<Bucket>("day");
-  const [dim, setDim] = useState<Dim>("items");
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof getSubmissionDetail>> | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -848,21 +846,37 @@ function AdminPage() {
   // bucketKey — day/week/month all go through the exact same aggregation
   // and rendering path below, they just group by a different-sized bucket.
   const timeSeries = useMemo(() => {
-    if (dim === "items") {
-      const m = new Map<string, number>();
-      for (const s of analytics) {
-        const k = bucketKey(s.for_date, bucket);
-        m.set(k, (m.get(k) ?? 0) + (s.total_items ?? 0));
-      }
-      const arr = Array.from(m.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, value]) => ({ key, value }));
-      // Pad empty state so chart still renders
-      if (arr.length === 0) return [{ key: "—", value: 0 }, { key: " ", value: 0 }];
-      return arr;
+    const m = new Map<string, number>();
+    for (const s of analytics) {
+      const k = bucketKey(s.for_date, bucket);
+      m.set(k, (m.get(k) ?? 0) + (s.total_items ?? 0));
     }
-    return [];
-  }, [analytics, bucket, dim]);
+    // Continuous axis for the recent window so gaps show as 0 instead of
+    // squashing the chart into only the days that had orders.
+    const now = new Date();
+    const keys: string[] = [];
+    if (bucket === "day") {
+      for (let i = 13; i >= 0; i--) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - i);
+        keys.push(toLocalISODate(d));
+      }
+    } else if (bucket === "week") {
+      for (let i = 9; i >= 0; i--) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - 7 * i);
+        keys.push(bucketKey(toLocalISODate(d), "week"));
+      }
+    } else {
+      for (let i = 11; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        keys.push(bucketKey(toLocalISODate(d), "month"));
+      }
+    }
+    const unique = Array.from(new Set(keys));
+    if (unique.length === 0) return [{ key: "—", value: 0 }];
+    return unique.map((k) => ({ key: k, value: m.get(k) ?? 0 }));
+  }, [analytics, bucket]);
 
   const topProducts = useMemo(() => {
     const m = new Map<string, number>();
@@ -890,6 +904,41 @@ function AdminPage() {
     if (arr.length === 0) return [{ name: "No data yet", qty: 0 }];
     return arr;
   }, [analytics]);
+
+  // ── Analytics: today's cycle stats (orders for tomorrow's delivery) ──
+  const todayStats = useMemo(() => {
+    const cycleKey = saTomorrowISO();
+    const subs = submissions.filter(
+      (s) => s.for_date === cycleKey && (s.total_items ?? 0) > 0,
+    );
+    const items = subs.reduce((a, s) => a + (s.total_items ?? 0), 0);
+    const custSet = new Set(subs.map((s) => s.customer?.slug ?? s.customer?.name ?? ""));
+    const linked = subs.filter((s) => !isAdminOrderMessage(s.message));
+    const manual = subs.filter((s) => isAdminOrderMessage(s.message));
+    return {
+      orders: subs.length,
+      items,
+      customers: custSet.size,
+      late: subs.filter((s) => s.order_type === "late").length,
+      linkedOrders: linked.length,
+      linkedItems: linked.reduce((a, s) => a + (s.total_items ?? 0), 0),
+      manualOrders: manual.length,
+      manualItems: manual.reduce((a, s) => a + (s.total_items ?? 0), 0),
+    };
+  }, [submissions]);
+
+  const driverBreakdown = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const c of liveSheetData?.customers ?? []) {
+      if (c.totalQuantity > 0) {
+        const d = c.driver || "Collection";
+        m.set(d, Math.round(((m.get(d) ?? 0) + c.totalQuantity) * 1000) / 1000);
+      }
+    }
+    return Array.from(m.entries()).sort((a, b) => b[1] - a[1]);
+  }, [liveSheetData]);
+  const driverSheetTotal =
+    Math.round(driverBreakdown.reduce((a, b) => a + b[1], 0) * 1000) / 1000;
 
   const activeOnSheetCount = useMemo(
     () => (liveSheetData?.customers ?? []).filter((c) => c.totalQuantity > 0).length,
@@ -1380,7 +1429,13 @@ function AdminPage() {
 
         {tab === "analytics" && (
           <section className="space-y-4">
-            <div className="flex flex-wrap gap-2 items-center">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="font-bold text-[#2a1810]">📊 Analytics</h2>
+                <p className="text-xs text-[#8b6f4e]">
+                  Today’s numbers are for the current sheet cycle (delivery {saTomorrowISO()})
+                </p>
+              </div>
               <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1">
                 {(["day", "week", "month"] as const).map((b) => (
                   <button key={b} onClick={() => setBucket(b)}
@@ -1389,43 +1444,142 @@ function AdminPage() {
                   </button>
                 ))}
               </div>
-              <div className="flex gap-1 bg-white border border-[#e8dcc8] rounded-xl p-1">
-                {(["items", "products", "customers"] as const).map((d) => (
-                  <button key={d} onClick={() => setDim(d)}
-                    className={`px-3 py-1 rounded-lg text-xs font-semibold ${dim === d ? "bg-[#c8362b] text-white" : "text-[#6b5544]"}`}>
-                    {d === "items" ? "Items over time" : d === "products" ? "Top products" : "Top customers"}
-                  </button>
-                ))}
-              </div>
             </div>
 
-            <ChartCard title={
-              dim === "items" ? `Items per ${bucket}` : dim === "products" ? "Top 10 products (all time)" : "Top 10 customers (all time)"
-            }>
-              <ResponsiveContainer width="100%" height={300}>
-                {dim === "items" ? (
-                  <LineChart data={timeSeries}>
-                    <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
-                    <XAxis
-                      dataKey="key"
-                      tick={{ fontSize: 11 }}
-                      tickFormatter={(k: string) => bucketLabel(k, bucket)}
-                    />
-                    <YAxis tick={{ fontSize: 11 }} allowDecimals={false} domain={[0, "auto"]} />
-                    <Tooltip labelFormatter={(k: string) => bucketLabel(k, bucket)} />
-                    <Line type="monotone" dataKey="value" stroke="#c8362b" strokeWidth={2} dot />
-                  </LineChart>
-                ) : (
-                  <BarChart data={dim === "products" ? topProducts : topCustomers}>
-                    <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
-                    <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-25} textAnchor="end" height={70} />
-                    <YAxis tick={{ fontSize: 11 }} allowDecimals={false} domain={[0, "auto"]} />
-                    <Tooltip />
-                    <Bar dataKey="qty" fill="#c8362b" />
-                  </BarChart>
-                )}
+            {/* KPI cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+              {[
+                { label: "Orders today", value: String(todayStats.orders), hint: "this cycle" },
+                { label: "Items today", value: fmtQty(todayStats.items), hint: "total quantity" },
+                { label: "Customers", value: String(todayStats.customers), hint: "ordered today" },
+                { label: "Late orders", value: String(todayStats.late), hint: "after 19:00" },
+                {
+                  label: "Avg per order",
+                  value: todayStats.orders ? fmtQty(Math.round((todayStats.items / todayStats.orders) * 10) / 10) : "—",
+                  hint: "items",
+                },
+              ].map((k) => (
+                <div key={k.label} className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm">
+                  <div className="text-[10px] uppercase tracking-wider text-[#8b6f4e] font-bold">{k.label}</div>
+                  <div className="text-2xl font-black text-[#2a1810] mt-1">{k.value}</div>
+                  <div className="text-[10px] text-[#8b6f4e] mt-0.5">{k.hint}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Items over time */}
+            <ChartCard title={`Items over time (${bucket === "day" ? "last 14 days" : bucket === "week" ? "last 10 weeks" : "last 12 months"})`}>
+              <ResponsiveContainer width="100%" height={280}>
+                <LineChart data={timeSeries}>
+                  <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" />
+                  <XAxis
+                    dataKey="key"
+                    tick={{ fontSize: 11 }}
+                    tickFormatter={(k: string) => bucketLabel(k, bucket)}
+                  />
+                  <YAxis tick={{ fontSize: 11 }} allowDecimals={false} domain={[0, "auto"]} />
+                  <Tooltip
+                    labelFormatter={(k: string) => bucketLabel(k, bucket)}
+                    formatter={(v: number) => [`${v} items`, "Items"]}
+                  />
+                  <Line type="monotone" dataKey="value" stroke="#c8362b" strokeWidth={2.5} dot={{ r: 3 }} activeDot={{ r: 5 }} />
+                </LineChart>
               </ResponsiveContainer>
             </ChartCard>
+
+            {/* Top products + customers */}
+            <div className="grid gap-4 lg:grid-cols-2">
+              <ChartCard title="Top 10 products (all time)">
+                <ResponsiveContainer width="100%" height={320}>
+                  <BarChart data={topProducts} layout="vertical" margin={{ left: 8, right: 16 }}>
+                    <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" horizontal={false} />
+                    <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
+                    <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={150} />
+                    <Tooltip formatter={(v: number) => [`${v} items`, "Quantity"]} />
+                    <Bar dataKey="qty" fill="#c8362b" radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartCard>
+              <ChartCard title="Top 10 customers (all time)">
+                <ResponsiveContainer width="100%" height={320}>
+                  <BarChart data={topCustomers} layout="vertical" margin={{ left: 8, right: 16 }}>
+                    <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" horizontal={false} />
+                    <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
+                    <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={150} />
+                    <Tooltip formatter={(v: number) => [`${v} items`, "Items"]} />
+                    <Bar dataKey="qty" fill="#2a1810" radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartCard>
+            </div>
+
+            {/* Driver breakdown + Linked vs Manual */}
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-sm text-[#2a1810]">🚚 Current sheet by driver</h3>
+                  <span className="text-xs text-[#8b6f4e]">{fmtQty(driverSheetTotal)} items</span>
+                </div>
+                {driverBreakdown.length === 0 ? (
+                  <p className="text-xs text-[#8b6f4e]">No orders on the current sheet.</p>
+                ) : (
+                  <div className="space-y-2.5">
+                    {driverBreakdown.map(([driver, qty]) => (
+                      <div key={driver}>
+                        <div className="flex items-center justify-between text-xs font-semibold text-[#2a1810]">
+                          <span>{driver}</span>
+                          <span>{fmtQty(qty)}</span>
+                        </div>
+                        <div className="h-2.5 bg-[#fdf8f1] rounded-full overflow-hidden mt-1">
+                          <div
+                            className="h-full rounded-full bg-[#c8362b]"
+                            style={{ width: `${driverBreakdown[0][1] > 0 ? (qty / driverBreakdown[0][1]) * 100 : 0}%` }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-white rounded-2xl border border-[#e8dcc8] p-4 shadow-sm space-y-3">
+                <h3 className="font-bold text-sm text-[#2a1810]">🔗 Linked vs ⚡ Manual (today)</h3>
+                {todayStats.linkedOrders + todayStats.manualOrders === 0 ? (
+                  <p className="text-xs text-[#8b6f4e]">No orders yet today.</p>
+                ) : (
+                  <>
+                    <div className="flex h-4 rounded-full overflow-hidden border border-[#e8dcc8]">
+                      <div
+                        className="bg-[#2a1810]"
+                        style={{
+                          width: `${(todayStats.linkedOrders / Math.max(1, todayStats.linkedOrders + todayStats.manualOrders)) * 100}%`,
+                        }}
+                        title="Linked orders"
+                      />
+                      <div
+                        className="bg-[#c8362b]"
+                        style={{
+                          width: `${(todayStats.manualOrders / Math.max(1, todayStats.linkedOrders + todayStats.manualOrders)) * 100}%`,
+                        }}
+                        title="Manual orders"
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-[#fdf8f1] rounded-xl p-2.5">
+                        <div className="text-[10px] font-bold uppercase text-[#8b6f4e]">🔗 From customer links</div>
+                        <div className="text-lg font-black text-[#2a1810]">{todayStats.linkedOrders}</div>
+                        <div className="text-[10px] text-[#8b6f4e]">{fmtQty(todayStats.linkedItems)} items</div>
+                      </div>
+                      <div className="bg-[#fdf8f1] rounded-xl p-2.5">
+                        <div className="text-[10px] font-bold uppercase text-[#8b6f4e]">⚡ Typed by you</div>
+                        <div className="text-lg font-black text-[#2a1810]">{todayStats.manualOrders}</div>
+                        <div className="text-[10px] text-[#8b6f4e]">{fmtQty(todayStats.manualItems)} items</div>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
 
             {analytics.length === 0 && (
               <p className="text-center text-xs text-[#8b6f4e]">
@@ -2824,9 +2978,11 @@ function ProductionListsTab() {
     categoryByLower.get(name.trim().toLowerCase()) === "FREEZER";
 
   const snapshots = useMemo(() => {
-    return (
-      freezerStateQ.data?.printedByDate?.[forDate] ?? { freezer: {}, bakery: {} }
-    );
+    return freezerStateQ.data?.printedByDate?.[forDate] ?? {
+      freezer: {},
+      bakery: {},
+      kota: {},
+    };
   }, [freezerStateQ.data, forDate]);
 
   type Row = { name: string; total: number; sincePrint: number };
@@ -3220,51 +3376,158 @@ function fmtQty(n: number): string {
   return Number.isInteger(rounded) ? String(rounded) : String(rounded);
 }
 
+function crateInfo(kotas: number) {
+  const total = Math.round(kotas * 1000) / 1000;
+  const fullCrates = Math.floor(total / KOTAS_PER_CRATE);
+  const loose = Math.round((total - fullCrates * KOTAS_PER_CRATE) * 1000) / 1000;
+  const cratesToTake = Math.ceil(total / KOTAS_PER_CRATE);
+  return { total, fullCrates, loose, cratesToTake };
+}
+
 function KotaJoeTab() {
+  const qc = useQueryClient();
   const liveQuery = useQuery(liveSheetOrdersQuery);
+  const freezerStateQ = useQuery(freezerListStateQuery);
+
+  // "to_print" = only what's new/changed since the last print (like the Print
+  // Sheet's To Print view); "all" = the full combined list.
+  const [view, setView] = useState<"to_print" | "all">("to_print");
+  const [savingSnapshot, setSavingSnapshot] = useState(false);
+
+  const customers = liveQuery.data?.customers ?? [];
+  const forDate = liveQuery.data?.forDate ?? "";
 
   const stores = useMemo(() => {
-    return (liveQuery.data?.customers ?? [])
+    return customers
       .filter((c) => c.name.toLowerCase().replace(/[^a-z0-9]/g, "").includes("kotajoe"))
       .sort((a, b) => a.name.localeCompare(b.name));
-  }, [liveQuery.data?.customers]);
+  }, [customers]);
 
   const storeShort = (name: string) => name.replace(/kota\s*joe\s*/i, "").trim() || name;
 
-  const productRows = useMemo(() => {
-    // productName (display) -> per-store qty keyed by store slug
-    const byKey = new Map<string, { name: string; qtyByStore: Map<string, number>; total: number }>();
+  // Snapshot of what was printed: compound key `${productLower}||${storeSlug}`
+  const kotaSnapshot = useMemo(() => {
+    return freezerStateQ.data?.printedByDate?.[forDate]?.kota ?? {};
+  }, [freezerStateQ.data, forDate]);
+
+  type KotaRow = {
+    name: string;
+    byStore: Map<string, number>;
+    total: number;
+    deltaByStore: Map<string, number>;
+    deltaTotal: number;
+  };
+
+  const allRows = useMemo(() => {
+    const byKey = new Map<string, KotaRow>();
     for (const st of stores) {
       for (const r of st.rows) {
         if (!(r.quantity > 0)) continue;
         const key = r.productName.trim().toLowerCase();
         let entry = byKey.get(key);
         if (!entry) {
-          entry = { name: r.productName, qtyByStore: new Map(), total: 0 };
+          entry = {
+            name: r.productName,
+            byStore: new Map(),
+            total: 0,
+            deltaByStore: new Map(),
+            deltaTotal: 0,
+          };
           byKey.set(key, entry);
         }
-        entry.qtyByStore.set(st.slug, (entry.qtyByStore.get(st.slug) ?? 0) + r.quantity);
+        entry.byStore.set(st.slug, (entry.byStore.get(st.slug) ?? 0) + r.quantity);
         entry.total = Math.round((entry.total + r.quantity) * 1000) / 1000;
+
+        const printed = kotaSnapshot[`${key}||${st.slug}`] ?? 0;
+        const delta = Math.max(0, Math.round((r.quantity - printed) * 1000) / 1000);
+        entry.deltaByStore.set(st.slug, (entry.deltaByStore.get(st.slug) ?? 0) + delta);
+        entry.deltaTotal = Math.round((entry.deltaTotal + delta) * 1000) / 1000;
       }
     }
-    return Array.from(byKey.values()).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
-  }, [stores]);
+    return Array.from(byKey.values()).sort(
+      (a, b) => b.total - a.total || a.name.localeCompare(b.name),
+    );
+  }, [stores, kotaSnapshot]);
+
+  const toPrintRows = useMemo(() => {
+    return allRows
+      .filter((r) => r.deltaTotal > 0)
+      .sort((a, b) => b.deltaTotal - a.deltaTotal || a.name.localeCompare(b.name));
+  }, [allRows]);
+
+  const displayRows = view === "to_print" ? toPrintRows : allRows;
 
   const storeTotals = useMemo(() => {
-    return stores.map((st) => ({
-      slug: st.slug,
-      total: Math.round(st.rows.reduce((sum, r) => sum + (r.quantity > 0 ? r.quantity : 0), 0) * 1000) / 1000,
-    }));
-  }, [stores]);
+    return stores.map((st) => {
+      const full =
+        Math.round(
+          st.rows.reduce((sum, r) => sum + (r.quantity > 0 ? r.quantity : 0), 0) * 1000,
+        ) / 1000;
+      const delta =
+        Math.round(
+          allRows.reduce((sum, r) => sum + (r.deltaByStore.get(st.slug) ?? 0), 0) * 1000,
+        ) / 1000;
+      return { slug: st.slug, full, delta };
+    });
+  }, [stores, allRows]);
 
-  const grandTotal = Math.round(storeTotals.reduce((a, b) => a + b.total, 0) * 1000) / 1000;
+  const grandFull = Math.round(storeTotals.reduce((a, b) => a + b.full, 0) * 1000) / 1000;
+  const grandDelta = Math.round(storeTotals.reduce((a, b) => a + b.delta, 0) * 1000) / 1000;
 
-  const kotaRow = productRows.find((r) => r.name.trim().toLowerCase() === "kota");
-  const totalKotas = kotaRow?.total ?? 0;
-  const fullCrates = Math.floor(Math.round(totalKotas * 1000) / 1000 / KOTAS_PER_CRATE);
-  const looseKotas =
-    Math.round((Math.round(totalKotas * 1000) / 1000 - fullCrates * KOTAS_PER_CRATE) * 1000) / 1000;
-  const cratesToTake = Math.ceil(Math.round(totalKotas * 1000) / 1000 / KOTAS_PER_CRATE);
+  const kotaRowAll = allRows.find((r) => r.name.trim().toLowerCase() === "kota");
+  const totalKotas = kotaRowAll?.total ?? 0;
+  const newKotas = kotaRowAll?.deltaTotal ?? 0;
+  const totalCrates = crateInfo(totalKotas);
+  const newCrates = crateInfo(newKotas);
+
+  async function persistKotaSnapshot() {
+    if (!forDate) return;
+    const totals: Record<string, number> = {};
+    for (const r of allRows) {
+      for (const [slug, qty] of r.byStore) {
+        totals[`${r.name.trim().toLowerCase()}||${slug}`] = qty;
+      }
+    }
+    setSavingSnapshot(true);
+    try {
+      await saveFreezerListState({ data: { forDate, list: "kota", printedTotals: totals } });
+      await qc.invalidateQueries({ queryKey: ["freezer-list-state"] });
+    } catch {
+      // non-fatal — the list still prints
+    } finally {
+      setSavingSnapshot(false);
+    }
+  }
+
+  async function handlePrint() {
+    await persistKotaSnapshot();
+    window.print();
+  }
+
+  async function resetKotaSnapshot() {
+    if (!window.confirm("Reset the printed Kota Joe list? Everything will show as new again.")) return;
+    if (!forDate) return;
+    setSavingSnapshot(true);
+    try {
+      await saveFreezerListState({ data: { forDate, list: "kota", printedTotals: {} } });
+      await qc.invalidateQueries({ queryKey: ["freezer-list-state"] });
+    } catch {
+      // non-fatal
+    } finally {
+      setSavingSnapshot(false);
+    }
+  }
+
+  // Ctrl+P / Cmd+P also saves the snapshot, exactly like the Print Sheet.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onBeforePrint = () => {
+      void persistKotaSnapshot();
+    };
+    window.addEventListener("beforeprint", onBeforePrint);
+    return () => window.removeEventListener("beforeprint", onBeforePrint);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allRows, forDate]);
 
   if (liveQuery.isLoading) {
     return (
@@ -3275,6 +3538,19 @@ function KotaJoeTab() {
       </section>
     );
   }
+
+  const thStyle: React.CSSProperties = {
+    border: "1px solid #434343",
+    padding: "6px 8px",
+    textAlign: "center",
+    fontSize: 14,
+    fontWeight: 700,
+  };
+  const tdStyle: React.CSSProperties = {
+    border: "1px solid #434343",
+    padding: "5px 8px",
+    fontSize: 14,
+  };
 
   return (
     <section className="space-y-3 print:space-y-0">
@@ -3297,10 +3573,13 @@ function KotaJoeTab() {
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="font-bold text-sm text-[#2a1810]">🔥 Kota Joe — Combined Order</h2>
             <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
-              {liveQuery.data?.sheetLabel ?? ""} · {liveQuery.data?.forDate ?? ""}
+              {liveQuery.data?.sheetLabel ?? ""} · {forDate}
             </span>
             <span className="text-xs text-[#8b6f4e]">
-              {stores.length} stores · {productRows.length} products · {fmtQty(grandTotal)} items
+              {stores.length} stores ·{" "}
+              {view === "to_print"
+                ? `${toPrintRows.length} products with new orders`
+                : `${allRows.length} products · ${fmtQty(grandFull)} items`}
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -3314,29 +3593,67 @@ function KotaJoeTab() {
             </button>
             <button
               type="button"
-              onClick={() => window.print()}
-              disabled={productRows.length === 0}
+              onClick={() => void resetKotaSnapshot()}
+              disabled={savingSnapshot}
+              className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] text-[#6b5544] hover:bg-[#fdf8f1] transition"
+              title="Show everything as new again (as if you never printed)"
+            >
+              ↺ Reset Print
+            </button>
+            <button
+              type="button"
+              onClick={() => void handlePrint()}
+              disabled={displayRows.length === 0}
               className="text-xs font-bold px-3.5 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] text-white shadow-sm transition disabled:opacity-50"
             >
               🖨️ Print Kota Joe List
             </button>
           </div>
         </div>
+
+        <div className="flex gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1 w-fit">
+          {([
+            { id: "to_print", label: `🔴 To Print — New (${toPrintRows.length})` },
+            { id: "all", label: `Show All (${allRows.length})` },
+          ] as const).map((v) => (
+            <button
+              key={v.id}
+              type="button"
+              onClick={() => setView(v.id)}
+              className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
+                view === v.id ? "bg-[#2a1810] text-white" : "text-[#6b5544] hover:bg-white"
+              }`}
+            >
+              {v.label}
+            </button>
+          ))}
+        </div>
+
+        <p className="text-[11px] text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2.5 py-1.5">
+          Works like the Print Sheet: printing remembers what was printed, and only{" "}
+          <strong>new additions</strong> show under <strong>To Print</strong> until you reset. The
+          numbers in the To Print view are the <strong>new quantities</strong> since your last print.
+        </p>
       </div>
 
       {stores.length === 0 ? (
         <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
           <p className="text-sm font-semibold text-[#2a1810]">No Kota Joe stores found on the live sheet</p>
           <p className="text-xs text-[#8b6f4e] mt-1">
-            Looked for customers whose name contains “Kota Joe”. Once they have their regular products
-            on the sheet they will show up here.
+            Looked for customers whose name contains “Kota Joe”.
           </p>
         </div>
-      ) : productRows.length === 0 ? (
+      ) : displayRows.length === 0 ? (
         <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
-          <p className="text-sm font-semibold text-[#2a1810]">No Kota Joe orders on today’s sheet yet</p>
+          <p className="text-sm font-semibold text-[#2a1810]">
+            {view === "to_print"
+              ? "Nothing new since the last print ✅"
+              : "No Kota Joe orders on today’s sheet yet"}
+          </p>
           <p className="text-xs text-[#8b6f4e] mt-1">
-            Quantities will appear here as soon as any Kota Joe store has items on the sheet.
+            {view === "to_print"
+              ? "New orders will appear here automatically — switch to Show All to see the full list."
+              : "Quantities will appear here as soon as any Kota Joe store has items on the sheet."}
           </p>
         </div>
       ) : (
@@ -3345,112 +3662,84 @@ function KotaJoeTab() {
             <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
               <thead>
                 <tr style={{ background: "#dfe8f3" }}>
-                  <th
-                    style={{
-                      border: "1px solid #434343",
-                      padding: "6px 10px",
-                      textAlign: "left",
-                      fontSize: 14,
-                      fontWeight: 700,
-                    }}
-                  >
-                    PRODUCT
-                  </th>
+                  <th style={{ ...thStyle, textAlign: "left" }}>PRODUCT</th>
                   {stores.map((st) => (
-                    <th
-                      key={st.slug}
-                      style={{
-                        border: "1px solid #434343",
-                        padding: "6px 8px",
-                        textAlign: "center",
-                        fontSize: 14,
-                        fontWeight: 700,
-                      }}
-                    >
+                    <th key={st.slug} style={thStyle}>
                       {storeShort(st.name)}
                     </th>
                   ))}
-                  <th
-                    style={{
-                      border: "1px solid #434343",
-                      padding: "6px 8px",
-                      textAlign: "center",
-                      fontSize: 14,
-                      fontWeight: 700,
-                      background: "#c8362b",
-                      color: "#fff",
-                    }}
-                  >
-                    TOTAL
+                  <th style={{ ...thStyle, background: "#c8362b", color: "#fff" }}>
+                    {view === "to_print" ? "NEW TOTAL" : "TOTAL"}
                   </th>
                 </tr>
               </thead>
               <tbody>
-                {productRows.map((r) => (
-                  <tr key={r.name}>
-                    <td
-                      style={{
-                        border: "1px solid #434343",
-                        padding: "5px 10px",
-                        fontSize: 14,
-                        fontWeight: r.name.trim().toLowerCase() === "kota" ? 700 : 400,
-                      }}
-                    >
-                      {r.name}
-                    </td>
-                    {stores.map((st) => {
-                      const q = r.qtyByStore.get(st.slug) ?? 0;
-                      return (
+                {displayRows.map((r) => {
+                  const cell = (slug: string) => {
+                    if (view === "to_print") {
+                      const d = r.deltaByStore.get(slug) ?? 0;
+                      return d > 0 ? fmtQty(d) : "–";
+                    }
+                    const q = r.byStore.get(slug) ?? 0;
+                    return q > 0 ? fmtQty(q) : "–";
+                  };
+                  const rowTotal = view === "to_print" ? r.deltaTotal : r.total;
+                  return (
+                    <tr key={r.name} style={view === "to_print" ? { background: "#fdecea" } : undefined}>
+                      <td
+                        style={{
+                          ...tdStyle,
+                          fontWeight: r.name.trim().toLowerCase() === "kota" ? 700 : 400,
+                        }}
+                      >
+                        {r.name}
+                      </td>
+                      {stores.map((st) => (
                         <td
                           key={st.slug}
                           style={{
-                            border: "1px solid #434343",
-                            padding: "5px 8px",
+                            ...tdStyle,
                             textAlign: "center",
-                            fontSize: 14,
-                            color: q > 0 ? "#000" : "#b9b9b9",
+                            color:
+                              view === "to_print"
+                                ? r.deltaByStore.get(st.slug)
+                                  ? "#c8362b"
+                                  : "#b9b9b9"
+                                : r.byStore.get(st.slug)
+                                ? "#000"
+                                : "#b9b9b9",
+                            fontWeight:
+                              view === "to_print" && r.deltaByStore.get(st.slug) ? 700 : 400,
                           }}
                         >
-                          {q > 0 ? fmtQty(q) : "–"}
+                          {cell(st.slug)}
                         </td>
-                      );
-                    })}
-                    <td
-                      style={{
-                        border: "1px solid #434343",
-                        padding: "5px 8px",
-                        textAlign: "center",
-                        fontSize: 14,
-                        fontWeight: 700,
-                        background: "#fdf3f2",
-                      }}
-                    >
-                      {fmtQty(r.total)}
-                    </td>
-                  </tr>
-                ))}
+                      ))}
+                      <td
+                        style={{
+                          ...tdStyle,
+                          textAlign: "center",
+                          fontWeight: 700,
+                          background: "#fdf3f2",
+                        }}
+                      >
+                        {fmtQty(rowTotal)}
+                      </td>
+                    </tr>
+                  );
+                })}
                 <tr style={{ background: "#dfe8f3" }}>
-                  <td style={{ border: "1px solid #434343", padding: "6px 10px", fontSize: 14, fontWeight: 700 }}>
-                    SUBTOTAL
+                  <td style={{ ...tdStyle, fontWeight: 700 }}>
+                    {view === "to_print" ? "NEW SUBTOTAL" : "SUBTOTAL"}
                   </td>
                   {storeTotals.map((st) => (
-                    <td
-                      key={st.slug}
-                      style={{
-                        border: "1px solid #434343",
-                        padding: "6px 8px",
-                        textAlign: "center",
-                        fontSize: 14,
-                        fontWeight: 700,
-                      }}
-                    >
-                      {fmtQty(st.total)}
+                    <td key={st.slug} style={{ ...tdStyle, textAlign: "center", fontWeight: 700 }}>
+                      {fmtQty(view === "to_print" ? st.delta : st.full)}
                     </td>
                   ))}
                   <td
                     style={{
-                      border: "1px solid #434343",
-                      padding: "6px 8px",
+                      ...tdStyle,
                       textAlign: "center",
                       fontSize: 15,
                       fontWeight: 900,
@@ -3458,7 +3747,7 @@ function KotaJoeTab() {
                       color: "#fff",
                     }}
                   >
-                    {fmtQty(grandTotal)}
+                    {fmtQty(view === "to_print" ? grandDelta : grandFull)}
                   </td>
                 </tr>
               </tbody>
@@ -3467,9 +3756,17 @@ function KotaJoeTab() {
 
           {/* Crates section */}
           <div
-            className="p-4 space-y-1"
+            className="p-4 space-y-1.5"
             style={{ background: "#dfe8f3", borderTop: "2px solid #434343" }}
           >
+            {view === "to_print" && newKotas > 0 && (
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#c8362b" }}>
+                🔴 NEW since last print: {fmtQty(newKotas)} kotas → take{" "}
+                {fmtQty(newCrates.cratesToTake)} more crate{newCrates.cratesToTake === 1 ? "" : "s"} (
+                {fmtQty(newCrates.fullCrates)} full
+                {newCrates.loose > 0 ? ` + ${fmtQty(newCrates.loose)} extra` : ""})
+              </div>
+            )}
             <div
               style={{
                 fontSize: 16,
@@ -3484,12 +3781,15 @@ function KotaJoeTab() {
             {totalKotas > 0 ? (
               <>
                 <div style={{ fontSize: 15, fontWeight: 700, color: "#c8362b" }}>
-                  {fmtQty(totalKotas)} kotas → take {fmtQty(cratesToTake)} crate
-                  {cratesToTake === 1 ? "" : "s"}
+                  TOTAL {fmtQty(totalKotas)} kotas → take {fmtQty(totalCrates.cratesToTake)} crate
+                  {totalCrates.cratesToTake === 1 ? "" : "s"}
                 </div>
                 <div style={{ fontSize: 13, color: "#434343" }}>
-                  {fmtQty(fullCrates)} full crate{fullCrates === 1 ? "" : "s"}
-                  {looseKotas > 0 ? ` + ${fmtQty(looseKotas)} kota${looseKotas === 1 ? "" : "s"} extra` : " exactly"}
+                  {fmtQty(totalCrates.fullCrates)} full crate
+                  {totalCrates.fullCrates === 1 ? "" : "s"}
+                  {totalCrates.loose > 0
+                    ? ` + ${fmtQty(totalCrates.loose)} kota${totalCrates.loose === 1 ? "" : "s"} extra`
+                    : " exactly"}
                 </div>
               </>
             ) : (
@@ -4594,13 +4894,22 @@ function getCustomerPrintStatus(
   return "printed_clean";
 }
 
-const PRINT_SNAPSHOTS_STORAGE_KEY = "bakery_printed_snapshots_v2";
+const PRINT_SNAPSHOTS_STORAGE_KEY = "bakery_printed_snapshots_v3"; // date-bucketed
 
-function loadInitialPrintedSnapshots(): Record<string, PrintedCustomerSnapshot> {
+/**
+ * Printed-customer snapshots, bucketed per DELIVERY DATE. A new delivery day
+ * always starts unprinted — this is what fixes customers going missing from
+ * "To Print" just because they ordered the same quantity as yesterday.
+ * Migrates the old undated v1/v2 localStorage snapshots into the bucket for
+ * the current live delivery date so nothing printed today is lost.
+ */
+function loadInitialPrintedSnapshotsByDate(): Record<
+  string,
+  Record<string, PrintedCustomerSnapshot>
+> {
   if (typeof window === "undefined") return {};
-  const merged: Record<string, PrintedCustomerSnapshot> = {};
+  const legacy: Record<string, PrintedCustomerSnapshot> = {};
   try {
-    // Migrate any earlier date-keyed v1 snapshots so nothing previously printed today is lost
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
       if (key && key.startsWith("bakery_printed_snapshots_v1_")) {
@@ -4609,20 +4918,37 @@ function loadInitialPrintedSnapshots(): Record<string, PrintedCustomerSnapshot> 
             string,
             PrintedCustomerSnapshot
           >;
-          Object.assign(merged, parsed);
+          Object.assign(legacy, parsed);
+          localStorage.removeItem(key);
         } catch {}
       }
     }
-    const rawV2 = localStorage.getItem(PRINT_SNAPSHOTS_STORAGE_KEY);
+    const rawV2 = localStorage.getItem("bakery_printed_snapshots_v2");
     if (rawV2) {
       const parsedV2 = JSON.parse(rawV2) as Record<string, PrintedCustomerSnapshot>;
-      Object.assign(merged, parsedV2);
+      Object.assign(legacy, parsedV2);
+      localStorage.removeItem("bakery_printed_snapshots_v2");
     }
-    if (Object.keys(merged).length > 0) {
-      localStorage.setItem(PRINT_SNAPSHOTS_STORAGE_KEY, JSON.stringify(merged));
+    const rawV3 = localStorage.getItem(PRINT_SNAPSHOTS_STORAGE_KEY);
+    if (rawV3) {
+      const parsedV3 = JSON.parse(rawV3) as Record<
+        string,
+        Record<string, PrintedCustomerSnapshot>
+      >;
+      if (legacy && Object.keys(legacy).length > 0) {
+        const todayKey = saTomorrowISO();
+        return {
+          ...parsedV3,
+          [todayKey]: { ...(parsedV3[todayKey] ?? {}), ...legacy },
+        };
+      }
+      return parsedV3;
+    }
+    if (Object.keys(legacy).length > 0) {
+      return { [saTomorrowISO()]: legacy };
     }
   } catch {}
-  return merged;
+  return {};
 }
 
 type PrintLayoutSettings = {
@@ -4761,8 +5087,21 @@ function PrintSheetTab() {
   } = layout;
   const totalSheetWidthPx = colWidths.reduce((s, w) => s + w, 0);
 
-  const [printedSnapshots, setPrintedSnapshots] = useState<Record<string, PrintedCustomerSnapshot>>(() =>
-    loadInitialPrintedSnapshots(),
+  const [printedSnapshotsByDate, setPrintedSnapshotsByDate] = useState<
+    Record<string, Record<string, PrintedCustomerSnapshot>>
+  >(() => loadInitialPrintedSnapshotsByDate());
+  const printedByDateRef = useRef(printedSnapshotsByDate);
+  printedByDateRef.current = printedSnapshotsByDate;
+  const viewForDateRef = useRef(viewForDate);
+  viewForDateRef.current = viewForDate;
+
+  // Which delivery date the user is currently looking at — snapshots are
+  // scoped to it, so printing for one day never hides another day's invoices.
+  const viewForDate =
+    selectedPrintDate === "__live__" ? liveQuery.data?.forDate ?? "" : selectedPrintDate;
+  const printedSnapshots = useMemo(
+    () => printedSnapshotsByDate[viewForDate] ?? {},
+    [printedSnapshotsByDate, viewForDate],
   );
 
   const [customModes, setCustomModes] = useState<Record<string, PrintCustomerMode>>(() => {
@@ -4788,11 +5127,12 @@ function PrintSheetTab() {
   });
 
   // Merge server-persisted print state (from Supabase) with local state whenever
-  // liveQuery finishes loading.
+  // liveQuery finishes loading. Snapshots are bucketed per delivery date.
   const serverSyncedOnceRef = useRef(false);
   useEffect(() => {
     if (!liveQuery.data) return;
-    const serverSnaps = liveQuery.data.printState?.printedSnapshots ?? {};
+    const liveForDate = liveQuery.data.forDate ?? "";
+    const serverSnaps = liveQuery.data.printState?.printedByDate?.[liveForDate] ?? {};
     const serverModes = liveQuery.data.printState?.customModes ?? {};
     const serverRemoved = liveQuery.data.printState?.removedProducts ?? {};
     const liveCusts = liveQuery.data.customers ?? [];
@@ -4800,35 +5140,44 @@ function PrintSheetTab() {
     // (so if the whole sheet clears for the next day, printed state isn't wiped prematurely).
     const anyActiveOnLiveSheet = liveCusts.some((c) => c.totalQuantity > 0);
 
-    setPrintedSnapshots((prev) => {
-      const merged: Record<string, PrintedCustomerSnapshot> = { ...serverSnaps, ...prev };
-      for (const [k, sSnap] of Object.entries(serverSnaps)) {
-        const lSnap = prev[k];
-        if (!lSnap || (sSnap.printedAt ?? "") > (lSnap.printedAt ?? "")) {
-          merged[k] = sSnap;
-        }
-      }
-      if (anyActiveOnLiveSheet) {
-        for (const c of liveCusts) {
-          const k = normPrintKey(c.name);
-          if (c.totalQuantity === 0 && merged[k]) {
-            delete merged[k];
+    if (liveForDate) {
+      setPrintedSnapshotsByDate((prevByDate) => {
+        const prev = prevByDate[liveForDate] ?? {};
+        const merged: Record<string, PrintedCustomerSnapshot> = { ...serverSnaps, ...prev };
+        for (const [k, sSnap] of Object.entries(serverSnaps)) {
+          const lSnap = prev[k];
+          if (!lSnap || (sSnap.printedAt ?? "") > (lSnap.printedAt ?? "")) {
+            merged[k] = sSnap;
           }
         }
-      }
-      if (typeof window !== "undefined") {
-        try {
-          localStorage.setItem(PRINT_SNAPSHOTS_STORAGE_KEY, JSON.stringify(merged));
-        } catch {}
-      }
-      if (!serverSyncedOnceRef.current && Object.keys(merged).length > Object.keys(serverSnaps).length) {
-        serverSyncedOnceRef.current = true;
-        void savePrintSheetState({ data: { printedSnapshots: merged } });
-      } else {
-        serverSyncedOnceRef.current = true;
-      }
-      return merged;
-    });
+        if (anyActiveOnLiveSheet) {
+          for (const c of liveCusts) {
+            const k = normPrintKey(c.name);
+            if (c.totalQuantity === 0 && merged[k]) {
+              delete merged[k];
+            }
+          }
+        }
+        const nextByDate = { ...prevByDate, [liveForDate]: merged };
+        if (typeof window !== "undefined") {
+          try {
+            localStorage.setItem(PRINT_SNAPSHOTS_STORAGE_KEY, JSON.stringify(nextByDate));
+          } catch {}
+        }
+        if (
+          !serverSyncedOnceRef.current &&
+          Object.keys(merged).length > Object.keys(serverSnaps).length
+        ) {
+          serverSyncedOnceRef.current = true;
+          void savePrintSheetState({
+            data: { forDate: liveForDate, printedSnapshots: merged },
+          });
+        } else {
+          serverSyncedOnceRef.current = true;
+        }
+        return nextByDate;
+      });
+    }
 
     if (Object.keys(serverModes).length > 0) {
       setCustomModes((prev) => {
@@ -4858,14 +5207,19 @@ function PrintSheetTab() {
   function persistSnapshotsOnly(next: Record<string, PrintedCustomerSnapshot>) {
     if (typeof window !== "undefined") {
       try {
-        localStorage.setItem(PRINT_SNAPSHOTS_STORAGE_KEY, JSON.stringify(next));
+        localStorage.setItem(
+          PRINT_SNAPSHOTS_STORAGE_KEY,
+          JSON.stringify({ ...printedByDateRef.current, [viewForDate]: next }),
+        );
       } catch {}
     }
-    void savePrintSheetState({ data: { printedSnapshots: next } });
+    if (viewForDate) {
+      void savePrintSheetState({ data: { forDate: viewForDate, printedSnapshots: next } });
+    }
   }
 
   function saveSnapshots(next: Record<string, PrintedCustomerSnapshot>) {
-    setPrintedSnapshots(next);
+    setPrintedSnapshotsByDate((prev) => ({ ...prev, [viewForDate]: next }));
     persistSnapshotsOnly(next);
   }
 
@@ -5144,7 +5498,10 @@ function PrintSheetTab() {
       if (pendingPrintSnapshotsRef.current) {
         const next = pendingPrintSnapshotsRef.current;
         pendingPrintSnapshotsRef.current = null;
-        setPrintedSnapshots(next);
+        setPrintedSnapshotsByDate((prev) => ({
+          ...prev,
+          [viewForDateRef.current]: next,
+        }));
       }
     };
     window.addEventListener("beforeprint", onBeforePrint);
@@ -5166,7 +5523,7 @@ function PrintSheetTab() {
     window.print();
     // Apply to React state so the printed customers immediately move to "Printed & Hidden"
     pendingPrintSnapshotsRef.current = null;
-    setPrintedSnapshots(next);
+    setPrintedSnapshotsByDate((prev) => ({ ...prev, [viewForDate]: next }));
   }
 
   const driverOptions = useMemo(() => {

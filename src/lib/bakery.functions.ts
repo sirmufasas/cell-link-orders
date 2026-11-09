@@ -1791,7 +1791,14 @@ export type PersistedPrintedCustomerSnapshot = {
 
 export type PersistedPrintSheetState = {
   updatedAt: string;
+  /** LEGACY (pre date-scoping) flat snapshots — kept only for migration. */
   printedSnapshots: Record<string, PersistedPrintedCustomerSnapshot>;
+  /**
+   * Date-scoped snapshots: per DELIVERY date, which customers were printed.
+   * This is what the app uses — a new delivery day always starts fresh, so a
+   * customer ordering the same quantity as yesterday is never wrongly hidden.
+   */
+  printedByDate: Record<string, Record<string, PersistedPrintedCustomerSnapshot>>;
   customModes: Record<string, "items" | "total_only" | "hidden">;
   removedProducts?: Record<string, string[]>; // normCustomerKey -> list of norm product names removed from print
 };
@@ -1799,6 +1806,13 @@ export type PersistedPrintSheetState = {
 const PRINT_STATE_SLUG = "__print_sheet_state_v2__";
 
 async function readServerPrintSheetState(): Promise<PersistedPrintSheetState> {
+  let state: PersistedPrintSheetState = {
+    updatedAt: new Date().toISOString(),
+    printedSnapshots: {},
+    printedByDate: {},
+    customModes: {},
+    removedProducts: {},
+  };
   try {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
     const { data } = await supabaseAdmin
@@ -1808,9 +1822,10 @@ async function readServerPrintSheetState(): Promise<PersistedPrintSheetState> {
       .maybeSingle();
     if (data?.name) {
       const parsed = JSON.parse(data.name) as Partial<PersistedPrintSheetState>;
-      return {
+      state = {
         updatedAt: parsed.updatedAt ?? new Date().toISOString(),
         printedSnapshots: parsed.printedSnapshots ?? {},
+        printedByDate: parsed.printedByDate ?? {},
         customModes: parsed.customModes ?? {},
         removedProducts: parsed.removedProducts ?? {},
       };
@@ -1818,12 +1833,19 @@ async function readServerPrintSheetState(): Promise<PersistedPrintSheetState> {
   } catch {
     // non-fatal
   }
-  return {
-    updatedAt: new Date().toISOString(),
-    printedSnapshots: {},
-    customModes: {},
-    removedProducts: {},
-  };
+  // One-time migration: move the old undated snapshots into the bucket for
+  // the CURRENT live delivery date, then persist the migrated shape. From
+  // here on every delivery day starts unprinted.
+  if (Object.keys(state.printedByDate).length === 0 && Object.keys(state.printedSnapshots).length > 0) {
+    state.printedByDate = { [tomorrowISO()]: state.printedSnapshots };
+    state.updatedAt = new Date().toISOString();
+    try {
+      await writeServerPrintSheetState(state);
+    } catch {
+      // non-fatal — next read retries the migration
+    }
+  }
+  return state;
 }
 
 async function writeServerPrintSheetState(state: PersistedPrintSheetState): Promise<void> {
@@ -1929,6 +1951,7 @@ const FREEZER_STATE_SLUG = "__freezer_list_state_v1__";
 export type ProductionListSnapshots = {
   freezer: Record<string, number>;
   bakery: Record<string, number>;
+  kota: Record<string, number>;
 };
 
 export type PersistedFreezerListState = {
@@ -1949,10 +1972,10 @@ function normalizeSnapshots(raw: unknown): ProductionListSnapshots {
     return out;
   };
   if (raw && typeof raw === "object" && !("freezer" in raw) && !("bakery" in raw)) {
-    return { freezer: pick(raw), bakery: {} };
+    return { freezer: pick(raw), bakery: {}, kota: {} };
   }
-  const obj = (raw ?? {}) as { freezer?: unknown; bakery?: unknown };
-  return { freezer: pick(obj.freezer), bakery: pick(obj.bakery) };
+  const obj = (raw ?? {}) as { freezer?: unknown; bakery?: unknown; kota?: unknown };
+  return { freezer: pick(obj.freezer), bakery: pick(obj.bakery), kota: pick(obj.kota) };
 }
 
 async function readServerFreezerListState(): Promise<PersistedFreezerListState> {
@@ -2006,14 +2029,14 @@ export const saveFreezerListState = createServerFn({ method: "POST" })
     z
       .object({
         forDate: z.string().min(1),
-        list: z.enum(["freezer", "bakery"]),
+        list: z.enum(["freezer", "bakery", "kota"]),
         printedTotals: z.record(z.string(), z.number()),
       })
       .parse(d),
   )
   .handler(async ({ data }) => {
     const current = await readServerFreezerListState();
-    const prev = current.printedByDate[data.forDate] ?? { freezer: {}, bakery: {} };
+    const prev = current.printedByDate[data.forDate] ?? { freezer: {}, bakery: {}, kota: {} };
     current.printedByDate[data.forDate] = {
       ...prev,
       [data.list]: data.printedTotals,
@@ -2081,12 +2104,14 @@ async function writeSheetArchiveForDate(
 
 export const savePrintSheetState = createServerFn({ method: "POST" })
   .validator((d: {
+    forDate?: string;
     printedSnapshots?: Record<string, PersistedPrintedCustomerSnapshot>;
     customModes?: Record<string, "items" | "total_only" | "hidden">;
     removedProducts?: Record<string, string[]>;
   }) =>
     z
       .object({
+        forDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         printedSnapshots: z
           .record(
             z.string(),
@@ -2104,9 +2129,17 @@ export const savePrintSheetState = createServerFn({ method: "POST" })
   )
   .handler(async ({ data }) => {
     const current = await readServerPrintSheetState();
+    let printedByDate = current.printedByDate;
+    if (data.printedSnapshots && data.forDate) {
+      printedByDate = {
+        ...current.printedByDate,
+        [data.forDate]: data.printedSnapshots,
+      };
+    }
     const next: PersistedPrintSheetState = {
       updatedAt: new Date().toISOString(),
-      printedSnapshots: data.printedSnapshots ?? current.printedSnapshots,
+      printedSnapshots: current.printedSnapshots, // legacy — no longer written flat
+      printedByDate,
       customModes: data.customModes ?? current.customModes,
       removedProducts: data.removedProducts ?? current.removedProducts ?? {},
     };
