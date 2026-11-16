@@ -3389,13 +3389,32 @@ function KotaJoeTab() {
   const liveQuery = useQuery(liveSheetOrdersQuery);
   const freezerStateQ = useQuery(freezerListStateQuery);
 
+  // Kota Joe is printed the MORNING OF the delivery day — by then the Google
+  // Sheet has already been exported + cleared for the next day, so the live
+  // sheet no longer holds today's orders. Default this tab to TODAY's
+  // delivery (rebuilt from the saved archive + order submissions, exactly
+  // like the Print Sheet's "Today's Delivery" view). "live" = the live
+  // Google Sheet, i.e. tomorrow's orders as they come in.
+  const todayDate = liveQuery.data?.todayDate ?? "";
+  const [source, setSource] = useState<"today" | "live">("today");
+
+  const savedTodayQuery = useQuery({
+    queryKey: ["print-sheet-for-date", todayDate],
+    queryFn: () => getPrintSheetForDate({ data: { forDate: todayDate } }),
+    enabled: todayDate !== "",
+    staleTime: 10_000,
+  });
+
   // "to_print" = only what's new/changed since the last print (like the Print
   // Sheet's To Print view); "all" = the full combined list.
   const [view, setView] = useState<"to_print" | "all">("to_print");
   const [savingSnapshot, setSavingSnapshot] = useState(false);
 
-  const customers = liveQuery.data?.customers ?? [];
-  const forDate = liveQuery.data?.forDate ?? "";
+  const sourceQuery = source === "live" ? liveQuery : savedTodayQuery;
+  const sourceLoading =
+    liveQuery.isLoading || (source === "today" && (todayDate === "" || savedTodayQuery.isLoading));
+  const customers = sourceQuery.data?.customers ?? [];
+  const forDate = source === "live" ? liveQuery.data?.forDate ?? "" : todayDate;
 
   const stores = useMemo(() => {
     return customers
@@ -3529,7 +3548,7 @@ function KotaJoeTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allRows, forDate]);
 
-  if (liveQuery.isLoading) {
+  if (sourceLoading) {
     return (
       <section className="space-y-4">
         <div className="bg-white rounded-2xl border border-[#e8dcc8] p-6 text-center text-sm text-[#8b6f4e]">
@@ -3572,8 +3591,14 @@ function KotaJoeTab() {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2 flex-wrap">
             <h2 className="font-bold text-sm text-[#2a1810]">🔥 Kota Joe — Combined Order</h2>
-            <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-[#c8362b]/10 text-[#c8362b]">
-              {liveQuery.data?.sheetLabel ?? ""} · {forDate}
+            <span
+              className={`text-xs font-bold px-2.5 py-0.5 rounded-full ${
+                source === "today" ? "bg-[#2a1810] text-white" : "bg-[#c8362b]/10 text-[#c8362b]"
+              }`}
+            >
+              {source === "today"
+                ? `TODAY'S DELIVERY · ${forDate || "…"}`
+                : `LIVE SHEET · ${forDate || "…"}`}
             </span>
             <span className="text-xs text-[#8b6f4e]">
               {stores.length} stores ·{" "}
@@ -3585,11 +3610,11 @@ function KotaJoeTab() {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => void liveQuery.refetch()}
-              disabled={liveQuery.isFetching}
+              onClick={() => void sourceQuery.refetch()}
+              disabled={sourceQuery.isFetching}
               className="text-xs font-bold px-3 py-2 rounded-xl border border-[#e8dcc8] hover:bg-[#fdf8f1] transition"
             >
-              {liveQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
+              {sourceQuery.isFetching ? "Refreshing…" : "↻ Refresh"}
             </button>
             <button
               type="button"
@@ -3611,34 +3636,63 @@ function KotaJoeTab() {
           </div>
         </div>
 
-        <div className="flex gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1 w-fit">
-          {([
-            { id: "to_print", label: `🔴 To Print — New (${toPrintRows.length})` },
-            { id: "all", label: `Show All (${allRows.length})` },
-          ] as const).map((v) => (
+        <div className="flex flex-wrap gap-2 items-center">
+          <div className="flex gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1 w-fit">
+            {([
+              { id: "to_print", label: `🔴 To Print — New (${toPrintRows.length})` },
+              { id: "all", label: `Show All (${allRows.length})` },
+            ] as const).map((v) => (
+              <button
+                key={v.id}
+                type="button"
+                onClick={() => setView(v.id)}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
+                  view === v.id ? "bg-[#2a1810] text-white" : "text-[#6b5544] hover:bg-white"
+                }`}
+              >
+                {v.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex gap-1 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl p-1 w-fit">
             <button
-              key={v.id}
               type="button"
-              onClick={() => setView(v.id)}
+              onClick={() => setSource("today")}
+              title="Today's delivery — rebuilt from the saved orders, works even after the Google Sheet cleared this morning"
               className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
-                view === v.id ? "bg-[#2a1810] text-white" : "text-[#6b5544] hover:bg-white"
+                source === "today" ? "bg-[#c8362b] text-white" : "text-[#6b5544] hover:bg-white"
               }`}
             >
-              {v.label}
+              📅 Today's Delivery{todayDate ? ` (${todayDate})` : ""}
             </button>
-          ))}
+            <button
+              type="button"
+              onClick={() => setSource("live")}
+              title="The live Google Sheet — tomorrow's orders as they come in"
+              className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
+                source === "live" ? "bg-[#c8362b] text-white" : "text-[#6b5544] hover:bg-white"
+              }`}
+            >
+              🟢 Tomorrow — Live Sheet
+            </button>
+          </div>
         </div>
 
         <p className="text-[11px] text-[#8b6f4e] bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-2.5 py-1.5">
-          Works like the Print Sheet: printing remembers what was printed, and only{" "}
-          <strong>new additions</strong> show under <strong>To Print</strong> until you reset. The
-          numbers in the To Print view are the <strong>new quantities</strong> since your last print.
+          Shows <strong>today's delivery</strong> by default — the Kota Joe list you print the
+          morning it goes out, even after the Google Sheet has cleared for the next day. Printing
+          remembers what was printed, and only <strong>new additions</strong> show under{" "}
+          <strong>To Print</strong> until you reset. The numbers in the To Print view are the{" "}
+          <strong>new quantities</strong> since your last print.
         </p>
       </div>
 
       {stores.length === 0 ? (
         <div className="bg-white rounded-2xl border border-[#e8dcc8] p-8 text-center print:hidden">
-          <p className="text-sm font-semibold text-[#2a1810]">No Kota Joe stores found on the live sheet</p>
+          <p className="text-sm font-semibold text-[#2a1810]">
+            No Kota Joe stores found for {source === "today" ? "today's delivery" : "the live sheet"}
+          </p>
           <p className="text-xs text-[#8b6f4e] mt-1">
             Looked for customers whose name contains “Kota Joe”.
           </p>
@@ -3658,6 +3712,12 @@ function KotaJoeTab() {
         </div>
       ) : (
         <div className="bg-white rounded-2xl border border-[#e8dcc8] shadow-sm overflow-hidden print:rounded-none print:border-0 print:shadow-none">
+          <div className="px-4 pt-3 print:px-0 print:pt-0" style={{ borderBottom: "1px solid #434343" }}>
+            <div className="text-sm font-black text-[#2a1810]" style={{ letterSpacing: 0.3 }}>
+              🔥 KOTA JOE — COMBINED ORDER — {source === "today" ? "TODAY'S DELIVERY" : "TOMORROW'S DELIVERY"} (
+              {forDate}) {view === "to_print" ? "— NEW SINCE LAST PRINT" : "— FULL LIST"}
+            </div>
+          </div>
           <div className="overflow-x-auto print:overflow-visible">
             <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
               <thead>
