@@ -1738,12 +1738,7 @@ function AdminPage() {
                   setClearPwError(false);
                 }}
                 onKeyDown={(e) => {
-                  if (
-                    e.key === "Enter" &&
-                    clearPwInput === ADMIN_PASSWORD &&
-                    (retentionInfo?.expiredCount ?? 0) > 0 &&
-                    !clearingHistory
-                  ) {
+                  if (e.key === "Enter" && (retentionInfo?.expiredCount ?? 0) > 0 && !clearingHistory) {
                     void handleConfirmClearOldHistory();
                   }
                 }}
@@ -1771,12 +1766,7 @@ function AdminPage() {
               </button>
               <button
                 onClick={handleConfirmClearOldHistory}
-                disabled={
-                  clearingHistory ||
-                  (retentionInfo?.expiredCount ?? 0) === 0 ||
-                  clearPwInput !== ADMIN_PASSWORD
-                }
-                title="Type the admin password above to enable"
+                disabled={clearingHistory || (retentionInfo?.expiredCount ?? 0) === 0}
                 className="px-4 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white text-xs font-bold"
               >
                 {clearingHistory
