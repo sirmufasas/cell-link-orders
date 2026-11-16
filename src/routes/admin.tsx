@@ -518,6 +518,11 @@ function AdminPage() {
   }
   const [showClearHistoryModal, setShowClearHistoryModal] = useState(false);
   const [clearingHistory, setClearingHistory] = useState(false);
+  // Password gate for the destructive "Clear >3 Months Old" action — the
+  // SAME password that unlocks the admin tabs. Order History is the one tab
+  // reachable without unlocking, so the delete needs its own gate.
+  const [clearPwInput, setClearPwInput] = useState("");
+  const [clearPwError, setClearPwError] = useState(false);
   const [clearHistoryFeedback, setClearHistoryFeedback] = useState<string | null>(null);
   const [dismissedExpiryPrompt, setDismissedExpiryPrompt] = useState(false);
 
@@ -529,7 +534,19 @@ function AdminPage() {
     }
   }, [retentionInfo?.expiredCount, dismissedExpiryPrompt]);
 
+  // Always start the clear-history password field fresh whenever the modal opens.
+  useEffect(() => {
+    if (showClearHistoryModal) {
+      setClearPwInput("");
+      setClearPwError(false);
+    }
+  }, [showClearHistoryModal]);
+
   async function handleConfirmClearOldHistory() {
+    if (clearPwInput !== ADMIN_PASSWORD) {
+      setClearPwError(true);
+      return;
+    }
     setClearingHistory(true);
     setClearHistoryFeedback(null);
     try {
@@ -1708,6 +1725,40 @@ function AdminPage() {
               </p>
             </div>
 
+            <div className="space-y-1.5">
+              <label className="text-xs font-bold text-[#2a1810]">
+                🔒 Enter the admin password to confirm
+              </label>
+              <input
+                type="password"
+                value={clearPwInput}
+                autoFocus
+                onChange={(e) => {
+                  setClearPwInput(e.target.value);
+                  setClearPwError(false);
+                }}
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    clearPwInput === ADMIN_PASSWORD &&
+                    (retentionInfo?.expiredCount ?? 0) > 0 &&
+                    !clearingHistory
+                  ) {
+                    void handleConfirmClearOldHistory();
+                  }
+                }}
+                placeholder="Admin password"
+                className={`w-full border rounded-xl px-3 py-2 text-sm focus:outline-none ${
+                  clearPwError
+                    ? "border-red-500 focus:border-red-500"
+                    : "border-[#e8dcc8] focus:border-[#c8362b]"
+                }`}
+              />
+              {clearPwError && (
+                <p className="text-xs text-red-600">Incorrect password, try again.</p>
+              )}
+            </div>
+
             <div className="flex items-center justify-end gap-2 pt-1">
               <button
                 onClick={() => {
@@ -1720,7 +1771,12 @@ function AdminPage() {
               </button>
               <button
                 onClick={handleConfirmClearOldHistory}
-                disabled={clearingHistory || (retentionInfo?.expiredCount ?? 0) === 0}
+                disabled={
+                  clearingHistory ||
+                  (retentionInfo?.expiredCount ?? 0) === 0 ||
+                  clearPwInput !== ADMIN_PASSWORD
+                }
+                title="Type the admin password above to enable"
                 className="px-4 py-2 rounded-xl bg-[#c8362b] hover:bg-[#a82a22] disabled:bg-[#e8dcc8] disabled:text-[#8b6f4e] text-white text-xs font-bold"
               >
                 {clearingHistory
