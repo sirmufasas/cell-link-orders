@@ -518,7 +518,7 @@ function AdminPage() {
   }
   const [showClearHistoryModal, setShowClearHistoryModal] = useState(false);
   const [clearingHistory, setClearingHistory] = useState(false);
-  // Password gate for the destructive "Clear >3 Months Old" action — the
+  // Password gate for the destructive "Clear >6 Weeks Old" action — the
   // SAME password that unlocks the admin tabs. Order History is the one tab
   // reachable without unlocking, so the delete needs its own gate.
   const [clearPwInput, setClearPwInput] = useState("");
@@ -527,7 +527,7 @@ function AdminPage() {
   const [dismissedExpiryPrompt, setDismissedExpiryPrompt] = useState(false);
 
   // Automatically notify the admin with a confirmation dialog if orders older
-  // than 3 months are waiting to be cleared.
+  // than 6 weeks are waiting to be cleared.
   useEffect(() => {
     if ((retentionInfo?.expiredCount ?? 0) > 0 && !dismissedExpiryPrompt) {
       setShowClearHistoryModal(true);
@@ -559,8 +559,8 @@ function AdminPage() {
       setDismissedExpiryPrompt(true);
       setClearHistoryFeedback(
         res.deletedCount > 0
-          ? `✓ Cleared ${res.deletedCount} order${res.deletedCount === 1 ? "" : "s"} older than 3 months (before ${res.cutoffDateISO}).`
-          : `No orders older than 3 months (before ${res.cutoffDateISO}) to clear.`,
+          ? `✓ Cleared ${res.deletedCount} order${res.deletedCount === 1 ? "" : "s"} older than 6 weeks (before ${res.cutoffDateISO}).`
+          : `No orders older than 6 weeks (before ${res.cutoffDateISO}) to clear.`,
       );
       setTimeout(() => setClearHistoryFeedback(null), 6000);
     } catch (e) {
@@ -776,10 +776,15 @@ function AdminPage() {
   useEffect(() => {
     const t = setInterval(() => {
       qc.invalidateQueries({ queryKey: ["submissions"] });
-      qc.invalidateQueries({ queryKey: ["analytics"] });
+      // Only re-pull the (previously very heavy) analytics while its tab is
+      // actually open — refreshing it in the background every 30s was a big
+      // part of the dashboard feeling slow.
+      if (tab === "analytics") {
+        qc.invalidateQueries({ queryKey: ["analytics"] });
+      }
     }, 30000);
     return () => clearInterval(t);
-  }, [qc]);
+  }, [qc, tab]);
 
   const sheetQtyBySlug = useMemo(() => {
     const m = new Map<string, number>();
@@ -864,9 +869,9 @@ function AdminPage() {
   // and rendering path below, they just group by a different-sized bucket.
   const timeSeries = useMemo(() => {
     const m = new Map<string, number>();
-    for (const s of analytics) {
-      const k = bucketKey(s.for_date, bucket);
-      m.set(k, (m.get(k) ?? 0) + (s.total_items ?? 0));
+    for (const d of analytics.daily) {
+      const k = bucketKey(d.for_date, bucket);
+      m.set(k, (m.get(k) ?? 0) + d.items);
     }
     // Continuous axis for the recent window so gaps show as 0 instead of
     // squashing the chart into only the days that had orders.
@@ -896,28 +901,17 @@ function AdminPage() {
   }, [analytics, bucket]);
 
   const topProducts = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const s of analytics) {
-      for (const it of (s.items ?? [])) {
-        m.set(it.product_name, (m.get(it.product_name) ?? 0) + it.quantity);
-      }
-    }
-    const arr = Array.from(m.entries())
-      .sort((a, b) => b[1] - a[1])
+    const arr = analytics.topProducts
       .slice(0, 10)
-      .map(([name, qty]) => ({ name: name.length > 18 ? name.slice(0, 18) + "…" : name, qty }));
+      .map(({ name, qty }) => ({ name: name.length > 18 ? name.slice(0, 18) + "…" : name, qty }));
     if (arr.length === 0) return [{ name: "No data yet", qty: 0 }];
     return arr;
   }, [analytics]);
 
   const topCustomers = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const s of analytics) {
-      const n = s.customer?.name ?? "—";
-      m.set(n, (m.get(n) ?? 0) + (s.total_items ?? 0));
-    }
-    const arr = Array.from(m.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10)
-      .map(([name, qty]) => ({ name: name.length > 16 ? name.slice(0, 16) + "…" : name, qty }));
+    const arr = analytics.topCustomers
+      .slice(0, 10)
+      .map(({ name, qty }) => ({ name: name.length > 16 ? name.slice(0, 16) + "…" : name, qty }));
     if (arr.length === 0) return [{ name: "No data yet", qty: 0 }];
     return arr;
   }, [analytics]);
@@ -1315,13 +1309,13 @@ function AdminPage() {
 
         {tab === "history" && (
           <section className="space-y-4">
-            {/* 3-Month Order History Retention & Notification Banner */}
+            {/* Order History Retention (6 weeks) & Notification Banner */}
             <div className="flex flex-wrap items-center justify-between gap-3 bg-[#fdf8f1] border border-[#e8dcc8] rounded-xl px-4 py-2.5 text-xs">
               <div className="flex flex-wrap items-center gap-2 text-[#2a1810]">
-                <span className="font-bold text-[#c8362b]">📅 3-Month Order History</span>
+                <span className="font-bold text-[#c8362b]">📅 Order History (6 Weeks)</span>
                 <span className="text-[#8b6f4e]">·</span>
                 <span>
-                  Showing <strong>{submissions.length}</strong> orders from the last 3 months
+                  Showing <strong>{submissions.length}</strong> orders from the last 6 weeks
                   {retentionInfo?.oldestCreatedAt
                     ? ` (since ${new Date(retentionInfo.oldestCreatedAt).toLocaleDateString()})`
                     : ""}
@@ -1330,7 +1324,7 @@ function AdminPage() {
                   <>
                     <span className="text-[#8b6f4e]">·</span>
                     <span className="text-[#6b5544]">
-                      Next 3-month mark: <strong>{retentionInfo.nextClearDateISO}</strong> (system will notify you before clearing)
+                      Next 6-week mark: <strong>{retentionInfo.nextClearDateISO}</strong> (system will notify you before clearing)
                     </span>
                   </>
                 )}
@@ -1338,7 +1332,7 @@ function AdminPage() {
               <div className="flex items-center gap-2">
                 {(retentionInfo?.expiredCount ?? 0) > 0 && (
                   <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-900 font-bold">
-                    ⚠️ {retentionInfo?.expiredCount} order{retentionInfo?.expiredCount === 1 ? "" : "s"} &gt; 3 months old
+                    ⚠️ {retentionInfo?.expiredCount} order{retentionInfo?.expiredCount === 1 ? "" : "s"} &gt; 6 weeks old
                   </span>
                 )}
                 {clearHistoryFeedback && (
@@ -1348,7 +1342,7 @@ function AdminPage() {
                   onClick={() => setShowClearHistoryModal(true)}
                   className="px-2.5 py-1 rounded-lg border border-[#e8dcc8] bg-white hover:bg-[#f5ede0] text-[#6b5544] font-semibold transition-colors"
                 >
-                  🧹 Clear &gt;3 Months Old
+                  🧹 Clear &gt;6 Weeks Old
                 </button>
               </div>
             </div>
@@ -1506,7 +1500,7 @@ function AdminPage() {
 
             {/* Top products + customers */}
             <div className="grid gap-4 lg:grid-cols-2">
-              <ChartCard title="Top 10 products (all time)">
+              <ChartCard title="Top 10 products (last 6 weeks)">
                 <ResponsiveContainer width="100%" height={320}>
                   <BarChart data={topProducts} layout="vertical" margin={{ left: 8, right: 16 }}>
                     <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" horizontal={false} />
@@ -1517,7 +1511,7 @@ function AdminPage() {
                   </BarChart>
                 </ResponsiveContainer>
               </ChartCard>
-              <ChartCard title="Top 10 customers (all time)">
+              <ChartCard title="Top 10 customers (last 6 weeks)">
                 <ResponsiveContainer width="100%" height={320}>
                   <BarChart data={topCustomers} layout="vertical" margin={{ left: 8, right: 16 }}>
                     <CartesianGrid stroke="#e8dcc8" strokeDasharray="3 3" horizontal={false} />
@@ -1598,7 +1592,7 @@ function AdminPage() {
               </div>
             </div>
 
-            {analytics.length === 0 && (
+            {analytics.daily.length === 0 && (
               <p className="text-center text-xs text-[#8b6f4e]">
                 No orders yet — charts will update automatically as orders come in.
               </p>
@@ -1686,7 +1680,7 @@ function AdminPage() {
               <div className="flex items-center gap-2.5">
                 <span className="text-2xl">🔔</span>
                 <div>
-                  <h3 className="font-bold text-[#2a1810] text-base">3-Month Order History Notice</h3>
+                  <h3 className="font-bold text-[#2a1810] text-base">Order History Notice (6 Weeks)</h3>
                   <p className="text-xs text-[#8b6f4e]">Confirmation required before clearing old history</p>
                 </div>
               </div>
@@ -1703,20 +1697,20 @@ function AdminPage() {
 
             <div className="rounded-xl bg-[#fdf8f1] border border-[#e8dcc8] p-3.5 text-xs text-[#2a1810] space-y-1.5">
               <p>
-                Order history is kept for <strong>3 months</strong> (cutoff date:{" "}
+                Order history is kept for <strong>6 weeks</strong> (cutoff date:{" "}
                 <strong>{retentionInfo?.cutoffDateISO ?? "—"}</strong>).
               </p>
               {(retentionInfo?.expiredCount ?? 0) > 0 ? (
                 <p className="text-amber-900 font-semibold">
                   ⚠️ There {retentionInfo?.expiredCount === 1 ? "is" : "are"} currently{" "}
                   <strong>{retentionInfo?.expiredCount}</strong> order
-                  {retentionInfo?.expiredCount === 1 ? "" : "s"} older than 3 months waiting for your confirmation to clear.
+                  {retentionInfo?.expiredCount === 1 ? "" : "s"} older than 6 weeks waiting for your confirmation to clear.
                 </p>
               ) : (
                 <p className="text-green-800 font-semibold">
-                  ✓ All <strong>{retentionInfo?.totalActiveCount ?? submissions.length}</strong> orders in your history are within the last 3 months.
+                  ✓ All <strong>{retentionInfo?.totalActiveCount ?? submissions.length}</strong> orders in your history are within the last 6 weeks.
                   {retentionInfo?.nextClearDateISO
-                    ? ` The oldest orders will reach 3 months on ${retentionInfo.nextClearDateISO}.`
+                    ? ` The oldest orders will reach 6 weeks on ${retentionInfo.nextClearDateISO}.`
                     : ""}
                 </p>
               )}
@@ -1773,7 +1767,7 @@ function AdminPage() {
                   ? "Clearing…"
                   : (retentionInfo?.expiredCount ?? 0) > 0
                     ? `Confirm & Clear (${retentionInfo?.expiredCount})`
-                    : "Nothing >3 Months to Clear"}
+                    : "Nothing >6 Weeks to Clear"}
               </button>
             </div>
           </div>

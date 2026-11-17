@@ -1110,9 +1110,10 @@ export const listSubmissions = createServerFn({ method: "GET" })
   .handler(async ({ data }) => {
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
 
-    // 3-month (90-day) history window
+    // 6-week (42-day) history window — the old 3-month window shipped far
+    // too many rows to the browser on every load and every 30s refresh.
     const cutoffDate = new Date();
-    cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+    cutoffDate.setDate(cutoffDate.getDate() - 42);
     const cutoffISO = cutoffDate.toISOString();
 
     const maxRows = data.limit ?? 5000;
@@ -1181,13 +1182,12 @@ export const listSubmissions = createServerFn({ method: "GET" })
 export const getHistoryRetentionInfo = createServerFn({ method: "GET" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const cutoffDate = new Date();
-  cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+  cutoffDate.setDate(cutoffDate.getDate() - 42);
   const cutoffISO = cutoffDate.toISOString();
 
-  // Check if any submissions are older than 3 months (90 days), or within 7 days of reaching 3 months
+  // Check if any submissions are older than 6 weeks (42 days), or within 7 days of reaching 6 weeks
   const warnDate = new Date();
-  warnDate.setMonth(warnDate.getMonth() - 3);
-  warnDate.setDate(warnDate.getDate() + 7);
+  warnDate.setDate(warnDate.getDate() - 42 + 7);
   const warnISO = warnDate.toISOString();
 
   const [
@@ -1220,7 +1220,7 @@ export const getHistoryRetentionInfo = createServerFn({ method: "GET" }).handler
   let nextClearDateISO: string | null = null;
   if (oldestCreatedAt) {
     const d = new Date(oldestCreatedAt);
-    d.setMonth(d.getMonth() + 3);
+    d.setDate(d.getDate() + 42);
     nextClearDateISO = d.toISOString().slice(0, 10);
   }
 
@@ -1237,7 +1237,7 @@ export const getHistoryRetentionInfo = createServerFn({ method: "GET" }).handler
 export const clearOldOrderHistory = createServerFn({ method: "POST" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
   const cutoffDate = new Date();
-  cutoffDate.setMonth(cutoffDate.getMonth() - 3);
+  cutoffDate.setDate(cutoffDate.getDate() - 42);
   const cutoffISO = cutoffDate.toISOString();
 
   const { count } = await supabaseAdmin
@@ -1281,13 +1281,68 @@ export const getSubmissionDetail = createServerFn({ method: "GET" })
 
 export const analyticsOverview = createServerFn({ method: "GET" }).handler(async () => {
   const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-  const { data, error } = await supabaseAdmin
-    .from("order_submissions")
-    .select("for_date, total_items, customer:customers(name), items:order_submission_items(product_name, quantity)")
-    .order("for_date", { ascending: true })
-    .limit(2000);
-  if (error) throw error;
-  return data ?? [];
+
+  // Match the order-history retention window (6 weeks) — older rows get
+  // cleared away anyway. Crucially, everything is AGGREGATED HERE on the
+  // server: the old version shipped every submission with every item line to
+  // the browser (and re-fetched it constantly), which is what made the admin
+  // dashboard slow. The response is now a few hundred bytes.
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - 42);
+  const cutoffISO = cutoffDate.toISOString();
+
+  // 1) Per-day totals + per-customer totals (submissions only — no items join).
+  const pageSize = 1000;
+  const dailyMap = new Map<string, number>();
+  const customerMap = new Map<string, number>();
+  for (let offset = 0; offset < 5000; offset += pageSize) {
+    const { data: rows, error } = await supabaseAdmin
+      .from("order_submissions")
+      .select("for_date, total_items, customer:customers(name)")
+      .gte("created_at", cutoffISO)
+      .gt("total_items", 0)
+      .order("for_date", { ascending: true })
+      .range(offset, offset + pageSize - 1);
+    if (error) throw error;
+    if (!rows?.length) break;
+    for (const r of rows as any[]) {
+      const d = String(r.for_date).slice(0, 10);
+      dailyMap.set(d, (dailyMap.get(d) ?? 0) + (r.total_items ?? 0));
+      const cname = r.customer?.name ?? "—";
+      customerMap.set(cname, (customerMap.get(cname) ?? 0) + (r.total_items ?? 0));
+    }
+    if (rows.length < pageSize) break;
+  }
+
+  // 2) Per-product totals (items inner-joined to submissions for the window).
+  const productMap = new Map<string, number>();
+  for (let offset = 0; offset < 20000; offset += pageSize) {
+    const { data: rows, error } = await supabaseAdmin
+      .from("order_submission_items")
+      .select("product_name, quantity, submission:order_submissions!inner(created_at)")
+      .gte("submission.created_at", cutoffISO)
+      .range(offset, offset + pageSize - 1);
+    if (error) throw error;
+    if (!rows?.length) break;
+    for (const r of rows as any[]) {
+      productMap.set(r.product_name, (productMap.get(r.product_name) ?? 0) + (r.quantity ?? 0));
+    }
+    if (rows.length < pageSize) break;
+  }
+
+  const daily = Array.from(dailyMap.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([for_date, items]) => ({ for_date, items }));
+  const topProducts = Array.from(productMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([name, qty]) => ({ name, qty }));
+  const topCustomers = Array.from(customerMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([name, qty]) => ({ name, qty }));
+
+  return { daily, topProducts, topCustomers };
 });
 
 // ============================== EXPORT ORDERS ==============================
