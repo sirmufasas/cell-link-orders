@@ -26,7 +26,8 @@
  *   1. Extensions -> Apps Script. Delete the old changed-markers code and
  *      paste this whole file. Save.
  *   2. Run `setupChangedMarkers` (function dropdown -> Run). Authorise.
- *      The log prints your SECRET TOKEN — copy it.
+ *      The log prints your SECRET TOKEN (it's also written near the top of
+ *      this file as CAMERA_TOKEN).
  *   3. Deploy -> New deployment -> type "Web app"
  *        Execute as:      Me
  *        Who has access:  Anyone
@@ -48,6 +49,10 @@ var PROTECT_DESC = 'Auto-filled by the system — please do not delete';
 
 // The two order tabs. Edits on any other tab are ignored.
 var ORDER_TAB_GIDS = [1049158606, 1026895194];
+
+// Secret token the /camera page must send. Paste this same value into the
+// camera page settings. (Change it here + in the camera page if it ever leaks.)
+var CAMERA_TOKEN = 'bcfe967bcbeaabe8ff8e4339b57a91d2';
 
 var QUEUE_TAB = '__photo_queue';
 var PHOTO_FOLDER_NAME = 'Sheet Change Photos';
@@ -101,11 +106,8 @@ function setupChangedMarkers() {
 
   // Secret token for the camera page
   var props = PropertiesService.getScriptProperties();
-  var token = props.getProperty('PHOTO_TOKEN');
-  if (!token) {
-    token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
-    props.setProperty('PHOTO_TOKEN', token);
-  }
+  var token = CAMERA_TOKEN;
+  props.setProperty('PHOTO_TOKEN', token);
 
   // Edit trigger (runs as you so it can write to the protected columns)
   var has = ScriptApp.getProjectTriggers().some(function (t) {
