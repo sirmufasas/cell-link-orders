@@ -87,11 +87,8 @@ function setupChangedMarkers() {
   var protection = sheet.getRange(1, CHANGED_COL, lastRow, 3).protect();
   protection.setDescription(PROTECT_DESC);
   protection.setWarningOnly(false);
-  var me = Session.getActiveUser().getEmail();
-  protection.getEditors().forEach(function (u) {
-    if (u.getEmail() !== me) protection.removeEditor(u);
-  });
-  Logger.log('Protected columns L:N (only the owner can edit them).');
+  applyProtectionEditors_(protection);
+  Logger.log('Protected columns L:N (staff cannot edit them; you and the app can).');
 
   // Hidden queue tab
   var q = ss.getSheetByName(QUEUE_TAB);
@@ -124,6 +121,53 @@ function setupChangedMarkers() {
   Logger.log('SECRET TOKEN (paste into the /camera page): ' + token);
   Logger.log('NEXT: Deploy -> New deployment -> Web app -> Execute as Me, access Anyone -> copy the /exec link.');
   Logger.log('=====================================================');
+}
+
+/**
+ * Keeps ONLY you and the ordering app's own Google account (the "service
+ * account", an address ending in gserviceaccount.com) able to edit L:N. Staff
+ * are removed. The app needs this so its normal saves (manual orders,
+ * add-ons, new rows) are never blocked by the protection.
+ */
+function applyProtectionEditors_(protection) {
+  var me = Session.getActiveUser().getEmail();
+  var kept = [];
+  protection.getEditors().forEach(function (u) {
+    var mail = u.getEmail();
+    var isApp = /gserviceaccount\.com$/i.test(mail);
+    if (mail !== me && !isApp) protection.removeEditor(u);
+    else kept.push(mail);
+  });
+  // The app's account may only be a "shared with" editor — add it to the
+  // protection explicitly if it isn't there yet.
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.getEditors().forEach(function (u) {
+    var mail = u.getEmail();
+    if (/gserviceaccount\.com$/i.test(mail) && kept.indexOf(mail) === -1) {
+      protection.addEditor(mail);
+      kept.push(mail);
+    }
+  });
+  Logger.log('Allowed to edit L:N: ' + kept.join(', '));
+  if (!kept.some(function (m) { return /gserviceaccount\.com$/i.test(m); })) {
+    Logger.log('WARNING: could not find the app\'s service account among this spreadsheet\'s editors. ' +
+      'Share the sheet with it as Editor, then run fixProtectionForApp again.');
+  }
+}
+
+/**
+ * RUN THIS if saving orders in the app shows "You are trying to edit a
+ * protected cell": it re-applies the L:N protection so the app's account is
+ * allowed through. Safe to run any time.
+ */
+function fixProtectionForApp() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ORDER_TAB_NAME);
+  if (!sheet) throw new Error('Tab "' + ORDER_TAB_NAME + '" not found.');
+  var found = 0;
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(function (p) {
+    if (p.getDescription() === PROTECT_DESC) { applyProtectionEditors_(p); found++; }
+  });
+  if (!found) Logger.log('No L:N protection found — run setupChangedMarkers instead.');
 }
 
 /** Run any time to see the token again. */

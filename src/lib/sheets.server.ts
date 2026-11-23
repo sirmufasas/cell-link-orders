@@ -938,7 +938,10 @@ export async function clearAddOnColumns(rows: number[]) {
   const entries: Array<{ range: string; value: string }> = [];
   for (const row of rows) {
     for (let i = 0; i < 21; i++) {
-      // F..Z inclusive
+      // F..Z inclusive — EXCEPT L, M, N (i = 6..8): those hold the sheet's
+      // "changed" stamp, its timestamp and the photo link. They are written by
+      // the sheet's own script and must never be blanked by the app.
+      if (i >= 6 && i <= 8) continue;
       const col = String.fromCharCode("F".charCodeAt(0) + i);
       entries.push({ range: `${TAB_CUSTOMERS}!${col}${row}`, value: "" });
     }
