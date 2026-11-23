@@ -1,42 +1,23 @@
 /**
- * Changed markers + photo — standalone script
+ * Changed markers (+ photo, currently PAUSED) — standalone script
  * ------------------------------------------------------------------
  * When a person edits a row on the "Customer Order Details" tab:
- *   column L  -> the word "changed"        (protected, can't be removed)
- *   column M  -> date/time of the change   (protected)
- *   column N  -> link to a photo of the person who made the change
- *                (filled in a few seconds later by the Sheet Camera page)
+ *   column L  -> the word "changed"
+ *   column M  -> date/time of the change
  *
- * The camera itself can't run inside Google Sheets (Google blocks camera
- * access there), so the photo is taken by the "Sheet Camera" page of your
- * app, open in its own window next to the sheet. This script:
- *   - keeps a small hidden queue ("__photo_queue" tab) of edits that need a
- *     photo,
- *   - exposes a private web endpoint (protected by a secret token) that the
- *     camera page uses to collect the next edit and upload the photo,
- *   - saves each photo into a private Drive folder "Sheet Change Photos"
- *     (only you can open it) and writes the link in column N.
- * If the camera page isn't open, the row still gets "changed" + the time —
- * just no photo.
+ * NOTHING IS LOCKED. Anyone the sheet is shared with as Editor can edit
+ * every cell, insert/delete rows, paste, sort — exactly like a normal sheet.
+ * If somebody deletes or overwrites "changed" / the time on a row that has
+ * data, the script puts it straight back (so the word can't be removed).
  *
- * USE THIS FILE INSTEAD OF the earlier changed-markers script (don't keep
- * both in the same project — delete the old one first).
+ * The camera photo feature is PAUSED (PHOTO_ENABLED = false). The code is
+ * still here so it can be switched on later.
  *
- * SETUP (do this in EACH of the two order spreadsheets):
- *   1. Extensions -> Apps Script. Delete the old changed-markers code and
- *      paste this whole file. Save.
- *   2. Run `setupChangedMarkers` (function dropdown -> Run). Authorise.
- *      The log prints your SECRET TOKEN (it's also written near the top of
- *      this file as CAMERA_TOKEN).
- *   3. Deploy -> New deployment -> type "Web app"
- *        Execute as:      Me
- *        Who has access:  Anyone
- *      Click Deploy, copy the "Web app URL" (ends in /exec).
- *   4. Open your app's  /camera  page, paste the link + token in settings
- *      (one link per spreadsheet) and click "Test connection".
- *
- * If you ever change this code, redeploy: Deploy -> Manage deployments ->
- * pencil -> Version: New version -> Deploy. (The link stays the same.)
+ * SETUP (in EACH of the two order spreadsheets):
+ *   1. Extensions -> Apps Script. Replace the code with this whole file. Save.
+ *   2. Run `setupChangedMarkers` (Run button). Authorise if asked.
+ *      This REMOVES the old L:N lock for everybody and keeps the stamping.
+ *   3. If you already had a web-app deployment, you don't need to touch it.
  */
 
 var CHANGED_TZ = 'Africa/Johannesburg';
@@ -52,6 +33,9 @@ var ORDER_TAB_GIDS = [1049158606, 1026895194];
 
 // Secret token the /camera page must send. Paste this same value into the
 // camera page settings. (Change it here + in the camera page if it ever leaks.)
+// Photo feature switch. false = PAUSED (no photo requests are queued).
+var PHOTO_ENABLED = false;
+
 var CAMERA_TOKEN = 'bcfe967bcbeaabe8ff8e4339b57a91d2';
 
 var QUEUE_TAB = '__photo_queue';
@@ -79,34 +63,27 @@ function setupChangedMarkers() {
   sheet.getRange(1, CHANGED_AT_COL).setValue('Changed At');
   sheet.getRange(1, PHOTO_COL).setValue('Photo');
 
-  // Protect L1:N2000 (replaces the older L:M-only protection if present)
-  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(function (p) {
-    if (p.getDescription() === PROTECT_DESC) p.remove();
-  });
-  var lastRow = Math.max(2000, sheet.getMaxRows());
-  var protection = sheet.getRange(1, CHANGED_COL, lastRow, 3).protect();
-  protection.setDescription(PROTECT_DESC);
-  protection.setWarningOnly(false);
-  applyProtectionEditors_(protection);
-  Logger.log('Protected columns L:N (staff cannot edit them; you and the app can).');
+  // Remove the old lock on L:N so EVERYONE can edit the whole sheet.
+  var removed = removeColumnProtection_(sheet);
+  Logger.log('Removed ' + removed + ' old protection(s) on columns L:N. Everyone with Editor access can now edit everything.');
 
-  // Hidden queue tab
-  var q = ss.getSheetByName(QUEUE_TAB);
-  if (!q) {
-    q = ss.insertSheet(QUEUE_TAB);
-    q.appendRow(['id', 'createdMs', 'gid', 'rows', 'editor', 'status', 'claimedMs']);
+  if (PHOTO_ENABLED) {
+    // Hidden queue tab
+    var q = ss.getSheetByName(QUEUE_TAB);
+    if (!q) {
+      q = ss.insertSheet(QUEUE_TAB);
+      q.appendRow(['id', 'createdMs', 'gid', 'rows', 'editor', 'status', 'claimedMs']);
+    }
+    q.hideSheet();
+
+    // Private Drive folder for the photos
+    getPhotoFolder_();
+
+    // Secret token for the camera page
+    PropertiesService.getScriptProperties().setProperty('PHOTO_TOKEN', CAMERA_TOKEN);
   }
-  q.hideSheet();
 
-  // Private Drive folder for the photos
-  getPhotoFolder_();
-
-  // Secret token for the camera page
-  var props = PropertiesService.getScriptProperties();
-  var token = CAMERA_TOKEN;
-  props.setProperty('PHOTO_TOKEN', token);
-
-  // Edit trigger (runs as you so it can write to the protected columns)
+  // Edit trigger (runs as the owner, for every editor)
   var has = ScriptApp.getProjectTriggers().some(function (t) {
     return t.getHandlerFunction() === 'markChangedOnEdit';
   });
@@ -117,57 +94,29 @@ function setupChangedMarkers() {
     Logger.log('Edit trigger already installed.');
   }
 
-  Logger.log('=====================================================');
-  Logger.log('SECRET TOKEN (paste into the /camera page): ' + token);
-  Logger.log('NEXT: Deploy -> New deployment -> Web app -> Execute as Me, access Anyone -> copy the /exec link.');
-  Logger.log('=====================================================');
+  Logger.log('Done. Changed markers are ON for everyone; photos are PAUSED.');
 }
 
-/**
- * Keeps ONLY you and the ordering app's own Google account (the "service
- * account", an address ending in gserviceaccount.com) able to edit L:N. Staff
- * are removed. The app needs this so its normal saves (manual orders,
- * add-ons, new rows) are never blocked by the protection.
- */
-function applyProtectionEditors_(protection) {
-  var me = Session.getActiveUser().getEmail();
-  var kept = [];
-  protection.getEditors().forEach(function (u) {
-    var mail = u.getEmail();
-    var isApp = /gserviceaccount\.com$/i.test(mail);
-    if (mail !== me && !isApp) protection.removeEditor(u);
-    else kept.push(mail);
-  });
-  // The app's account may only be a "shared with" editor — add it to the
-  // protection explicitly if it isn't there yet.
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  ss.getEditors().forEach(function (u) {
-    var mail = u.getEmail();
-    if (/gserviceaccount\.com$/i.test(mail) && kept.indexOf(mail) === -1) {
-      protection.addEditor(mail);
-      kept.push(mail);
-    }
-  });
-  Logger.log('Allowed to edit L:N: ' + kept.join(', '));
-  if (!kept.some(function (m) { return /gserviceaccount\.com$/i.test(m); })) {
-    Logger.log('WARNING: could not find the app\'s service account among this spreadsheet\'s editors. ' +
-      'Share the sheet with it as Editor, then run fixProtectionForApp again.');
-  }
-}
-
-/**
- * RUN THIS if saving orders in the app shows "You are trying to edit a
- * protected cell": it re-applies the L:N protection so the app's account is
- * allowed through. Safe to run any time.
- */
-function fixProtectionForApp() {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ORDER_TAB_NAME);
-  if (!sheet) throw new Error('Tab "' + ORDER_TAB_NAME + '" not found.');
-  var found = 0;
+/** Removes the L:N lock (any protection that lives inside columns L:N). Returns how many were removed. */
+function removeColumnProtection_(sheet) {
+  var n = 0;
   sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(function (p) {
-    if (p.getDescription() === PROTECT_DESC) { applyProtectionEditors_(p); found++; }
+    var r = p.getRange();
+    var inLN = r.getColumn() >= CHANGED_COL && r.getLastColumn() <= PHOTO_COL;
+    if (p.getDescription() === PROTECT_DESC || inLN) { p.remove(); n++; }
   });
-  if (!found) Logger.log('No L:N protection found — run setupChangedMarkers instead.');
+  return n;
+}
+
+/**
+ * RUN THIS if anyone ever says they "can't edit" or sees "protected cell":
+ * it removes every lock on L:N in this spreadsheet. Safe to run any time.
+ */
+function unlockEveryone() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var total = 0;
+  ss.getSheets().forEach(function (sh) { total += removeColumnProtection_(sh); });
+  Logger.log('Removed ' + total + ' lock(s). Everyone with Editor access can edit the whole sheet.');
 }
 
 /** Run any time to see the token again. */
@@ -237,8 +186,8 @@ function markChangedOnEdit(e) {
     sheet.getRange(run[0], CHANGED_AT_COL, n, 1).setValues(timeVals);
   });
 
-  // Ask for a photo of whoever just made this change (cap rows per request).
-  if (stampedRows.length > 0) {
+  // (PAUSED unless PHOTO_ENABLED) Ask for a photo of whoever just made this change (cap rows per request).
+  if (PHOTO_ENABLED && stampedRows.length > 0) {
     var editor = '';
     try { editor = (e.user && e.user.getEmail()) || ''; } catch (err) { editor = ''; }
     try {
