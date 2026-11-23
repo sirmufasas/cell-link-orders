@@ -177,7 +177,7 @@ function exportToAllDrives(sheetConfig, dateStamp) {
 
 /**
  * Clears Quantity (C), the four "added" columns (F:I), Comments (J), the
- * LATE column (K), and the Changed markers (L:M) from row 2 down on the
+ * LATE column (K), and the Changed markers + photo link (L:N) from row 2 down on the
  * specified order tab. Row 1 (headers) and columns A, B, D, E (Customer,
  * Product, Driver, Show) are untouched.
  *
@@ -202,7 +202,7 @@ function clearOrderColumns(sheetConfig) {
   sheet.getRange(2, 6, numRows, 4).clearContent();  // F:I: added x4
   sheet.getRange(2, 10, numRows, 1).clearContent(); // J: Comments
   sheet.getRange(2, 11, numRows, 1).clearContent(); // K: LATE
-  sheet.getRange(2, 12, numRows, 2).clearContent(); // L:M: Changed markers
+  sheet.getRange(2, 12, numRows, 3).clearContent(); // L:N: Changed markers + photo link
 }
 
 // ===================== TRIGGER MANAGEMENT (v2) ======================

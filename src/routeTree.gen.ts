@@ -9,10 +9,16 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as CameraRouteImport } from './routes/camera'
 import { Route as AdminRouteImport } from './routes/admin'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as OrderSlugRouteImport } from './routes/order.$slug'
 
+const CameraRoute = CameraRouteImport.update({
+  id: '/camera',
+  path: '/camera',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AdminRoute = AdminRouteImport.update({
   id: '/admin',
   path: '/admin',
@@ -32,35 +38,46 @@ const OrderSlugRoute = OrderSlugRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
+  '/camera': typeof CameraRoute
   '/order/$slug': typeof OrderSlugRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
+  '/camera': typeof CameraRoute
   '/order/$slug': typeof OrderSlugRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
+  '/camera': typeof CameraRoute
   '/order/$slug': typeof OrderSlugRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/admin' | '/order/$slug'
+  fullPaths: '/' | '/admin' | '/camera' | '/order/$slug'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/admin' | '/order/$slug'
-  id: '__root__' | '/' | '/admin' | '/order/$slug'
+  to: '/' | '/admin' | '/camera' | '/order/$slug'
+  id: '__root__' | '/' | '/admin' | '/camera' | '/order/$slug'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AdminRoute: typeof AdminRoute
+  CameraRoute: typeof CameraRoute
   OrderSlugRoute: typeof OrderSlugRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/camera': {
+      id: '/camera'
+      path: '/camera'
+      fullPath: '/camera'
+      preLoaderRoute: typeof CameraRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/admin': {
       id: '/admin'
       path: '/admin'
@@ -88,6 +105,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AdminRoute: AdminRoute,
+  CameraRoute: CameraRoute,
   OrderSlugRoute: OrderSlugRoute,
 }
 export const routeTree = rootRouteImport
