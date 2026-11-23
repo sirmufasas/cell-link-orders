@@ -34,6 +34,31 @@ function loadCfg(): Cfg {
   return EMPTY_CFG;
 }
 
+const HTML_HINT =
+  "Google sent back a web page instead of data. Check: (1) the link is the Web app URL ending in /exec (not the editor or spreadsheet link), (2) the deployment is set to Execute as: Me and Who has access: Anyone, (3) you clicked Deploy after setting it.";
+
+async function readJson(res: Response): Promise<any> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(HTML_HINT);
+  }
+}
+
+function checkUrl(u: string): string {
+  const v = u.trim();
+  if (!v) return "";
+  if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(\?.*)?$/.test(v)) {
+    if (/\/dev(\?.*)?$/.test(v)) return "This is a test link (/dev). Use the Web app URL ending in /exec.";
+    if (v.includes("docs.google.com")) return "This is the spreadsheet link. Paste the Web app URL from Deploy.";
+    if (v.includes("script.google.com/home") || v.includes("/projects/"))
+      return "This is the script editor link. Paste the Web app URL from Deploy.";
+    return "This doesn't look like a Web app URL. It should look like https://script.google.com/macros/s/…/exec";
+  }
+  return "";
+}
+
 function nowLabel() {
   return new Date().toLocaleTimeString("en-ZA", { hour12: false });
 }
@@ -54,7 +79,14 @@ function CameraPage() {
   const busyRef = useRef(false);
   const camOnRef = useRef(false);
 
+  const lastErrRef = useRef<{ msg: string; at: number }>({ msg: "", at: 0 });
   const addLog = useCallback((msg: string, ok = true) => {
+    if (!ok) {
+      // Don't repeat the same error every 2 seconds — once a minute is enough.
+      const last = lastErrRef.current;
+      if (last.msg === msg && Date.now() - last.at < 60000) return;
+      lastErrRef.current = { msg, at: Date.now() };
+    }
     setLog((prev) => [{ t: nowLabel(), msg, ok }, ...prev].slice(0, 12));
   }, []);
 
@@ -185,7 +217,7 @@ function CameraPage() {
     const u = new URL(url);
     Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
     const res = await fetch(u.toString(), { method: "GET", redirect: "follow" });
-    return res.json();
+    return readJson(res);
   }, []);
 
   const postScript = useCallback(async (url: string, body: Record<string, unknown>) => {
@@ -196,7 +228,7 @@ function CameraPage() {
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify(body),
     });
-    return res.json();
+    return readJson(res);
   }, []);
 
   const pollOnce = useCallback(async () => {
@@ -212,7 +244,7 @@ function CameraPage() {
         try {
           took = await callScript(url, { action: "take", token: c.token, email: c.email });
         } catch (e: any) {
-          addLog("Could not reach the sheet script (" + (e?.message || "network") + ")", false);
+          addLog("Sheet script problem: " + (e?.message || "network"), false);
           continue;
         }
         if (!took?.ok) {
@@ -319,7 +351,7 @@ function CameraPage() {
           !!r?.ok,
         );
       } catch (e: any) {
-        addLog(`✗ ${label}: could not reach it (${e?.message || "network"})`, false);
+        addLog(`✗ ${label}: ${e?.message || "could not reach it"}`, false);
       }
     }
   };
@@ -432,6 +464,11 @@ function CameraPage() {
                 onChange={(e) => saveCfg({ ...cfg, monWedUrl: e.target.value })}
                 placeholder="https://script.google.com/macros/s/.../exec"
               />
+              {checkUrl(cfg.monWedUrl) && (
+                <span style={{ display: "block", color: "#b91c1c", fontWeight: 400, marginTop: 2 }}>
+                  {checkUrl(cfg.monWedUrl)}
+                </span>
+              )}
             </label>
             <label style={{ fontSize: 12, fontWeight: 600 }}>
               THU-SAT sheet link (web app URL)
@@ -441,6 +478,11 @@ function CameraPage() {
                 onChange={(e) => saveCfg({ ...cfg, thuSatUrl: e.target.value })}
                 placeholder="https://script.google.com/macros/s/.../exec"
               />
+              {checkUrl(cfg.thuSatUrl) && (
+                <span style={{ display: "block", color: "#b91c1c", fontWeight: 400, marginTop: 2 }}>
+                  {checkUrl(cfg.thuSatUrl)}
+                </span>
+              )}
             </label>
             <label style={{ fontSize: 12, fontWeight: 600 }}>
               Secret token (from the sheet script)
