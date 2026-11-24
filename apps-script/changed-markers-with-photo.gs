@@ -1,14 +1,17 @@
 /**
  * Changed markers + photo — standalone script
  * ------------------------------------------------------------------
- * When a person edits a row on the "Customer Order Details" tab:
+ * When a person CHANGES an existing value in columns A:K of a row on the
+ * "Customer Order Details" tab (a cell that held a value was edited to
+ * something else, or was deleted):
  *   column L  -> the word "changed"
  *   column M  -> date/time of the change
  *   column N  -> link to the photo of the person (when photos are switched on)
+ * Typing into an EMPTY cell does not count. Editing L:N does not count either.
  *
- * Columns L:N are LOCKED: staff can see them but cannot edit them. Only the
- * owner (you) and the ordering app's own Google account can write there, so
- * the app's manual orders / add-ons / customer orders keep working.
+ * Columns L:N are LOCKED: staff can see them but cannot edit them. ONLY
+ * jonathankabango08@gmail.com and the ordering app's own Google account can
+ * write there, so the app's manual orders / add-ons / customer orders keep working.
  * Everything else on the sheet stays editable by everyone it is shared with.
  *
  * Photos are saved in the Drive folder "Sheet Change Photos" which is set to
@@ -62,7 +65,7 @@ function setupChangedMarkers() {
   sheet.getRange(1, CHANGED_AT_COL).setValue('Changed At');
   sheet.getRange(1, PHOTO_COL).setValue('Photo');
 
-  // Lock L:N for staff (owner + the app's account stay allowed).
+  // Lock L:N: only Jonathan + the app's account can edit.
   sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(function (p) {
     if (p.getDescription() === PROTECT_DESC) p.remove();
   });
@@ -71,7 +74,7 @@ function setupChangedMarkers() {
   protection.setDescription(PROTECT_DESC);
   protection.setWarningOnly(false);
   applyProtectionEditors_(protection);
-  Logger.log('Locked columns L:N (staff can view but not edit; you and the app can).');
+  Logger.log('Locked columns L:N (staff can view but not edit; only Jonathan and the app can).');
 
   if (PHOTO_ENABLED) {
     // Hidden queue tab
@@ -89,7 +92,7 @@ function setupChangedMarkers() {
     PropertiesService.getScriptProperties().setProperty('PHOTO_TOKEN', CAMERA_TOKEN);
   }
 
-  // Edit trigger (runs as the owner, for every editor)
+  // Edit trigger (runs as whoever runs this setup, for every editor)
   var has = ScriptApp.getProjectTriggers().some(function (t) {
     return t.getHandlerFunction() === 'markChangedOnEdit';
   });
@@ -153,7 +156,7 @@ function applyProtectionEditors_(protection) {
   }
 }
 
-/** RUN THIS if the app ever says "protected cell": re-allows the app's account. */
+/** RUN THIS if the app ever says "protected cell": re-allows Jonathan + the app's account. */
 function fixProtectionForApp() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ORDER_TAB_NAME);
   if (!sheet) throw new Error('Tab "' + ORDER_TAB_NAME + '" not found.');
