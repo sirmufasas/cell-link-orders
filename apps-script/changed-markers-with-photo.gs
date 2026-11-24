@@ -37,6 +37,7 @@ var PHOTO_ENABLED = true;
 var CAMERA_TOKEN = 'bcfe967bcbeaabe8ff8e4339b57a91d2';
 
 var QUEUE_TAB = '__photo_queue';
+var SNAP_TAB = '__snapshot';        // hidden copy of A:K, used to know what a cell held BEFORE an edit
 var PHOTO_FOLDER_NAME = 'Sheet Change Photos';
 var MERGE_WINDOW_MS = 15 * 1000;     // edits within 15s share one photo
 var MAX_AGE_MS = 5 * 60 * 1000;      // an edit older than 5 min is no longer photographed
@@ -99,26 +100,31 @@ function setupChangedMarkers() {
     Logger.log('Edit trigger already installed.');
   }
 
+  // Hidden snapshot of A:K (so a deleted/overwritten selection can be compared with what it held before)
+  refreshSnapshot();
+  var hasSnap = ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getHandlerFunction() === 'refreshSnapshot';
+  });
+  if (!hasSnap) {
+    ScriptApp.newTrigger('refreshSnapshot').timeBased().everyMinutes(1).create();
+    Logger.log('Snapshot trigger installed: refreshSnapshot (every minute).');
+  }
+
   Logger.log('Done. Changed markers are ON; L:N locked for staff; photos are ' + (PHOTO_ENABLED ? 'ON.' : 'PAUSED.'));
 }
 
 /**
- * Keeps ONLY these accounts able to edit L:N:
- *   - the spreadsheet OWNER (whoever really owns the file)
- *   - the person running this script
- *   - every address in ALWAYS_ALLOWED below (add your other Google accounts here)
+ * Keeps ONLY these able to edit L:N:
+ *   - the accounts in ALWAYS_ALLOWED (only Jonathan)
  *   - the ordering app's own Google account (an address ending in gserviceaccount.com)
- * Everyone else is removed.
+ * Everyone else is removed. Run the setup while signed in as Jonathan.
  */
-var ALWAYS_ALLOWED = ['portugalbakery01@gmail.com', 'jonathankabango08@gmail.com'];
+var ALWAYS_ALLOWED = ['jonathankabango08@gmail.com'];
 
 function applyProtectionEditors_(protection) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var allowed = {};
-  function allow(mail) { if (mail) allowed[String(mail).toLowerCase()] = true; }
-  allow(Session.getEffectiveUser().getEmail());
-  try { var owner = ss.getOwner(); if (owner) allow(owner.getEmail()); } catch (err) { /* shared drive: no owner */ }
-  ALWAYS_ALLOWED.forEach(allow);
+  ALWAYS_ALLOWED.forEach(function (m) { allowed[String(m).toLowerCase()] = true; });
 
   var isApp = function (mail) { return /gserviceaccount\.com$/i.test(mail); };
   var kept = {};
@@ -130,7 +136,7 @@ function applyProtectionEditors_(protection) {
     else { try { protection.removeEditor(u); } catch (err) { Logger.log('Could not remove ' + mail + ': ' + err); } }
   });
 
-  // 2) Add every allowed person / the app account who is missing.
+  // 2) Add whoever is allowed but missing (Jonathan + the app account).
   var toAdd = Object.keys(allowed);
   ss.getEditors().forEach(function (u) { if (isApp(u.getEmail())) toAdd.push(u.getEmail()); });
   toAdd.forEach(function (mail) {
@@ -195,10 +201,17 @@ function getPhotoFolder_() {
 
 // ============================ EDIT TRIGGER ============================
 
+function norm_(v) { return String(v === null || v === undefined ? '' : v).trim(); }
+
 /**
- * Installable onEdit trigger: stamps "changed" + time on every edited row
- * that has order data, then queues a photo request for the camera page.
+ * Installable onEdit trigger. A row is marked "changed" ONLY when, in columns
+ * A:K, a cell that HELD a value was edited to something different (or was
+ * deleted). Typing into an empty cell, or editing L:N, does nothing.
  * Programmatic writes (the app, the daily clear) don't fire this trigger.
+ *
+ * For one edited cell Google tells us the old value (e.oldValue). For several
+ * cells at once (select + Delete, paste) it doesn't, so we compare with the
+ * hidden "__snapshot" tab, which holds a copy of A:K.
  */
 function markChangedOnEdit(e) {
   if (!e || !e.range) return;
@@ -210,49 +223,113 @@ function markChangedOnEdit(e) {
   var startCol = e.range.getColumn();
   var endCol = startCol + e.range.getNumColumns() - 1;
 
-  var touchesData = startCol <= DATA_LAST_COL;
-  var touchesMarkers = endCol >= CHANGED_COL && startCol <= PHOTO_COL;
-  if (!touchesData && !touchesMarkers) return;
-
-  var firstRow = Math.max(startRow, 2); // never stamp the header row
+  if (startCol > DATA_LAST_COL) return;              // only A:K counts
+  var firstRow = Math.max(startRow, 2);              // never the header row
   if (firstRow > endRow) return;
+  var lastCol = Math.min(endCol, DATA_LAST_COL);
   var numRows = endRow - firstRow + 1;
+  var numCols = lastCol - startCol + 1;
+  var single = e.range.getNumRows() === 1 && e.range.getNumColumns() === 1;
 
-  var data = sheet.getRange(firstRow, 1, numRows, DATA_LAST_COL).getValues();
-  var stamp = Utilities.formatDate(new Date(), CHANGED_TZ, 'dd/MM/yyyy HH:mm');
-
-  var runs = [];
-  var runStart = null, runEnd = null;
-  var stampedRows = [];
-  for (var i = 0; i < numRows; i++) {
-    var hasData = data[i].some(function (v) { return v !== '' && v !== null; });
-    var r = firstRow + i;
-    if (hasData) {
-      stampedRows.push(r);
-      if (runStart === null) { runStart = r; runEnd = r; }
-      else if (r === runEnd + 1) { runEnd = r; }
-      else { runs.push([runStart, runEnd]); runStart = r; runEnd = r; }
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  var changedRows = [];
+  try {
+    var now = sheet.getRange(firstRow, startCol, numRows, numCols).getDisplayValues();
+    var snap = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SNAP_TAB);
+    var before = null;
+    if (!single && snap && snap.getMaxRows() >= endRow) {
+      before = snap.getRange(firstRow, startCol, numRows, numCols).getValues();
     }
-  }
-  if (runStart !== null) runs.push([runStart, runEnd]);
 
+    for (var i = 0; i < numRows; i++) {
+      var rowChanged = false;
+      for (var j = 0; j < numCols && !rowChanged; j++) {
+        var oldV = single ? norm_(e.oldValue) : (before ? norm_(before[i][j]) : '');
+        var newV = norm_(now[i][j]);
+        if (oldV !== '' && oldV !== newV) rowChanged = true;   // had a value, now different/removed
+      }
+      if (rowChanged) changedRows.push(firstRow + i);
+    }
+
+    // Keep the snapshot up to date for the cells that were just edited.
+    if (snap && snap.getMaxRows() >= endRow) {
+      snap.getRange(firstRow, startCol, numRows, numCols).setNumberFormat('@').setValues(now);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+  if (!changedRows.length) return;
+
+  // Write "changed" + time for the changed rows (grouped into runs).
+  var stamp = Utilities.formatDate(new Date(), CHANGED_TZ, 'dd/MM/yyyy HH:mm');
+  var runs = [];
+  var runStart = changedRows[0], runEnd = changedRows[0];
+  for (var k = 1; k < changedRows.length; k++) {
+    if (changedRows[k] === runEnd + 1) runEnd = changedRows[k];
+    else { runs.push([runStart, runEnd]); runStart = changedRows[k]; runEnd = changedRows[k]; }
+  }
+  runs.push([runStart, runEnd]);
   runs.forEach(function (run) {
     var n = run[1] - run[0] + 1;
     var changedVals = [], timeVals = [];
-    for (var k = 0; k < n; k++) { changedVals.push(['changed']); timeVals.push([stamp]); }
+    for (var m = 0; m < n; m++) { changedVals.push(['changed']); timeVals.push([stamp]); }
     sheet.getRange(run[0], CHANGED_COL, n, 1).setValues(changedVals);
     sheet.getRange(run[0], CHANGED_AT_COL, n, 1).setValues(timeVals);
   });
 
-  // (PAUSED unless PHOTO_ENABLED) Ask for a photo of whoever just made this change (cap rows per request).
-  if (PHOTO_ENABLED && stampedRows.length > 0) {
+  // (PAUSED unless PHOTO_ENABLED) Ask for a photo of whoever just made this change.
+  if (PHOTO_ENABLED) {
     var editor = '';
     try { editor = (e.user && e.user.getEmail()) || ''; } catch (err) { editor = ''; }
     try {
-      queuePhoto_(sheet.getSheetId(), stampedRows.slice(0, 200), editor);
+      queuePhoto_(sheet.getSheetId(), changedRows.slice(0, 200), editor);
     } catch (err) {
       Logger.log('queuePhoto_ failed: ' + err);
     }
+  }
+}
+
+// ============================== SNAPSHOT ==============================
+
+/**
+ * Copies columns A:K of the order tab into the hidden "__snapshot" tab so the
+ * edit trigger knows what a cell held before it was deleted/overwritten.
+ * Runs every minute (and once during setup). The app's own writes and the
+ * daily clear are picked up here too.
+ */
+function refreshSnapshot() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return;
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName(ORDER_TAB_NAME);
+    if (!sheet) return;
+    var rows = Math.min(sheet.getMaxRows(), Math.max(sheet.getLastRow(), 2) + 50);
+    var vals = sheet.getRange(1, 1, rows, DATA_LAST_COL).getDisplayValues();
+
+    var snap = ss.getSheetByName(SNAP_TAB);
+    if (!snap) {
+      snap = ss.insertSheet(SNAP_TAB);
+      snap.hideSheet();
+    }
+    if (snap.getMaxColumns() < DATA_LAST_COL) snap.insertColumnsAfter(snap.getMaxColumns(), DATA_LAST_COL - snap.getMaxColumns());
+    if (snap.getMaxRows() < sheet.getMaxRows()) snap.insertRowsAfter(snap.getMaxRows(), sheet.getMaxRows() - snap.getMaxRows());
+
+    var old = snap.getRange(1, 1, rows, DATA_LAST_COL).getValues();
+    var same = true;
+    for (var i = 0; i < rows && same; i++) {
+      for (var j = 0; j < DATA_LAST_COL; j++) {
+        if (norm_(old[i][j]) !== norm_(vals[i][j])) { same = false; break; }
+      }
+    }
+    if (same) return;
+    var all = snap.getRange(1, 1, snap.getMaxRows(), DATA_LAST_COL);
+    all.clearContent();
+    all.setNumberFormat('@');                 // plain text so "007" stays "007"
+    snap.getRange(1, 1, rows, DATA_LAST_COL).setValues(vals);
+  } finally {
+    lock.releaseLock();
   }
 }
 
