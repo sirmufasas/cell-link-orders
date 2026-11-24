@@ -493,22 +493,116 @@ export async function readDriverAssignments(): Promise<{
 
 // ============================== WRITES ==============================
 
+// ============================== "CHANGED" STAMPS ==============================
+// When a PERSON edits the sheet, the Apps Script marks the row in L ("changed")
+// and M (date/time). Google does not fire that trigger for the app's own
+// writes, so the app writes the same marker itself, in the SAME API call as
+// the data (no extra round-trip). If Google ever rejects it because of the
+// L:N protection, the data is re-sent WITHOUT the marker so a save never fails.
+
+const CHANGED_TZ = "Africa/Johannesburg";
+
+function changedStampNow(): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: CHANGED_TZ,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+  const g = (t: string) => parts.find((x) => x.type === t)?.value ?? "";
+  const hh = g("hour") === "24" ? "00" : g("hour");
+  return `${g("day")}/${g("month")}/${g("year")} ${hh}:${g("minute")}`;
+}
+
+type ValueRangeData = { range: string; values: string[][] };
+
+function stampData(rows: number[]): ValueRangeData[] {
+  const unique = Array.from(new Set(rows.filter((r) => Number.isInteger(r) && r > 1)));
+  if (!unique.length) return [];
+  const stamp = changedStampNow();
+  return unique.map((row) => ({
+    range: `${TAB_CUSTOMERS}!L${row}:M${row}`,
+    values: [["changed", stamp]],
+  }));
+}
+
+/** values.batchUpdate with optional "changed" markers; falls back to data-only on a protection error. */
+async function batchWriteWithStamp(data: ValueRangeData[], stampRows: number[] = []) {
+  const sheets = await getSheetsClient();
+  const spreadsheetId = getActiveSheetId();
+  const stamps = stampData(stampRows);
+  const send = (d: ValueRangeData[]) =>
+    sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: { valueInputOption: "USER_ENTERED", data: d },
+    });
+  if (!data.length && !stamps.length) return;
+  try {
+    await send([...data, ...stamps]);
+  } catch (err) {
+    const msg = String((err as Error)?.message ?? err);
+    if (stamps.length && /protected|permission|not have|forbidden|403/i.test(msg)) {
+      console.warn(
+        "[bakery] Could not write the changed markers (L:M) — is the app's service account allowed on the L:N protection? Saving data without them.",
+        msg,
+      );
+      if (data.length) await send(data);
+      return;
+    }
+    throw err;
+  }
+}
+
+/** Stamp rows as changed without writing any data (e.g. rows whose order was cleared). */
+export async function stampChangedRows(rows: number[]) {
+  await batchWriteWithStamp([], rows);
+}
+
+const parseQtyLoose = (v: unknown): number => {
+  const n = parseFloat(String(v ?? "").replace(/,/g, ".").replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(n) ? Math.round(n * 1000) / 1000 : 0;
+};
+
+/**
+ * For a "replace this customer's order" save: which rows really changed?
+ *  - dropped: rows that had a quantity and are no longer in the order
+ *  - changed(): rows whose quantity differs from before (or are brand new)
+ * `allRows` is the A:E read taken BEFORE any write (column C = quantity).
+ */
+export function planChangedRows(
+  allRows: string[][],
+  customerRowNumbers: number[],
+  positive: Array<{ sheetRow: number; quantity: number }>,
+) {
+  const prev = new Map<number, number>(
+    customerRowNumbers.map((r) => [r, parseQtyLoose(allRows[r - 1]?.[2])]),
+  );
+  const keep = new Set(positive.map((i) => i.sheetRow).filter((r) => r > 0));
+  const dropped = customerRowNumbers.filter((r) => (prev.get(r) ?? 0) > 0 && !keep.has(r));
+  const changed = () =>
+    positive
+      .filter((i) => i.sheetRow > 0 && (!prev.has(i.sheetRow) || prev.get(i.sheetRow) !== i.quantity))
+      .map((i) => i.sheetRow);
+  return { dropped, changed, prev };
+}
+
 /** Write quantity values into column C of "Customer Order Details" for the given sheet rows. */
 export async function writeOrderQuantities(
   entries: Array<{ row: number; quantity: number }>,
+  /** Rows to mark "changed". Default: every row that gets a quantity > 0. */
+  stampRows?: number[],
 ) {
   if (!entries.length) return;
-  const sheets = await getSheetsClient();
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: getActiveSheetId(),
-    requestBody: {
-      valueInputOption: "USER_ENTERED",
-      data: entries.map((e) => ({
-        range: `${TAB_CUSTOMERS}!C${e.row}`,
-        values: [[e.quantity > 0 ? String(e.quantity) : ""]],
-      })),
-    },
-  });
+  await batchWriteWithStamp(
+    entries.map((e) => ({
+      range: `${TAB_CUSTOMERS}!C${e.row}`,
+      values: [[e.quantity > 0 ? String(e.quantity) : ""]],
+    })),
+    stampRows ?? entries.filter((e) => e.quantity > 0).map((e) => e.row),
+  );
 }
 
 /** Clear column C for given rows (used when starting a new daily order). */
@@ -529,17 +623,13 @@ export async function writeLateOrderQuantities(
   entries: Array<{ row: number; quantity: number }>,
 ) {
   if (!entries.length) return;
-  const sheets = await getSheetsClient();
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: getActiveSheetId(),
-    requestBody: {
-      valueInputOption: "USER_ENTERED",
-      data: entries.map((e) => ({
-        range: `${TAB_CUSTOMERS}!K${e.row}`,
-        values: [[e.quantity > 0 ? String(e.quantity) : ""]],
-      })),
-    },
-  });
+  await batchWriteWithStamp(
+    entries.map((e) => ({
+      range: `${TAB_CUSTOMERS}!K${e.row}`,
+      values: [[e.quantity > 0 ? String(e.quantity) : ""]],
+    })),
+    entries.filter((e) => e.quantity > 0).map((e) => e.row),
+  );
 }
 
 /**
@@ -561,9 +651,10 @@ export async function addLateOrderQuantityToRow(
   const currentRaw = (res.data.values?.[0]?.[0] ?? "").toString().trim();
   const current = parseSheetNumber(currentRaw);
   const newTotal = Math.round(((Number.isFinite(current) ? current : 0) + quantity) * 1000) / 1000;
-  await writeCells([
-    { range: `${TAB_CUSTOMERS}!K${row}`, value: String(newTotal) },
-  ]);
+  await writeCells(
+    [{ range: `${TAB_CUSTOMERS}!K${row}`, value: String(newTotal) }],
+    [row],
+  );
 }
 
 // A clearly-red, still-legible-with-black-text fill (close to Material Red
@@ -642,19 +733,16 @@ export async function addLateQuantityToColumnC(
   await setCellBackgroundColors([{ row, col: "C" }], LATE_ORDER_RED);
 }
 
-/** Write arbitrary single-cell values. */
+/** Write arbitrary single-cell values (optionally marking rows "changed" in L:M in the same call). */
 export async function writeCells(
   entries: Array<{ range: string; value: string }>,
+  stampRows: number[] = [],
 ) {
   if (!entries.length) return;
-  const sheets = await getSheetsClient();
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: getActiveSheetId(),
-    requestBody: {
-      valueInputOption: "USER_ENTERED",
-      data: entries.map((e) => ({ range: e.range, values: [[e.value]] })),
-    },
-  });
+  await batchWriteWithStamp(
+    entries.map((e) => ({ range: e.range, values: [[e.value]] })),
+    stampRows,
+  );
 }
 
 /**
@@ -853,17 +941,20 @@ export async function insertCustomerProductRow(opts: {
     },
   });
 
-  await writeCells([
-    { range: `${TAB_CUSTOMERS}!A${newRow}`, value: opts.customerName },
-    { range: `${TAB_CUSTOMERS}!B${newRow}`, value: opts.productName },
-    {
-      range: `${TAB_CUSTOMERS}!C${newRow}`,
-      value: opts.quantity > 0 ? String(opts.quantity) : "",
-    },
-    { range: `${TAB_CUSTOMERS}!D${newRow}`, value: driver },
-    // Column E intentionally NOT written here — its formula was just
-    // copied down above and will recalculate from this row's own C value.
-  ]);
+  await writeCells(
+    [
+      { range: `${TAB_CUSTOMERS}!A${newRow}`, value: opts.customerName },
+      { range: `${TAB_CUSTOMERS}!B${newRow}`, value: opts.productName },
+      {
+        range: `${TAB_CUSTOMERS}!C${newRow}`,
+        value: opts.quantity > 0 ? String(opts.quantity) : "",
+      },
+      { range: `${TAB_CUSTOMERS}!D${newRow}`, value: driver },
+      // Column E intentionally NOT written here — its formula was just
+      // copied down above and will recalculate from this row's own C value.
+    ],
+    [newRow],
+  );
   return newRow;
 }
 
@@ -920,10 +1011,13 @@ export async function addOnQuantityToRow(
   const newFormula =
     `=${baseExpr}+` + filledLetters.map((L) => `${L}${row}`).join("+");
 
-  await writeCells([
-    { range: `${TAB_CUSTOMERS}!${colLetter}${row}`, value: String(quantity) },
-    { range: `${TAB_CUSTOMERS}!C${row}`, value: newFormula },
-  ]);
+  await writeCells(
+    [
+      { range: `${TAB_CUSTOMERS}!${colLetter}${row}`, value: String(quantity) },
+      { range: `${TAB_CUSTOMERS}!C${row}`, value: newFormula },
+    ],
+    [row],
+  );
   return colLetter;
 }
 

@@ -440,6 +440,7 @@ export const changeOrder = createServerFn({ method: "POST" })
       insertCustomerProductRow,
       clearAddOnColumns,
       writeOrderComment,
+      planChangedRows,
     } = await import("@/lib/sheets.server");
 
     const { data: customer, error: cErr } = await supabaseAdmin
@@ -466,12 +467,16 @@ export const changeOrder = createServerFn({ method: "POST" })
       }
     }
 
+    resolveItemsSheetRows(customer.name, positive, allRows);
+    const changePlan = planChangedRows(allRows, customerRowNumbers, positive);
+
     if (customerRowNumbers.length) {
-      await writeOrderQuantities(customerRowNumbers.map((row) => ({ row, quantity: 0 })));
+      await writeOrderQuantities(
+        customerRowNumbers.map((row) => ({ row, quantity: 0 })),
+        changePlan.dropped, // only rows removed from the order are marked "changed" here
+      );
       await clearAddOnColumns(customerRowNumbers);
     }
-
-    resolveItemsSheetRows(customer.name, positive, allRows);
 
     let insertedAny = false;
     for (const item of positive) {
@@ -486,7 +491,10 @@ export const changeOrder = createServerFn({ method: "POST" })
       }
     }
 
-    await writeOrderQuantities(positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })));
+    await writeOrderQuantities(
+      positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+      changePlan.changed(), // only rows whose quantity really changed (or are new)
+    );
 
     if (message.length > 0) {
       await writeOrderComment(positive.map((i) => i.sheetRow), message);
@@ -2592,6 +2600,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
       writeOrderComment,
       writeCells,
       activeSheetGroupSlug,
+      planChangedRows,
     } = await import("@/lib/sheets.server");
 
     const allRows = await readCustomerRows();
@@ -2613,7 +2622,11 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
 
     if (data.mode === "clear") {
       if (customerRowNumbers.length) {
-        await writeOrderQuantities(customerRowNumbers.map((row) => ({ row, quantity: 0 })));
+        // Mark only the rows that actually had a quantity as "changed".
+        const clearedRows = customerRowNumbers.filter(
+          (r) => parseFloat(String(allRows[r - 1]?.[2] ?? "").replace(/,/g, ".").replace(/[^0-9.-]/g, "")) > 0,
+        );
+        await writeOrderQuantities(customerRowNumbers.map((row) => ({ row, quantity: 0 })), clearedRows);
         await clearAddOnColumns(customerRowNumbers);
         await writeCells(
           customerRowNumbers.flatMap((row) => [
@@ -2638,11 +2651,15 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
     }
 
     resolveItemsSheetRows(canonicalName, positive, allRows);
+    const changePlan = planChangedRows(allRows, customerRowNumbers, positive);
 
     if (data.mode === "set") {
       // First clear all existing quantities and add-on columns for this customer on the sheet
       if (customerRowNumbers.length) {
-        await writeOrderQuantities(customerRowNumbers.map((row) => ({ row, quantity: 0 })));
+        await writeOrderQuantities(
+          customerRowNumbers.map((row) => ({ row, quantity: 0 })),
+          changePlan.dropped, // only rows removed from the order are marked "changed" here
+        );
         await clearAddOnColumns(customerRowNumbers);
       }
       for (const item of positive) {
@@ -2657,6 +2674,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
       }
       await writeOrderQuantities(
         positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
+        changePlan.changed(), // only rows whose quantity really changed (or are new)
       );
     } else {
       // mode === "addon"
