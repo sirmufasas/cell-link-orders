@@ -103,28 +103,45 @@ function setupChangedMarkers() {
 }
 
 /**
- * Keeps ONLY you and the ordering app's own Google account (an address ending
- * in gserviceaccount.com) able to edit L:N. Everyone else is removed.
+ * Keeps ONLY these accounts able to edit L:N:
+ *   - the spreadsheet OWNER (whoever really owns the file)
+ *   - the person running this script
+ *   - every address in ALWAYS_ALLOWED below (add your other Google accounts here)
+ *   - the ordering app's own Google account (an address ending in gserviceaccount.com)
+ * Everyone else is removed.
  */
+var ALWAYS_ALLOWED = ['portugalbakery01@gmail.com', 'jonathankabango08@gmail.com'];
+
 function applyProtectionEditors_(protection) {
-  var me = Session.getEffectiveUser().getEmail();
-  var kept = [];
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var allowed = {};
+  function allow(mail) { if (mail) allowed[String(mail).toLowerCase()] = true; }
+  allow(Session.getEffectiveUser().getEmail());
+  try { var owner = ss.getOwner(); if (owner) allow(owner.getEmail()); } catch (err) { /* shared drive: no owner */ }
+  ALWAYS_ALLOWED.forEach(allow);
+
+  var isApp = function (mail) { return /gserviceaccount\.com$/i.test(mail); };
+  var kept = {};
+
+  // 1) Remove everyone who is not allowed.
   protection.getEditors().forEach(function (u) {
     var mail = u.getEmail();
-    var isApp = /gserviceaccount\.com$/i.test(mail);
-    if (mail !== me && !isApp) protection.removeEditor(u);
-    else kept.push(mail);
+    if (allowed[mail.toLowerCase()] || isApp(mail)) kept[mail.toLowerCase()] = true;
+    else { try { protection.removeEditor(u); } catch (err) { Logger.log('Could not remove ' + mail + ': ' + err); } }
   });
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  ss.getEditors().forEach(function (u) {
-    var mail = u.getEmail();
-    if (/gserviceaccount\.com$/i.test(mail) && kept.indexOf(mail) === -1) {
-      protection.addEditor(mail);
-      kept.push(mail);
-    }
+
+  // 2) Add every allowed person / the app account who is missing.
+  var toAdd = Object.keys(allowed);
+  ss.getEditors().forEach(function (u) { if (isApp(u.getEmail())) toAdd.push(u.getEmail()); });
+  toAdd.forEach(function (mail) {
+    if (kept[mail.toLowerCase()]) return;
+    try { protection.addEditor(mail); kept[mail.toLowerCase()] = true; }
+    catch (err) { Logger.log('Could not add ' + mail + ' (is the sheet shared with them as Editor?): ' + err); }
   });
-  Logger.log('Allowed to edit L:N: ' + kept.join(', '));
-  if (!kept.some(function (m) { return /gserviceaccount\.com$/i.test(m); })) {
+
+  var list = Object.keys(kept);
+  Logger.log('Allowed to edit L:N: ' + list.join(', '));
+  if (!list.some(isApp)) {
     Logger.log('WARNING: the app\'s service account (…@…gserviceaccount.com) is not an editor of this spreadsheet. ' +
       'Share the sheet with it as Editor, then run fixProtectionForApp.');
   }
