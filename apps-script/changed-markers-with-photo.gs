@@ -1,23 +1,21 @@
 /**
- * Changed markers (+ photo, currently PAUSED) — standalone script
+ * Changed markers + photo — standalone script
  * ------------------------------------------------------------------
  * When a person edits a row on the "Customer Order Details" tab:
  *   column L  -> the word "changed"
  *   column M  -> date/time of the change
+ *   column N  -> link to the photo of the person (when photos are switched on)
  *
- * NOTHING IS LOCKED. Anyone the sheet is shared with as Editor can edit
- * every cell, insert/delete rows, paste, sort — exactly like a normal sheet.
- * If somebody deletes or overwrites "changed" / the time on a row that has
- * data, the script puts it straight back (so the word can't be removed).
+ * Columns L:N are LOCKED: staff can see them but cannot edit them. Only the
+ * owner (you) and the ordering app's own Google account can write there, so
+ * the app's manual orders / add-ons / customer orders keep working.
+ * Everything else on the sheet stays editable by everyone it is shared with.
  *
- * The camera photo feature is PAUSED (PHOTO_ENABLED = false). The code is
- * still here so it can be switched on later.
+ * Photos are saved in the Drive folder "Sheet Change Photos" which is set to
+ * "anyone with the link can VIEW", so nobody has to ask for permission to see
+ * a photo. (Viewing only — nobody can change or delete them.)
  *
- * SETUP (in EACH of the two order spreadsheets):
- *   1. Extensions -> Apps Script. Replace the code with this whole file. Save.
- *   2. Run `setupChangedMarkers` (Run button). Authorise if asked.
- *      This REMOVES the old L:N lock for everybody and keeps the stamping.
- *   3. If you already had a web-app deployment, you don't need to touch it.
+ * The photo feature is switched by PHOTO_ENABLED below (false = paused).
  */
 
 var CHANGED_TZ = 'Africa/Johannesburg';
@@ -63,9 +61,16 @@ function setupChangedMarkers() {
   sheet.getRange(1, CHANGED_AT_COL).setValue('Changed At');
   sheet.getRange(1, PHOTO_COL).setValue('Photo');
 
-  // Remove the old lock on L:N so EVERYONE can edit the whole sheet.
-  var removed = removeColumnProtection_(sheet);
-  Logger.log('Removed ' + removed + ' old protection(s) on columns L:N. Everyone with Editor access can now edit everything.');
+  // Lock L:N for staff (owner + the app's account stay allowed).
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(function (p) {
+    if (p.getDescription() === PROTECT_DESC) p.remove();
+  });
+  var lastRow = Math.max(2000, sheet.getMaxRows());
+  var protection = sheet.getRange(1, CHANGED_COL, lastRow, 3).protect();
+  protection.setDescription(PROTECT_DESC);
+  protection.setWarningOnly(false);
+  applyProtectionEditors_(protection);
+  Logger.log('Locked columns L:N (staff can view but not edit; you and the app can).');
 
   if (PHOTO_ENABLED) {
     // Hidden queue tab
@@ -76,7 +81,7 @@ function setupChangedMarkers() {
     }
     q.hideSheet();
 
-    // Private Drive folder for the photos
+    // Drive folder for the photos (viewable by link)
     getPhotoFolder_();
 
     // Secret token for the camera page
@@ -94,29 +99,64 @@ function setupChangedMarkers() {
     Logger.log('Edit trigger already installed.');
   }
 
-  Logger.log('Done. Changed markers are ON for everyone; photos are PAUSED.');
-}
-
-/** Removes the L:N lock (any protection that lives inside columns L:N). Returns how many were removed. */
-function removeColumnProtection_(sheet) {
-  var n = 0;
-  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(function (p) {
-    var r = p.getRange();
-    var inLN = r.getColumn() >= CHANGED_COL && r.getLastColumn() <= PHOTO_COL;
-    if (p.getDescription() === PROTECT_DESC || inLN) { p.remove(); n++; }
-  });
-  return n;
+  Logger.log('Done. Changed markers are ON; L:N locked for staff; photos are ' + (PHOTO_ENABLED ? 'ON.' : 'PAUSED.'));
 }
 
 /**
- * RUN THIS if anyone ever says they "can't edit" or sees "protected cell":
- * it removes every lock on L:N in this spreadsheet. Safe to run any time.
+ * Keeps ONLY you and the ordering app's own Google account (an address ending
+ * in gserviceaccount.com) able to edit L:N. Everyone else is removed.
  */
-function unlockEveryone() {
+function applyProtectionEditors_(protection) {
+  var me = Session.getEffectiveUser().getEmail();
+  var kept = [];
+  protection.getEditors().forEach(function (u) {
+    var mail = u.getEmail();
+    var isApp = /gserviceaccount\.com$/i.test(mail);
+    if (mail !== me && !isApp) protection.removeEditor(u);
+    else kept.push(mail);
+  });
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var total = 0;
-  ss.getSheets().forEach(function (sh) { total += removeColumnProtection_(sh); });
-  Logger.log('Removed ' + total + ' lock(s). Everyone with Editor access can edit the whole sheet.');
+  ss.getEditors().forEach(function (u) {
+    var mail = u.getEmail();
+    if (/gserviceaccount\.com$/i.test(mail) && kept.indexOf(mail) === -1) {
+      protection.addEditor(mail);
+      kept.push(mail);
+    }
+  });
+  Logger.log('Allowed to edit L:N: ' + kept.join(', '));
+  if (!kept.some(function (m) { return /gserviceaccount\.com$/i.test(m); })) {
+    Logger.log('WARNING: the app\'s service account (…@…gserviceaccount.com) is not an editor of this spreadsheet. ' +
+      'Share the sheet with it as Editor, then run fixProtectionForApp.');
+  }
+}
+
+/** RUN THIS if the app ever says "protected cell": re-allows the app's account. */
+function fixProtectionForApp() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ORDER_TAB_NAME);
+  if (!sheet) throw new Error('Tab "' + ORDER_TAB_NAME + '" not found.');
+  var found = 0;
+  sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).forEach(function (p) {
+    if (p.getDescription() === PROTECT_DESC) { applyProtectionEditors_(p); found++; }
+  });
+  if (!found) Logger.log('No L:N lock found — run setupChangedMarkers instead.');
+}
+
+/**
+ * Makes the photo folder and every photo in it viewable by anyone with the
+ * link (view only). Run once; new photos are set automatically.
+ */
+function makePhotosViewable() {
+  var folder = getPhotoFolder_();
+  setViewable_(folder);
+  var files = folder.getFiles();
+  var n = 0;
+  while (files.hasNext()) { setViewable_(files.next()); n++; }
+  Logger.log('Photos folder + ' + n + ' photo(s) are now viewable by anyone with the link: ' + folder.getUrl());
+}
+
+function setViewable_(item) {
+  try { item.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); }
+  catch (err) { Logger.log('Could not set sharing on ' + item.getName() + ': ' + err); }
 }
 
 /** Run any time to see the token again. */
@@ -131,6 +171,7 @@ function getPhotoFolder_() {
     try { return DriveApp.getFolderById(id); } catch (err) { /* recreate below */ }
   }
   var folder = DriveApp.createFolder(PHOTO_FOLDER_NAME);
+  setViewable_(folder);
   props.setProperty('PHOTO_FOLDER_ID', folder.getId());
   return folder;
 }
@@ -352,6 +393,7 @@ function saveUpload_(body) {
     var when = Utilities.formatDate(new Date(), CHANGED_TZ, 'yyyy-MM-dd HH-mm-ss');
     var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'image/jpeg', 'change ' + when + ' - ' + editor + '.jpg');
     var file = getPhotoFolder_().createFile(blob);
+    setViewable_(file); // anyone with the link can VIEW (not edit)
     var url = 'https://drive.google.com/file/d/' + file.getId() + '/view';
 
     var ss = SpreadsheetApp.getActiveSpreadsheet();
