@@ -494,10 +494,12 @@ export async function readDriverAssignments(): Promise<{
 // ============================== WRITES ==============================
 
 // ============================== "CHANGED" STAMPS ==============================
-// When a PERSON edits the sheet, the Apps Script marks the row in L ("changed")
-// and M (date/time). Google does not fire that trigger for the app's own
-// writes, so the app writes the same marker itself, in the SAME API call as
-// the data (no extra round-trip). If Google ever rejects it because of the
+// When a PERSON changes an existing value in A:K, the Apps Script marks the row
+// in L ("changed") and M (date/time). Google does not fire that trigger for the
+// app's own writes, so the app writes the same marker itself, in the SAME API
+// call as the data (no extra round-trip). SAME RULE AS THE SHEET: a brand-new
+// order is NOT a change; only a row that already HAD a quantity and then got
+// changed (or removed) is marked. If Google ever rejects it because of the
 // L:N protection, the data is re-sent WITHOUT the marker so a save never fails.
 
 const CHANGED_TZ = "Africa/Johannesburg";
@@ -569,7 +571,7 @@ const parseQtyLoose = (v: unknown): number => {
 /**
  * For a "replace this customer's order" save: which rows really changed?
  *  - dropped: rows that had a quantity and are no longer in the order
- *  - changed(): rows whose quantity differs from before (or are brand new)
+ *  - changed(): rows that HAD a quantity before and now have a different one (new rows / empty→value are NOT changes)
  * `allRows` is the A:E read taken BEFORE any write (column C = quantity).
  */
 export function planChangedRows(
@@ -584,7 +586,7 @@ export function planChangedRows(
   const dropped = customerRowNumbers.filter((r) => (prev.get(r) ?? 0) > 0 && !keep.has(r));
   const changed = () =>
     positive
-      .filter((i) => i.sheetRow > 0 && (!prev.has(i.sheetRow) || prev.get(i.sheetRow) !== i.quantity))
+      .filter((i) => i.sheetRow > 0 && prev.has(i.sheetRow) && (prev.get(i.sheetRow) ?? 0) > 0 && prev.get(i.sheetRow) !== i.quantity)
       .map((i) => i.sheetRow);
   return { dropped, changed, prev };
 }
@@ -592,8 +594,8 @@ export function planChangedRows(
 /** Write quantity values into column C of "Customer Order Details" for the given sheet rows. */
 export async function writeOrderQuantities(
   entries: Array<{ row: number; quantity: number }>,
-  /** Rows to mark "changed". Default: every row that gets a quantity > 0. */
-  stampRows?: number[],
+  /** Rows to mark "changed" (only rows that already had a quantity). Default: none. */
+  stampRows: number[] = [],
 ) {
   if (!entries.length) return;
   await batchWriteWithStamp(
@@ -601,7 +603,7 @@ export async function writeOrderQuantities(
       range: `${TAB_CUSTOMERS}!C${e.row}`,
       values: [[e.quantity > 0 ? String(e.quantity) : ""]],
     })),
-    stampRows ?? entries.filter((e) => e.quantity > 0).map((e) => e.row),
+    stampRows,
   );
 }
 
@@ -628,7 +630,7 @@ export async function writeLateOrderQuantities(
       range: `${TAB_CUSTOMERS}!K${e.row}`,
       values: [[e.quantity > 0 ? String(e.quantity) : ""]],
     })),
-    entries.filter((e) => e.quantity > 0).map((e) => e.row),
+    [], // a first late quantity is a new order, not a change
   );
 }
 
@@ -653,7 +655,7 @@ export async function addLateOrderQuantityToRow(
   const newTotal = Math.round(((Number.isFinite(current) ? current : 0) + quantity) * 1000) / 1000;
   await writeCells(
     [{ range: `${TAB_CUSTOMERS}!K${row}`, value: String(newTotal) }],
-    [row],
+    current > 0 ? [row] : [], // only a change if there already was a late quantity
   );
 }
 
@@ -953,7 +955,6 @@ export async function insertCustomerProductRow(opts: {
       // Column E intentionally NOT written here — its formula was just
       // copied down above and will recalculate from this row's own C value.
     ],
-    [newRow],
   );
   return newRow;
 }
@@ -1016,7 +1017,7 @@ export async function addOnQuantityToRow(
       { range: `${TAB_CUSTOMERS}!${colLetter}${row}`, value: String(quantity) },
       { range: `${TAB_CUSTOMERS}!C${row}`, value: newFormula },
     ],
-    [row],
+    cRaw.startsWith("=") || parseQtyLoose(cRaw) > 0 ? [row] : [], // only a change if C already had a value
   );
   return colLetter;
 }

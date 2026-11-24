@@ -493,7 +493,7 @@ export const changeOrder = createServerFn({ method: "POST" })
 
     await writeOrderQuantities(
       positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
-      changePlan.changed(), // only rows whose quantity really changed (or are new)
+      changePlan.changed(), // only rows that HAD a quantity and now differ (new orders are not changes)
     );
 
     if (message.length > 0) {
@@ -2674,7 +2674,7 @@ export const adminSaveManualOrder = createServerFn({ method: "POST" })
       }
       await writeOrderQuantities(
         positive.map((i) => ({ row: i.sheetRow, quantity: i.quantity })),
-        changePlan.changed(), // only rows whose quantity really changed (or are new)
+        changePlan.changed(), // only rows that HAD a quantity and now differ (new orders are not changes)
       );
     } else {
       // mode === "addon"
