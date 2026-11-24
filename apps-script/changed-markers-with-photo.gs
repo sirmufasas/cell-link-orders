@@ -15,7 +15,7 @@
  * "anyone with the link can VIEW", so nobody has to ask for permission to see
  * a photo. (Viewing only — nobody can change or delete them.)
  *
- * The photo feature is switched by PHOTO_ENABLED below (false = paused).
+ * The photo feature is switched by PHOTO_ENABLED below (true = on).
  */
 
 var CHANGED_TZ = 'Africa/Johannesburg';
@@ -31,8 +31,8 @@ var ORDER_TAB_GIDS = [1049158606, 1026895194];
 
 // Secret token the /camera page must send. Paste this same value into the
 // camera page settings. (Change it here + in the camera page if it ever leaks.)
-// Photo feature switch. false = PAUSED (no photo requests are queued).
-var PHOTO_ENABLED = false;
+// Photo feature switch. true = photos ON, false = PAUSED (no photo requests are queued).
+var PHOTO_ENABLED = true;
 
 var CAMERA_TOKEN = 'bcfe967bcbeaabe8ff8e4339b57a91d2';
 
