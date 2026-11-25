@@ -5858,7 +5858,7 @@ function PrintSheetTab() {
                 📦 Today's Delivery ({liveQuery.data.todayDate} — Saved Orders)
               </button>
             )}
-            {liveQuery.data?.forDate && (
+            {liveQuery.data?.forDate && liveQuery.data.forDate !== liveQuery.data.todayDate && (
               <button
                 type="button"
                 onClick={() => setSelectedPrintDate(liveQuery.data!.forDate)}
@@ -6335,7 +6335,7 @@ function PrintSheetTab() {
                   📦 Did the Google Sheet clear for the next day? Load Today's Delivery ({liveQuery.data.todayDate})
                 </button>
               )}
-              {selectedPrintDate === "__live__" && liveQuery.data?.forDate && (
+              {selectedPrintDate === "__live__" && liveQuery.data?.forDate && liveQuery.data.forDate !== liveQuery.data.todayDate && (
                 <button
                   type="button"
                   onClick={() => setSelectedPrintDate(liveQuery.data!.forDate)}
