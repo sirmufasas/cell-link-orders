@@ -2216,9 +2216,12 @@ export const getLiveSheetOrders = createServerFn({ method: "GET" }).handler(asyn
     readLiveCustomerOrderSheet,
     getActiveSheetLabel,
     getActiveSheetUrl,
+    liveSheetForDateISO,
   } = await import("@/lib/sheets.server");
 
-  const activeForDate = tomorrowISO();
+  // The date the LIVE sheet really holds (still today's orders until the daily
+  // clear runs — NOT automatically "tomorrow" after midnight).
+  const activeForDate = liveSheetForDateISO();
   const currentTodayDate = todayISO();
 
   const [
@@ -2379,10 +2382,11 @@ export const getPrintSheetForDate = createServerFn({ method: "GET" })
       readLiveCustomerOrderSheet,
       getActiveSheetLabel,
       getActiveSheetUrl,
+      liveSheetForDateISO,
     } = await import("@/lib/sheets.server");
 
     const targetForDate = data.forDate;
-    const isCurrentLiveTarget = targetForDate === tomorrowISO();
+    const isCurrentLiveTarget = targetForDate === liveSheetForDateISO();
 
     const [
       archive,

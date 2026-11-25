@@ -91,6 +91,46 @@ export function todayISOInBakeryTimezone(): string {
   return today.toISOString().slice(0, 10);
 }
 
+// ============================ LIVE SHEET DATE ============================
+// The order sheet is only cleared by the daily Apps Script download (about
+// SHEET_CLEAR_HOUR:00 Johannesburg time). Between midnight and that clear the
+// sheet STILL HOLDS TODAY'S orders (placed yesterday), even though the
+// calendar already says "tomorrow" is the next date. Treating that content as
+// tomorrow's orders is what made yesterday's deliveries (e.g. OPHIRTON HOTEL)
+// leak onto the next day's invoices. This works out which delivery date the
+// LIVE sheet currently represents.
+
+/** Hour (Johannesburg) the daily download + clear runs. Override with env SHEET_CLEAR_HOUR. */
+const SHEET_CLEAR_HOUR = (() => {
+  const n = Number(process.env.SHEET_CLEAR_HOUR);
+  return Number.isFinite(n) && n >= 0 && n <= 23 ? n : 5;
+})();
+/** Minutes after the clear hour we still allow for the script to finish. */
+const SHEET_CLEAR_GRACE_MIN = 30;
+
+function sheetGroupForWeekday(weekday: number): "mon_wed" | "thu_sat" {
+  return weekday === 4 || weekday === 5 || weekday === 6 ? "thu_sat" : "mon_wed";
+}
+
+/**
+ * The delivery date the LIVE (active) sheet holds right now.
+ *  - After the daily clear → tomorrow (new orders being collected).
+ *  - Between midnight and the clear → TODAY, but only if the active sheet is the
+ *    same sheet that holds today's orders (not on the Wed→Thu / Sat→Sun switch,
+ *    where the active sheet is the next group's, still empty one).
+ */
+export function liveSheetForDateISO(): string {
+  const { year, month, day, hour, minute } = nowInBakeryTimezone();
+  const beforeClear = hour * 60 + minute < SHEET_CLEAR_HOUR * 60 + SHEET_CLEAR_GRACE_MIN;
+  if (beforeClear) {
+    const todayWd = weekdayOf(year, month, day);
+    const sameSheet =
+      sheetGroupForWeekday(todayWd) === sheetGroupForWeekday(tomorrowWeekdayInBakeryTimezone());
+    if (sameSheet) return todayISOInBakeryTimezone();
+  }
+  return tomorrowISOInBakeryTimezone();
+}
+
 /** Tomorrow's date (bakery-local) as YYYY-MM-DD. */
 export function tomorrowISOInBakeryTimezone(): string {
   const { year, month, day } = nowInBakeryTimezone();
