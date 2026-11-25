@@ -2165,6 +2165,76 @@ async function writeSheetArchiveForDate(
   }
 }
 
+/**
+ * ONE-OFF CLEAN-UP (verified with the owner): the saved list for 2026-11-25 was
+ * polluted at 00:21 on 24 Nov, when the live sheet still held TUESDAY's orders
+ * but was archived as "tomorrow" (Wednesday). These customers have NO order for
+ * 25 Nov in the app and NONE on the sheet. They are removed from that date's
+ * saved list; a backup copy is kept in `__sheet_archive_backup_<date>__`.
+ * Safety: an entry is only removed if there is no submission for that date.
+ */
+const STALE_ARCHIVE_PURGE: Record<string, string[]> = {
+  "2026-11-25": [
+    "ecoestatebrian", "excel", "holyfamily", "lesedi", "newstop", "nossacassafourways",
+    "ophirtonhotel", "patrick", "puma", "sasol", "shaft22", "thabajustdarling", "verney",
+  ],
+};
+
+async function purgeStaleArchiveEntries(forDate: string): Promise<void> {
+  const keys = STALE_ARCHIVE_PURGE[forDate];
+  if (!keys) return;
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    const archive = await readSheetArchiveForDate(forDate);
+    const present = keys.filter((k) => archive[k]);
+    if (!present.length) return;
+
+    // Never remove anybody who really has an app order for that date.
+    const { data: subs } = await supabaseAdmin
+      .from("order_submissions")
+      .select("customer:customers(name)")
+      .eq("for_date", forDate)
+      .gt("total_items", 0);
+    const hasOrder = new Set(
+      (subs ?? []).map((s: any) => normCustomerKey(s.customer?.name ?? "")).filter(Boolean),
+    );
+    const toRemove = present.filter((k) => !hasOrder.has(k));
+    if (!toRemove.length) return;
+
+    // Backup first (merge with any earlier backup so nothing is lost).
+    const backupSlug = `__sheet_archive_backup_${forDate}__`;
+    const { data: oldBackup } = await supabaseAdmin
+      .from("sheet_groups")
+      .select("id, name")
+      .eq("slug", backupSlug)
+      .maybeSingle();
+    let backup: Record<string, ArchivedDateCustomerOrder> = {};
+    try {
+      backup = oldBackup?.name ? JSON.parse(oldBackup.name) : {};
+    } catch {
+      backup = {};
+    }
+    for (const k of toRemove) backup[k] = archive[k];
+    if (oldBackup?.id) {
+      const { error } = await supabaseAdmin
+        .from("sheet_groups")
+        .update({ name: JSON.stringify(backup) })
+        .eq("id", oldBackup.id);
+      if (error) return; // no backup -> do not delete
+    } else {
+      const { error } = await supabaseAdmin
+        .from("sheet_groups")
+        .insert({ slug: backupSlug, name: JSON.stringify(backup) });
+      if (error) return; // no backup -> do not delete
+    }
+
+    for (const k of toRemove) delete archive[k];
+    await writeSheetArchiveForDate(forDate, archive);
+  } catch {
+    // non-fatal: the list simply stays as it was
+  }
+}
+
 export const savePrintSheetState = createServerFn({ method: "POST" })
   .validator((d: {
     forDate?: string;
@@ -2387,6 +2457,9 @@ export const getPrintSheetForDate = createServerFn({ method: "GET" })
 
     const targetForDate = data.forDate;
     const isCurrentLiveTarget = targetForDate === liveSheetForDateISO();
+
+    // One-off verified clean-up of stale carried-over entries (see above).
+    await purgeStaleArchiveEntries(targetForDate);
 
     const [
       archive,
